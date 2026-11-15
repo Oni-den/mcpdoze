@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.png" alt="MCPDoze: a sleepy robot dozing on top of a server" width="160">
+</p>
+
 # MCPDoze
 
 **One shared, lazy, idle-unloading instance of every MCP server.**
@@ -5,11 +9,15 @@
 MCPDoze is a small Rust broker that sits between your AI agents and your
 [Model Context Protocol](https://modelcontextprotocol.io) servers.
 
-> Status: **pre-alpha.** The data path, lifecycle, catalog, admin API, CLI,
-> HTTP passthrough, migration skill and optional guardrail hook work and are
-> tested on Windows. Not yet done: `per-cwd` / `per-session` scopes
-> (currently served as `shared`), routing of server-to-client requests such
-> as sampling, release binaries, and Linux/macOS verification. See
+> Status: **v0.1.0, early release.** The data path, lifecycle, catalog,
+> admin API, CLI, HTTP passthrough, `shared` / `per-cwd` / `per-session`
+> scopes, routing of server-to-client requests (sampling, elicitation,
+> roots), migration skill with rollback and the optional guardrail hook work.
+> CI tests Windows (x64 and ARM64), Linux and macOS, and a release workflow
+> builds the binaries. Deferred to v0.2: the stateless MCP 2026-07-28
+> protocol (clients fall back to 2025-11-25; see
+> [decision 0002](docs/decisions/0002-stateless-protocol-support.md)) and
+> resource subscriptions. See
 > [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) and the measured
 > [case study](docs/CASE_STUDY.md): two sessions, 741 MB without MCPDoze
 > versus 394 MB with it, and about 6 MB after the idle unload.
@@ -117,7 +125,7 @@ first call and is unloaded after the idle TTL (10 minutes by default).
 [`skills/mcpdoze-migrate`](skills/mcpdoze-migrate/SKILL.md) moves them behind
 the broker and routes later "install an MCP server" requests to `mcpdoze add`.
 It drives `mcpdoze import <agent> --dry-run`, then `--yes`, with a backup and
-a rollback (`mcpdoze import --rollback <backup>`). Supported: `claude-code`,
+a rollback (`mcpdoze import --rollback <manifest>`). Supported: `claude-code`,
 `codex`, `opencode`, `cursor`, `vscode`.
 
 **Optional guardrail.** `mcpdoze hook install --scope user --dry-run` previews
