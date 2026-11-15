@@ -88,9 +88,13 @@ session, which is what MCPDoze exists to prevent. Instead:
    first use). Ask the user to restart the agent and call one tool. Then
    `mcpdoze status` again should show one running backend with a process id,
    and after the idle period (default 10 minutes) it returns to zero.
-8. **Roll back if needed.** `mcpdoze import --rollback <manifest>` restores
-   the original files and removes the registered servers. It refuses if a
-   file changed since the migration; explain that and let the user decide.
+8. **Roll back if needed.** `mcpdoze import --rollback <manifest>` (no agent
+   argument) puts the original server entries back and removes the
+   registered servers. For JSON configs it works even after the agent
+   rewrote the file: only the `mcpdoze` entry is removed and the migrated
+   entries re-inserted, all other keys are kept. It refuses if the file is
+   no longer valid JSON, or if a Codex `config.toml` changed since the
+   migration; explain that and let the user decide.
 
 ## Reference
 

@@ -11,7 +11,6 @@
 //! * OpenCode: `{"type":"remote","url":..,"headers":{"Authorization":"Bearer {env:VAR}"}}`
 //! * Codex: `[mcp_servers.mcpdoze] url = ..; bearer_token_env_var = "VAR"`
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -19,12 +18,12 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 
-use super::parse::json_container_key;
+use super::parse::{classify, json_container_key};
 use super::plan::{Plan, PlanItem, Source};
 use super::util::{
     atomic_write, now_secs, read_capped, sha256_hex, to_text, utc_iso, utc_timestamp,
 };
-use super::{Agent, ImportError, BACKUP_INFIX, BROKER_ENTRY_NAME};
+use super::{Agent, ImportError, RawValue, BACKUP_INFIX, BROKER_ENTRY_NAME};
 
 /// Options for [`apply`].
 #[derive(Debug, Clone, Default)]
@@ -43,10 +42,49 @@ pub struct ManifestFile {
     pub backup: Option<PathBuf>,
     pub original_sha256: Option<String>,
     pub new_sha256: String,
+    /// What the import changed inside a JSON agent config, so a rollback can
+    /// undo exactly that even after the agent rewrote the file. Absent for
+    /// TOML agents and in manifests written before version 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_edit: Option<JsonEdit>,
+}
+
+/// Marker stored in the manifest in place of a literal value that may be a
+/// secret. Rollback reads the real value from the verified backup.
+pub const REDACTED: &str = "<redacted: restored from backup>";
+
+/// The edits an import made to one JSON agent config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JsonEdit {
+    /// Object keys leading to the map that received the broker entry.
+    pub broker_container: Vec<String>,
+    /// The import created `broker_container` (it did not exist before).
+    pub created_container: bool,
+    /// The `mcpdoze` entry that existed before the import, if any. It is
+    /// MCPDoze's own entry and holds only a URL and an env reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_broker_entry: Option<Value>,
+    /// Entries removed by the import, in their original order.
+    pub entries: Vec<SavedEntry>,
+}
+
+/// One migrated entry as it was in the agent config. Literal values under
+/// `env` / `environment` / `headers` (and URLs with credentials or a query)
+/// are replaced by [`REDACTED`]; `redacted` lists their paths inside `value`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedEntry {
+    pub container: Vec<String>,
+    pub key: String,
+    /// Position of the entry in its container before the import.
+    pub index: usize,
+    pub value: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted: Vec<Vec<String>>,
 }
 
 /// The record written to `<data_dir>/import/<timestamp>.json`. Holds names,
-/// paths and hashes only.
+/// paths, hashes and the migrated JSON entries with literal values redacted;
+/// never a secret value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
@@ -110,11 +148,28 @@ fn rewrite_json(
     sources: &[&Source],
     url: &str,
     var: &str,
-) -> Result<String, ImportError> {
+) -> Result<(String, JsonEdit), ImportError> {
     let mut root: Value = serde_json::from_str(text).map_err(|e| ImportError::Parse {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
+    let mut entries = Vec::new();
+    for s in sources {
+        let Some(map) = get_path(&root, &s.container).and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(index) = map.keys().position(|k| k == &s.key) {
+            let (value, redacted) = redact_entry(&map[&s.key]);
+            entries.push(SavedEntry {
+                container: s.container.clone(),
+                key: s.key.clone(),
+                index,
+                value,
+                redacted,
+            });
+        }
+    }
+    entries.sort_by_key(|e| e.index);
     for s in sources {
         let mut cur = Some(&mut root);
         for k in &s.container {
@@ -133,6 +188,7 @@ fn rewrite_json(
         path: path.to_path_buf(),
         message: "top level is not an object".into(),
     })?;
+    let created_container = !obj.contains_key(&key);
     let container = obj
         .entry(key.clone())
         .or_insert_with(|| Value::Object(Default::default()));
@@ -142,15 +198,172 @@ fn rewrite_json(
             path: path.to_path_buf(),
             message: format!("`{key}` is not an object"),
         })?;
-    map.insert(BROKER_ENTRY_NAME.into(), broker_entry_json(agent, url, var));
-    let mut out = serde_json::to_string_pretty(&root).map_err(|e| ImportError::Parse {
+    let previous_broker_entry =
+        map.insert(BROKER_ENTRY_NAME.into(), broker_entry_json(agent, url, var));
+    let out = to_json_text(path, &root, text.ends_with('\n'))?;
+    Ok((
+        out,
+        JsonEdit {
+            broker_container: vec![key],
+            created_container,
+            previous_broker_entry,
+            entries,
+        },
+    ))
+}
+
+fn to_json_text(path: &Path, root: &Value, newline: bool) -> Result<String, ImportError> {
+    let mut out = serde_json::to_string_pretty(root).map_err(|e| ImportError::Parse {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
-    if text.ends_with('\n') {
+    if newline {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Replace literal values that may be secrets with [`REDACTED`]; returns the
+/// redacted copy and the paths replaced.
+fn redact_entry(v: &Value) -> (Value, Vec<Vec<String>>) {
+    let mut out = v.clone();
+    let mut paths = Vec::new();
+    if let Some(o) = out.as_object_mut() {
+        for (k, field) in o.iter_mut() {
+            match (k.as_str(), field) {
+                ("env" | "environment" | "headers", Value::Object(m)) => {
+                    for (name, val) in m.iter_mut() {
+                        let literal = match val {
+                            Value::String(s) => matches!(classify(s), RawValue::Literal(_)),
+                            Value::Null => false,
+                            _ => true,
+                        };
+                        if literal {
+                            *val = Value::String(REDACTED.into());
+                            paths.push(vec![k.clone(), name.clone()]);
+                        }
+                    }
+                }
+                ("url", Value::String(u)) if u.contains('?') || u.contains('@') => {
+                    *u = REDACTED.into();
+                    paths.push(vec![k.clone()]);
+                }
+                _ => {}
+            }
+        }
+    }
+    (out, paths)
+}
+
+fn get_path<'a>(root: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(root, |v, k| v.get(k))
+}
+
+fn get_path_mut<'a>(root: &'a mut Value, path: &[String]) -> Option<&'a mut Value> {
+    path.iter().try_fold(root, |v, k| v.get_mut(k))
+}
+
+/// Undo `edit` on the current content of a JSON agent config. `backup` is
+/// the verified original, needed only for redacted values. Returns the new
+/// text, or `None` when nothing needs changing.
+fn surgical_json_rollback(
+    path: &Path,
+    current: &str,
+    edit: &JsonEdit,
+    backup: Option<&[u8]>,
+) -> Result<Option<String>, ImportError> {
+    let refuse = |m: String| ImportError::Parse {
+        path: path.to_path_buf(),
+        message: format!("{m}; refusing to roll back"),
+    };
+    let mut root: Value =
+        serde_json::from_str(current).map_err(|e| refuse(format!("not valid JSON ({e})")))?;
+    if !root.is_object() {
+        return Err(refuse("top level is not an object".into()));
+    }
+    let needs_backup = edit.entries.iter().any(|e| !e.redacted.is_empty());
+    let original: Option<Value> = match (needs_backup, backup) {
+        (false, _) => None,
+        (true, Some(b)) => Some(
+            serde_json::from_slice(b)
+                .map_err(|e| refuse(format!("backup is not valid JSON ({e})")))?,
+        ),
+        (true, None) => {
+            return Err(refuse(
+                "the backup needed to restore redacted values is missing".into(),
+            ))
+        }
+    };
+    let before = root.clone();
+    let not_object = |p: &[String]| refuse(format!("`{}` is not an object", p.join(".")));
+
+    // 1. Our broker entry: put back what was there, or remove it.
+    if let Some(c) = get_path_mut(&mut root, &edit.broker_container) {
+        let map = c
+            .as_object_mut()
+            .ok_or_else(|| not_object(&edit.broker_container))?;
+        match &edit.previous_broker_entry {
+            Some(prev) => {
+                if map.contains_key(BROKER_ENTRY_NAME) {
+                    map.insert(BROKER_ENTRY_NAME.into(), prev.clone());
+                }
+            }
+            None => {
+                map.shift_remove(BROKER_ENTRY_NAME);
+            }
+        }
+    }
+
+    // 2. Re-insert the migrated entries (an entry the user re-added is kept).
+    for e in &edit.entries {
+        let mut value = e.value.clone();
+        if let Some(orig) = &original {
+            let src = get_path(orig, &e.container)
+                .and_then(|c| c.get(&e.key))
+                .ok_or_else(|| refuse(format!("backup lacks entry `{}`", e.key)))?;
+            for rp in &e.redacted {
+                let real = get_path(src, rp)
+                    .cloned()
+                    .ok_or_else(|| refuse(format!("backup lacks a value of `{}`", e.key)))?;
+                if let Some(slot) = get_path_mut(&mut value, rp) {
+                    *slot = real;
+                }
+            }
+        }
+        let mut cur = &mut root;
+        for (i, k) in e.container.iter().enumerate() {
+            let map = cur
+                .as_object_mut()
+                .ok_or_else(|| not_object(&e.container[..i]))?;
+            cur = map
+                .entry(k.clone())
+                .or_insert_with(|| Value::Object(Default::default()));
+        }
+        let map = cur
+            .as_object_mut()
+            .ok_or_else(|| not_object(&e.container))?;
+        if !map.contains_key(&e.key) {
+            let at = e.index.min(map.len());
+            map.shift_insert(at, e.key.clone(), value);
+        }
+    }
+
+    // 3. Drop a container the import created if it is now empty.
+    if edit.created_container {
+        if let ([k], Some(obj)) = (edit.broker_container.as_slice(), root.as_object_mut()) {
+            if obj
+                .get(k)
+                .and_then(Value::as_object)
+                .is_some_and(|m| m.is_empty())
+            {
+                obj.shift_remove(k);
+            }
+        }
+    }
+    if root == before {
+        return Ok(None);
+    }
+    to_json_text(path, &root, current.ends_with('\n')).map(Some)
 }
 
 fn rewrite_codex(
@@ -294,6 +507,7 @@ struct Pending {
     role: &'static str,
     original: Option<Vec<u8>>,
     new: String,
+    json_edit: Option<JsonEdit>,
 }
 
 /// Apply `plan`. Order: compute everything in memory, back up, write the
@@ -326,6 +540,7 @@ pub fn apply(
             role: "broker_config",
             original,
             new: text,
+            json_edit: None,
         });
     }
     for file in &plan.files {
@@ -337,23 +552,28 @@ pub fn apply(
             .flat_map(|i| i.sources.iter())
             .filter(|s| &s.file == file)
             .collect();
-        let new = if plan.agent == Agent::Codex {
-            rewrite_codex(file, &text, &sources, &plan.broker_url, &plan.token_env_var)?
+        let (new, json_edit) = if plan.agent == Agent::Codex {
+            (
+                rewrite_codex(file, &text, &sources, &plan.broker_url, &plan.token_env_var)?,
+                None,
+            )
         } else {
-            rewrite_json(
+            let (t, e) = rewrite_json(
                 plan.agent,
                 file,
                 &text,
                 &sources,
                 &plan.broker_url,
                 &plan.token_env_var,
-            )?
+            )?;
+            (t, Some(e))
         };
         pending.push(Pending {
             path: file.clone(),
             role: "agent",
             original: Some(bytes),
             new,
+            json_edit,
         });
     }
 
@@ -381,11 +601,12 @@ pub fn apply(
             backup,
             original_sha256: p.original.as_ref().map(|o| sha256_hex(o)),
             new_sha256: sha256_hex(p.new.as_bytes()),
+            json_edit: p.json_edit.clone(),
         });
     }
 
     let manifest = Manifest {
-        version: 1,
+        version: 2,
         created_utc: utc_iso(secs),
         agent: plan.agent,
         broker_url: plan.broker_url.clone(),
@@ -437,9 +658,17 @@ fn write_manifest(path: &Path, m: &Manifest) -> Result<(), ImportError> {
 
 // --------------------------------------------------------------- rollback
 
-/// Undo an import. Agent files are restored only if their current content
-/// still hashes to the manifest's `new_sha256`; otherwise nothing is touched.
-/// Servers the import registered are removed from the broker config.
+/// Undo an import.
+///
+/// For each agent file: if it is byte-identical to what the import wrote, the
+/// backup is restored whole. Otherwise a JSON agent config recorded with a
+/// [`JsonEdit`] is rolled back surgically: the current file is parsed, the
+/// broker entry the import added is removed (or the previous one put back),
+/// the migrated entries are re-inserted at their old positions, and every
+/// other key is kept. A file that is not valid JSON, a changed TOML agent
+/// file, or a changed file under an older manifest without saved entries is
+/// refused, and then nothing is touched. Servers the import registered are
+/// finally removed from the broker config.
 pub fn rollback(manifest_path: &Path) -> Result<RollbackResult, ImportError> {
     let text = to_text(manifest_path, read_capped(manifest_path)?)?;
     let mut m: Manifest = serde_json::from_str(&text).map_err(|e| ImportError::Parse {
@@ -450,36 +679,51 @@ pub fn rollback(manifest_path: &Path) -> Result<RollbackResult, ImportError> {
         return Err(ImportError::AlreadyRolledBack);
     }
     let mut changed = Vec::new();
-    let mut backups: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+    // Per agent file: `Some(bytes)` = write these, `None` = remove the file.
+    let mut writes: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     for f in m.files.iter().filter(|f| f.role == "agent") {
-        match read_capped(&f.path) {
-            Ok(cur) if sha256_hex(&cur) == f.new_sha256 => {}
-            Ok(_) => changed.push(format!("{} (modified)", f.path.display())),
-            Err(_) => changed.push(format!("{} (missing)", f.path.display())),
-        }
-        if let Some(b) = &f.backup {
-            let data = read_capped(b)?;
-            if Some(sha256_hex(&data)) != f.original_sha256 {
-                return Err(ImportError::Invalid(format!(
-                    "{}: backup does not match the manifest; refusing to restore",
-                    b.display()
-                )));
+        let backup = match &f.backup {
+            Some(b) => {
+                let data = read_capped(b)?;
+                if Some(sha256_hex(&data)) != f.original_sha256 {
+                    return Err(ImportError::Invalid(format!(
+                        "{}: backup does not match the manifest; refusing to restore",
+                        b.display()
+                    )));
+                }
+                Some(data)
             }
-            backups.insert(f.path.clone(), data);
+            None => None,
+        };
+        let Ok(cur) = read_capped(&f.path) else {
+            changed.push(format!("{} (missing)", f.path.display()));
+            continue;
+        };
+        if sha256_hex(&cur) == f.new_sha256 {
+            writes.push((f.path.clone(), backup));
+            continue;
+        }
+        let Some(edit) = &f.json_edit else {
+            changed.push(format!("{} (modified)", f.path.display()));
+            continue;
+        };
+        let cur_text = to_text(&f.path, cur)?;
+        if let Some(new) = surgical_json_rollback(&f.path, &cur_text, edit, backup.as_deref())? {
+            writes.push((f.path.clone(), Some(new.into_bytes())));
         }
     }
     if !changed.is_empty() {
         return Err(ImportError::Changed(changed));
     }
     let mut restored = Vec::new();
-    for f in m.files.iter().filter(|f| f.role == "agent") {
-        match backups.get(&f.path) {
-            Some(data) => atomic_write(&f.path, data)?,
+    for (path, data) in &writes {
+        match data {
+            Some(data) => atomic_write(path, data)?,
             None => {
-                let _ = std::fs::remove_file(&f.path);
+                let _ = std::fs::remove_file(path);
             }
         }
-        restored.push(f.path.clone());
+        restored.push(path.clone());
     }
     let mut removed = Vec::new();
     if !m.registered_servers.is_empty() && m.broker_config.is_file() {

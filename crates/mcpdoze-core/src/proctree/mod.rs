@@ -222,6 +222,9 @@ pub enum ResolveError {
     /// The program was not found on `PATH`.
     #[error("program not found: {0}")]
     NotFound(String),
+    /// The program exists but is not an executable regular file (Unix).
+    #[error("program is not an executable file: {0}")]
+    NotExecutable(String),
     /// The program path cannot be passed safely through `cmd.exe`.
     #[error("program path contains a character that cannot be safely quoted for cmd.exe: {0:?}")]
     UnsafeProgram(char),
@@ -245,6 +248,7 @@ impl From<ResolveError> for io::Error {
     fn from(e: ResolveError) -> Self {
         let kind = match e {
             ResolveError::NotFound(_) => io::ErrorKind::NotFound,
+            ResolveError::NotExecutable(_) => io::ErrorKind::PermissionDenied,
             _ => io::ErrorKind::InvalidInput,
         };
         io::Error::new(kind, e)
@@ -304,8 +308,10 @@ pub fn batch_command_line<S: AsRef<str>>(script: &str, args: &[S]) -> Result<Str
 /// directory is not searched). `.cmd` / `.bat` shims such as `npx` are run
 /// through `%SystemRoot%\System32\cmd.exe /d /s /c` with every token quoted;
 /// arguments that cannot be quoted safely (`"`, `%`, `!`, line breaks) are
-/// refused rather than risk command injection. Elsewhere the program and
-/// arguments are passed through unchanged.
+/// refused rather than risk command injection. On Unix a name without `/` is
+/// searched in the absolute `PATH` entries and anything else is taken as a
+/// path; either way it must be an executable regular file, and the command
+/// runs the resolved absolute path with the arguments unchanged.
 pub fn resolve_command<P, I, A>(program: P, args: I) -> Result<Command, ResolveError>
 where
     P: AsRef<OsStr>,
@@ -371,15 +377,16 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
         let e: io::Error = ResolveError::NotFound("x".into()).into();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        let e: io::Error = ResolveError::NotExecutable("x".into()).into();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
     fn resolve_missing_program_is_not_found() {
         let r = resolve_command("mcpdoze-test-no-such-program-xyz", ["a"]);
-        #[cfg(windows)]
         assert!(matches!(r, Err(ResolveError::NotFound(_))));
-        #[cfg(unix)]
-        assert!(r.is_ok(), "unix defers lookup to exec");
+        let e: io::Error = r.unwrap_err().into();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 }
 

@@ -154,6 +154,9 @@ fn build_spec(server: &ServerConfig, broker: &config::BrokerConfig) -> Result<Ba
                 .map(|(k, _)| k.clone())
                 .collect();
             spec.cwd = server.cwd.clone();
+            if let Some(var) = &broker.token_env {
+                spec.strip_env.insert(var.clone());
+            }
             spec
         }
         Transport::Http => {
@@ -852,5 +855,20 @@ mod tests {
         .unwrap();
         let e = build_spec(&s, &config::BrokerConfig::default()).unwrap_err();
         assert!(e.contains("MCPDOZE_TEST_UNSET_VAR_XYZ"), "{e}");
+    }
+
+    #[test]
+    fn spec_strips_broker_token_variables() {
+        let s: ServerConfig =
+            serde_json::from_str(r#"{"transport":"stdio","command":"prog"}"#).unwrap();
+        let spec = build_spec(&s, &config::BrokerConfig::default()).unwrap();
+        assert!(spec.strip_env.contains("MCPDOZE_TOKEN"));
+        let broker = config::BrokerConfig {
+            token_env: Some("EXAMPLE_BROKER_TOKEN".into()),
+            ..config::BrokerConfig::default()
+        };
+        let spec = build_spec(&s, &broker).unwrap();
+        assert!(spec.strip_env.contains("MCPDOZE_TOKEN"));
+        assert!(spec.strip_env.contains("EXAMPLE_BROKER_TOKEN"));
     }
 }

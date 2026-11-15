@@ -4,12 +4,30 @@ Every `mcpdoze import` apply:
 
 1. copies each file it will change to `<file>.mcpdoze-bak-<UTC timestamp>`;
 2. writes a manifest, `<data dir>/import/<timestamp>.json`, listing the files,
-   their backups, a SHA-256 of the original and of the new content, and the
-   server names it registered.
+   their backups, a SHA-256 of the original and of the new content, the
+   server names it registered and, for JSON agent configs, the migrated
+   entries with their positions. Literal `env` / `headers` values and URLs
+   with a query or credentials are stored as `<redacted: restored from
+   backup>`; the manifest never holds a secret value.
 
-`mcpdoze import --rollback <manifest>` restores the backups and removes the
-registered servers, but only if each file still has the hash recorded after the
-migration. If you edited a file since, it refuses and says which one.
+`mcpdoze import --rollback <manifest>` (no agent argument) then:
+
+- restores a file whole from its backup when it is unchanged since the
+  migration;
+- for a JSON agent config (Claude Code, Cursor, VS Code, OpenCode) that the
+  agent has rewritten since, edits the current file: removes the `mcpdoze`
+  entry the import added (or puts back the one that was there before),
+  re-inserts the migrated entries at their old positions (redacted values are
+  read from the verified backup), and keeps every other key and the key
+  order. An entry you re-added yourself is left alone. It refuses, touching
+  nothing, if the file is not valid JSON;
+- refuses, touching nothing, when a Codex `config.toml` changed since the
+  migration, or when a manifest from an older version (without saved
+  entries) does not match;
+- removes the registered servers from the MCPDoze config.
+
+A manifest can be rolled back once; a second run is refused and changes
+nothing.
 
 Manual recovery if the binary is unavailable: copy each
 `<file>.mcpdoze-bak-<timestamp>` over the file named in the manifest, then

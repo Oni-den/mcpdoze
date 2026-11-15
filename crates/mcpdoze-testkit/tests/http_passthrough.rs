@@ -5,8 +5,12 @@
 //! is killed when its handle drops.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+
+#[path = "support/log_capture.rs"]
+mod log_capture;
+use log_capture::Capture;
 
 use mcpdoze_core::backend::{jsonrpc, BackendSpec, StateKind, Tuning};
 use mcpdoze_core::router::{MemoryCatalog, Router, Session};
@@ -54,26 +58,6 @@ fn text(resp: &Value) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("no text in {resp}"))
         .to_owned()
-}
-
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Capture {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-    type Writer = Capture;
-    fn make_writer(&'a self) -> Capture {
-        self.clone()
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -203,13 +187,7 @@ async fn connection_refused_gives_clear_error_and_backs_off() {
 async fn header_values_never_reach_tracing_output() {
     guarded(async {
         const SECRET: &str = "s3cr3t-token-value-9f2";
-        let cap = Capture::default();
-        let sub = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(cap.clone())
-            .with_ansi(false)
-            .finish();
-        let _g = tracing::subscriber::set_default(sub);
+        let cap = Capture::start();
 
         let srv = mock(
             MockHttpSpec::new()
@@ -231,8 +209,13 @@ async fn header_values_never_reach_tracing_output() {
         assert!(!resp.to_string().contains("wrong-value-1"));
         r2.shutdown().await;
 
-        let out = String::from_utf8_lossy(&cap.0.lock().unwrap()).into_owned();
-        assert!(!out.is_empty(), "expected some tracing output");
+        let out = cap.text();
+        // Emitted when the dropped session is re-created (headers re-sent).
+        assert!(
+            out.contains("re-initialising upstream session"),
+            "expected the re-init line in tracing output:
+{out}"
+        );
         assert!(!out.contains(SECRET), "header value leaked into tracing");
         assert!(!out.contains("wrong-value-1"));
     })

@@ -8,7 +8,11 @@
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+#[path = "support/log_capture.rs"]
+mod log_capture;
+use log_capture::Capture;
 use std::time::Duration;
 
 use mcpdoze_core::auth::Token;
@@ -423,43 +427,12 @@ impl MemBroker {
     }
 }
 
-/// Collects formatted tracing output.
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut v = self.0.lock().unwrap();
-        // Bounded: a runaway logger cannot exhaust memory.
-        if v.len() < 16 * 1024 * 1024 {
-            v.extend_from_slice(buf);
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-    type Writer = Capture;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 /// The token (right or wrong) never reaches the logs, at TRACE level, across
 /// auth failures, MCP calls and admin calls. Single-threaded runtime so every
-/// task logs into the scoped subscriber.
+/// task logs on the capturing thread (see `support/log_capture.rs`).
 #[tokio::test(flavor = "current_thread")]
 async fn token_never_logged() {
-    let cap = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(cap.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let cap = Capture::start();
     with_timeout(async {
         let b = MemBroker::start(Vec::new()).await;
         let reg = json!({"name":"mock","server":{"transport":"stdio","command":BIN,
@@ -494,7 +467,9 @@ async fn token_never_logged() {
             .await;
         assert!(!alive(pid));
         b.finish().await;
-        let logs = String::from_utf8_lossy(&cap.0.lock().unwrap()).into_owned();
+        let logs = cap.text();
+        // Both lines are emitted before the matching response is returned,
+        // so they prove the capture saw the broker's events.
         assert!(
             logs.contains("backend running"),
             "nothing captured:\n{logs}"

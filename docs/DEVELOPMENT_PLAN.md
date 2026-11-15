@@ -135,8 +135,8 @@ paragraph above is historical.
 | M4 | done | Disk catalog, probe, refresh, `list_changed`, prompts and resources. |
 | M5 | done | Auth, Host/Origin checks, secret refs, admin API and CLI. |
 | M6 | done | HTTP passthrough. |
-| M7 | in progress | `per-cwd` / `per-session` scopes and server-to-client routing. |
-| M8 | partial | Autostart, migration skill, hook and case study done; release binaries in progress; soak and Linux/macOS verification todo; v0.1.0 not tagged. |
+| M7 | done | `per-cwd` / `per-session` scopes and server-to-client routing (sampling, elicitation, roots). |
+| M8 | done | Autostart, migration skill (surgical rollback), hook and case study done; release workflow builds the binaries; Linux/macOS covered by CI; version 0.1.0. Open: the nightly soak run. Deferred to v0.2: the stateless 2026-07-28 protocol (decisions/0002) and resource subscriptions. |
 
 
 ## Hardest problems
@@ -166,7 +166,7 @@ references/agents.md         # config locations and formats per agent
 references/rollback.md
 ```
 
-Logic lives in the binary (`mcpdoze import --from <agent> --dry-run`) so the
+Logic lives in the binary (`mcpdoze import <agent> --dry-run`) so the
 skill stays thin and testable. Steps: check the broker is installed and running;
 discover user, project and local MCP configs; show a dry-run plan (transport,
 prefix, scope, env var names only); confirm; back up every touched file and

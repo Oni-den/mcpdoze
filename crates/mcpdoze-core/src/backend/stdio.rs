@@ -154,6 +154,11 @@ impl StdioConn {
         stderr: Arc<StderrRing>,
     ) -> io::Result<Self> {
         let mut cmd = resolve_command(&spec.command, &spec.args)?;
+        // Never hand the broker token to a backend through inheritance;
+        // an explicit `env` entry of the same name (set by the user) wins.
+        for name in spec.strip_env.iter().filter(|n| !spec.env.contains_key(*n)) {
+            cmd.env_remove(name);
+        }
         cmd.envs(&spec.env);
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);

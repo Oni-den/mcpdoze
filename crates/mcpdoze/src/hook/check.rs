@@ -37,7 +37,8 @@ pub fn check_event(event: &Value) -> Decision {
         return Decision::Allow;
     };
     match tool {
-        "Bash" => match input.get("command").and_then(Value::as_str) {
+        // Claude Code's shell tool is `Bash`, or `PowerShell` on Windows.
+        "Bash" | "PowerShell" => match input.get("command").and_then(Value::as_str) {
             Some(cmd) if command_registers_mcp(cmd) => Decision::Deny,
             _ => Decision::Allow,
         },
@@ -79,9 +80,25 @@ pub fn command_registers_mcp(cmd: &str) -> bool {
 const MAX_DEPTH: u8 = 3;
 
 fn scan(cmd: &str, depth: u8) -> bool {
-    split_segments(cmd)
-        .into_iter()
-        .any(|words| segment_registers(&words, depth))
+    let segs = split_segments(cmd);
+    if segs.iter().any(|words| segment_registers(words, depth)) {
+        return true;
+    }
+    // `"claude mcp add x" | iex` or `$c = '...'; iex $c`: when the text
+    // evaluates strings, treat every multi-word string as a command.
+    if depth < MAX_DEPTH
+        && segs
+            .iter()
+            .flatten()
+            .any(|w| matches!(base_name(w).as_str(), "iex" | "invoke-expression"))
+    {
+        return segs
+            .iter()
+            .flatten()
+            .filter(|w| w.contains(char::is_whitespace))
+            .any(|w| scan(w, depth + 1));
+    }
+    false
 }
 
 /// Splits into command segments (on `&&`, `||`, `;`, `|`, `&`, newline) of
@@ -155,7 +172,18 @@ fn split_segments(cmd: &str) -> Vec<Vec<String>> {
     segs
 }
 
+/// A word stripped of PowerShell escapes (backticks) and of leading
+/// grouping/call syntax (`(`, `{`, `$(`) and trailing `)` / `}`.
+fn clean(word: &str) -> String {
+    let w: String = word.chars().filter(|&c| c != '`').collect();
+    w.trim_start_matches(['(', '{', '$'])
+        .trim_end_matches([')', '}'])
+        .to_owned()
+}
+
 fn base_name(word: &str) -> String {
+    let word = clean(word);
+    let word = word.as_str();
     let w = word.rsplit(['/', '\\']).next().unwrap_or(word);
     let lower = w.to_ascii_lowercase();
     for ext in [".exe", ".cmd", ".bat", ".ps1"] {
@@ -181,9 +209,9 @@ fn segment_registers(words: &[String], depth: u8) -> bool {
     let mut i = 0;
     // Strip prefixes that do not change which program runs.
     while i < words.len() {
-        let w = words[i].trim_start_matches('(');
-        let b = base_name(w);
-        if w.is_empty() || is_env_assignment(w) {
+        let w = clean(&words[i]);
+        let b = base_name(&w);
+        if w.is_empty() || is_env_assignment(&w) {
             i += 1;
         } else if matches!(
             b.as_str(),
@@ -198,6 +226,7 @@ fn segment_registers(words: &[String], depth: u8) -> bool {
                 | "npx"
                 | "bunx"
                 | "pnpx"
+                | "."
         ) {
             i += 1;
             while i < words.len() && words[i].starts_with('-') {
@@ -210,7 +239,7 @@ fn segment_registers(words: &[String], depth: u8) -> bool {
     let Some(first) = words.get(i) else {
         return false;
     };
-    let prog = base_name(first.trim_start_matches('('));
+    let prog = base_name(first);
     let rest = &words[i + 1..];
     match prog.as_str() {
         "pwsh" | "powershell" | "bash" | "sh" | "zsh" | "dash" | "cmd" => {
@@ -221,6 +250,18 @@ fn segment_registers(words: &[String], depth: u8) -> bool {
                 Some(p) if p + 1 < rest.len() => scan(&rest[p + 1..].join(" "), depth + 1),
                 _ => false,
             }
+        }
+        // PowerShell wrappers that run their argument text as a command.
+        "iex" | "invoke-expression" | "invoke-command" | "icm" | "start-process" | "saps" => {
+            if depth >= MAX_DEPTH {
+                return false;
+            }
+            let text: Vec<String> = rest
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .map(|a| a.replace(',', " "))
+                .collect();
+            scan(&text.join(" "), depth + 1)
         }
         "claude" | "codex" | "gemini" | "opencode" => registration_args(rest),
         "code" | "code-insiders" | "codium" | "cursor" => rest
@@ -436,6 +477,48 @@ mod tests {
 
     fn write_event(tool: &str, path: &str, key: &str, text: &str) -> Value {
         json!({"tool_name":tool,"tool_input":{"file_path":path,key:text}})
+    }
+
+    fn powershell(cmd: &str) -> Decision {
+        check_event(&json!({"tool_name":"PowerShell","tool_input":{"command":cmd}}))
+    }
+
+    #[test]
+    fn powershell_tool_is_inspected_like_bash() {
+        let deny = [
+            "claude mcp add foo -- npx -y bar",
+            "& claude mcp add foo -- x",
+            "& 'C:\\Program Files\\x\\claude.exe' mcp add foo -- x",
+            "& \"$env:APPDATA\\npm\\claude.cmd\" mcp add foo -- x",
+            "Invoke-Expression 'claude mcp add foo -- x'",
+            "iex \"claude mcp add foo -- x\"",
+            "'claude mcp add foo -- x' | iex",
+            "$c = 'codex mcp add foo -- x'; Invoke-Expression $c",
+            "Invoke-Command -ScriptBlock { claude mcp add foo -- x }",
+            "Start-Process claude -ArgumentList 'mcp','add','foo'",
+            "Start-Process -FilePath claude.exe -ArgumentList \"mcp add foo\"",
+            "$(claude mcp add foo -- x)",
+            "c`laude mcp add foo -- x",
+            ". claude mcp add foo -- x",
+            "pwsh -NoProfile -Command \"& { claude mcp add foo -- x }\"",
+            "Set-Location C:\\p; claude mcp add foo -- x",
+        ];
+        for c in deny {
+            assert_eq!(powershell(c), Decision::Deny, "should deny: {c}");
+        }
+        let allow = [
+            "claude mcp list",
+            "Write-Output 'claude mcp add x'",
+            "Get-ChildItem",
+            "Select-String 'claude mcp add' README.md",
+            "iex 'Get-Date'",
+            "mcpdoze add foo -- npx -y bar",
+            "Start-Process notepad",
+            "",
+        ];
+        for c in allow {
+            assert_eq!(powershell(c), Decision::Allow, "should allow: {c}");
+        }
     }
 
     #[test]

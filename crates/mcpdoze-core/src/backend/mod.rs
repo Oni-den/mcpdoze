@@ -137,10 +137,18 @@ pub struct BackendSpec {
     pub ref_env: BTreeSet<String>,
     /// Client capabilities and server-to-client answers for this instance.
     pub client: ClientSide,
+    /// Inherited variables removed from the backend's environment (the
+    /// broker token). An entry of the same name in `env`, which the user
+    /// configured explicitly, is still passed.
+    pub strip_env: BTreeSet<String>,
 }
 
+/// Variable agents carry the broker token in; never inherited by backends.
+pub const TOKEN_ENV_VAR: &str = "MCPDOZE_TOKEN";
+
 impl BackendSpec {
-    /// A spec with default TTL and start timeout, no extra env, no cwd.
+    /// A spec with default TTL and start timeout, no extra env, no cwd. The
+    /// broker token variable [`TOKEN_ENV_VAR`] is stripped.
     pub fn new<I, S>(command: impl Into<String>, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -156,6 +164,7 @@ impl BackendSpec {
             http: None,
             ref_env: BTreeSet::new(),
             client: ClientSide::default(),
+            strip_env: BTreeSet::from([TOKEN_ENV_VAR.to_string()]),
         }
     }
 

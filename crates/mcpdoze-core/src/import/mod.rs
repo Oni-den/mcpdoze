@@ -33,7 +33,8 @@ mod plan;
 mod util;
 
 pub use apply::{
-    apply, rollback, ApplyOptions, ApplyResult, Manifest, ManifestFile, RollbackResult,
+    apply, rollback, ApplyOptions, ApplyResult, JsonEdit, Manifest, ManifestFile, RollbackResult,
+    SavedEntry, REDACTED,
 };
 pub use parse::{
     agent_files, parse_file, AgentFile, FileRole, ParsedFile, RawServer, RawSpec, RawValue,

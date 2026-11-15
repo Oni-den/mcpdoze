@@ -48,6 +48,7 @@ pub struct MockServerSpec {
     resources: Option<Vec<String>>,
     resource_templates: Option<Vec<String>>,
     log_messages: bool,
+    echo_env: Vec<String>,
 }
 
 impl MockServerSpec {
@@ -67,6 +68,11 @@ impl MockServerSpec {
     /// any URI starting with a template's text before its first `{`.
     pub fn resource_templates(mut self, t: &[&str]) -> Self {
         self.resource_templates = Some(t.iter().map(|s| s.to_string()).collect());
+        self
+    }
+    /// Also report variable `name` (when set) in the `info` tool's `env`.
+    pub fn echo_env(mut self, name: &str) -> Self {
+        self.echo_env.push(name.to_string());
         self
     }
     /// Emit a `notifications/message` log notification at each tool call.
@@ -183,6 +189,9 @@ impl MockServerSpec {
         }
         if let Some(v) = &self.resource_templates {
             kv("--resource-templates", v.join(","));
+        }
+        for n in &self.echo_env {
+            kv("--echo-env", n.clone());
         }
         for (on, flag) in [
             (self.garbage_on_start, "--garbage-on-start"),

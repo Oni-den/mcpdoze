@@ -73,7 +73,11 @@ impl Broker {
     }
 
     async fn one(mock: MockServerSpec, ttl: Duration) -> Broker {
-        let router = Router::with(Arc::new(MemoryCatalog::default()), tuning());
+        Broker::one_tuned(mock, ttl, tuning()).await
+    }
+
+    async fn one_tuned(mock: MockServerSpec, ttl: Duration, tuning: Tuning) -> Broker {
+        let router = Router::with(Arc::new(MemoryCatalog::default()), tuning);
         router.register("mock", "m", spec(mock, ttl)).unwrap();
         Broker::start(router).await
     }
@@ -447,9 +451,17 @@ async fn call_at_ttl_expiry_succeeds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_fails_call_then_recovers_after_backoff() {
     with_timeout(async {
-        let b = Broker::one(
+        // A backoff long enough that the fail-fast call below always lands
+        // inside it, even on a slow runner.
+        let backoff = Duration::from_secs(2);
+        let b = Broker::one_tuned(
             MockServerSpec::new().tools(&["pid"]).crash_after(1),
             Duration::from_secs(30),
+            Tuning {
+                backoff_base: backoff,
+                backoff_max: backoff,
+                ..tuning()
+            },
         )
         .await;
         let c = Client::init(b.addr).await;
@@ -466,7 +478,8 @@ async fn crash_fails_call_then_recovers_after_backoff() {
         assert!(r.get("error").is_some(), "{r}");
         assert_eq!(b.inst().spawn_count(), 1);
         wait_until("old pid gone", Duration::from_secs(10), || !alive(p1)).await;
-        sleep(Duration::from_millis(300)).await;
+        // The backoff started before the state was observed as Failed.
+        sleep(backoff + Duration::from_millis(100)).await;
         let r = c.call(4, "pid", json!({})).await;
         let p2 = pid_of(&r);
         assert_ne!(p1, p2);

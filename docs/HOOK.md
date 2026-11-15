@@ -6,12 +6,18 @@ natively (which starts one copy per session) and tells it to use
 
 ## What it blocks
 
-- **Bash** commands that run `claude mcp add`, `add-json` or
-  `add-from-claude-desktop`, `codex mcp add`, `gemini mcp add`,
-  `opencode mcp add`, or `code --add-mcp`. Matching is case-insensitive, allows
-  flags and `.exe`/`.cmd` suffixes, and sees commands inside `&&`, `||`, `;`,
-  `|` chains and one or more `pwsh -c "..."` / `bash -c '...'` wrappers, after
-  `sudo`, `env`, `time`, `npx` and `VAR=value` prefixes.
+- **Bash** and **PowerShell** tool commands (Claude Code's shell tool is
+  named `PowerShell` on Windows; both are inspected the same way) that run
+  `claude mcp add`, `add-json` or `add-from-claude-desktop`, `codex mcp add`,
+  `gemini mcp add`, `opencode mcp add`, or `code --add-mcp`. Matching is
+  case-insensitive, allows flags and `.exe`/`.cmd` suffixes, and sees commands
+  inside `&&`, `||`, `;`, `|` chains and one or more `pwsh -c "..."` /
+  `bash -c '...'` wrappers, after `sudo`, `env`, `time`, `npx` and
+  `VAR=value` prefixes. PowerShell forms are handled conservatively: the call
+  operator `& "<path>\claude.exe" ...`, dot-sourcing, `$( )` / `{ }` groups,
+  backtick escapes, `Invoke-Expression` / `iex` (the argument, or any
+  multi-word string in a command that pipes into `iex`), `Invoke-Command
+  -ScriptBlock { ... }` and `Start-Process <prog> -ArgumentList ...`.
 - **Write / Edit / MultiEdit** of a file named `.mcp.json` or `mcp.json` whose
   new content defines a server with a `command`, or a `url` that is not the
   local broker entry named `mcpdoze`.
@@ -34,9 +40,10 @@ Options: `--scope user|project` (`<home>/.claude/settings.json` or
 `./.claude/settings.json`), `--settings PATH` to name a file, `--dry-run`,
 `--yes` (otherwise an interactive confirmation is required).
 
-Install adds one `hooks.PreToolUse` entry (matcher `Bash|Write|Edit|MultiEdit`,
+Install adds one `hooks.PreToolUse` entry (matcher `Bash|PowerShell|Write|Edit|MultiEdit`,
 command `"<path to mcpdoze>" hook claude-code`). Re-running it updates the path
-instead of duplicating. Remove deletes only that entry. Other settings and key
+and an older matcher (such as `Bash|Write|Edit|MultiEdit`) instead of
+duplicating. Remove deletes only that entry. Other settings and key
 order are preserved, an existing file is copied to
 `<file>.mcpdoze-bak-<UTC timestamp>` first, the write is atomic, and a file
 that is not valid JSON is refused and left untouched.
@@ -49,6 +56,6 @@ Use it only if you really want a native install.
 ## Limits
 
 This is a guardrail, not a security boundary. It looks at command text only: a
-command assembled at runtime, run from a script file, or otherwise obscured is
-not seen, and it does not watch other agents' config files. Malformed or
+command assembled at runtime, run from a script file, passed with
+`pwsh -EncodedCommand`, or otherwise obscured is not seen, and it does not watch other agents' config files. Malformed or
 unrecognised hook input is always allowed; the hook never fails closed.

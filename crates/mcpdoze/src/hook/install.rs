@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 /// Suffix that identifies our hook command.
 const OUR_SUFFIX: &str = "hook claude-code";
 /// Tool matcher of our entry.
-pub const MATCHER: &str = "Bash|Write|Edit|MultiEdit";
+pub const MATCHER: &str = "Bash|PowerShell|Write|Edit|MultiEdit";
 /// Largest settings file we will read.
 const MAX_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -320,6 +320,29 @@ mod tests {
         let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 1);
         assert_eq!(pre[0]["hooks"][0]["command"], new_cmd);
+    }
+
+    #[test]
+    fn reinstall_upgrades_old_matcher() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("settings.json");
+        // An entry written by an earlier version (no PowerShell).
+        std::fs::write(
+            &f,
+            format!(
+                r#"{{"hooks":{{"PreToolUse":[{{"matcher":"Bash|Write|Edit|MultiEdit","hooks":[{{"type":"command","command":{}}}]}}]}}}}"#,
+                serde_json::to_string(CMD).unwrap()
+            ),
+        )
+        .unwrap();
+        let p = plan(Op::Install, &f, CMD).unwrap();
+        assert!(p.new_text.is_some());
+        apply(&p).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0]["matcher"], "Bash|PowerShell|Write|Edit|MultiEdit");
+        assert!(plan(Op::Install, &f, CMD).unwrap().new_text.is_none());
     }
 
     #[test]

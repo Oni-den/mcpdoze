@@ -28,6 +28,8 @@ struct Config {
     resources: Vec<String>,
     templates: Vec<String>,
     log_messages: bool,
+    /// Extra variable names the `info` tool reports (`--echo-env NAME`).
+    echo_env: Vec<String>,
 }
 
 struct State {
@@ -79,6 +81,7 @@ fn parse_args() -> Result<Option<Config>, String> {
         resources: vec!["mock://readme".into()],
         templates: Vec::new(),
         log_messages: false,
+        echo_env: Vec::new(),
     };
     let list = |s: String| -> Vec<String> {
         s.split(',')
@@ -112,6 +115,7 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--resources" => c.resources = list(val()?),
             "--resource-templates" => c.templates = list(val()?),
             "--log-messages" => c.log_messages = true,
+            "--echo-env" => c.echo_env.push(val()?),
             "--sleep-forever" => return Ok(None),
             other => return Err(format!("unknown flag {other}")),
         }
@@ -207,7 +211,7 @@ fn handle_call(st: Arc<State>, id: Value, params: Value) {
         "roots" if st.cfg.roots => client_request(&st, "roots", "roots/list", json!({})),
         "info" => {
             let env: serde_json::Map<String, Value> = std::env::vars()
-                .filter(|(k, _)| k.starts_with("MCPDOZE_TEST_"))
+                .filter(|(k, _)| k.starts_with("MCPDOZE_TEST_") || st.cfg.echo_env.contains(k))
                 .map(|(k, v)| (k, Value::String(v)))
                 .collect();
             let cwd = std::env::current_dir()

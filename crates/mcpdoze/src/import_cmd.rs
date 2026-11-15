@@ -108,12 +108,20 @@ pub fn run_with(args: ImportArgs, json: bool) -> anyhow::Result<()> {
         "Set {} to the broker token in the agent's environment (the token is never written to a file).",
         plan.token_env_var
     );
-    println!(
-        "Undo with: mcpdoze import --from {} --rollback {}",
-        agent.as_str(),
-        result.manifest_path.display()
-    );
+    println!("{}", rollback_hint(&result.manifest_path));
     Ok(())
+}
+
+/// The undo hint printed after an import. `FROM` is positional and not needed
+/// with `--rollback`, so the hint names only the manifest.
+fn rollback_hint(manifest: &Path) -> String {
+    let p = manifest.display().to_string();
+    let p = if p.contains(char::is_whitespace) {
+        format!("\"{p}\"")
+    } else {
+        p
+    };
+    format!("Undo with: mcpdoze import --rollback {p}")
 }
 
 fn do_rollback(manifest: &Path, env: &ImportEnv, json: bool) -> anyhow::Result<()> {
@@ -222,4 +230,20 @@ fn read_token(cfg: &Config, data_dir: &Path) -> Option<String> {
     };
     let t = raw.trim().to_string();
     (!t.is_empty()).then_some(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_hint_uses_real_cli_shape() {
+        let h = rollback_hint(Path::new("m.json"));
+        assert_eq!(h, "Undo with: mcpdoze import --rollback m.json");
+        assert!(!h.contains("--from"));
+        assert_eq!(
+            rollback_hint(Path::new("a b.json")),
+            "Undo with: mcpdoze import --rollback \"a b.json\""
+        );
+    }
 }

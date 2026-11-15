@@ -4,6 +4,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use nix::errno::Errno;
@@ -180,8 +182,173 @@ fn private_bytes(_pid: u32) -> Option<u64> {
     None
 }
 
+/// `PATH` used when the broker has none, as `execvp` does.
+const DEFAULT_PATH: &str = "/usr/bin:/bin";
+
+/// Outcome of checking one candidate file.
+enum Candidate {
+    Executable,
+    NotExecutable,
+    Missing,
+}
+
+fn check_candidate(path: &Path) -> Candidate {
+    use std::os::unix::fs::PermissionsExt;
+    // `metadata` follows symlinks, like exec does.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => Candidate::Executable,
+        Ok(_) => Candidate::NotExecutable,
+        Err(_) => Candidate::Missing,
+    }
+}
+
+/// Finds `program` like a shell would: a name containing `/` is taken as a
+/// path (relative to the broker's working directory), anything else is
+/// searched in the absolute entries of `path`; empty and relative entries,
+/// which would mean the current directory, are skipped. Errors name the
+/// program only, never its arguments or environment.
+fn find_program(program: &OsStr, path: Option<&OsStr>) -> Result<PathBuf, ResolveError> {
+    let name = || program.to_string_lossy().into_owned();
+    if program.is_empty() {
+        return Err(ResolveError::NotFound(name()));
+    }
+    let p = Path::new(program);
+    if program.as_bytes().contains(&b'/') {
+        let abs = std::path::absolute(p).map_err(|_| ResolveError::NotFound(name()))?;
+        return match check_candidate(&abs) {
+            Candidate::Executable => Ok(abs),
+            Candidate::NotExecutable => Err(ResolveError::NotExecutable(name())),
+            Candidate::Missing => Err(ResolveError::NotFound(name())),
+        };
+    }
+    let path = path.unwrap_or_else(|| OsStr::new(DEFAULT_PATH));
+    let mut saw_non_exec = false;
+    for dir in std::env::split_paths(path).filter(|d| d.is_absolute()) {
+        let cand = dir.join(p);
+        match check_candidate(&cand) {
+            Candidate::Executable => return Ok(cand),
+            Candidate::NotExecutable => saw_non_exec = true,
+            Candidate::Missing => {}
+        }
+    }
+    Err(if saw_non_exec {
+        ResolveError::NotExecutable(name())
+    } else {
+        ResolveError::NotFound(name())
+    })
+}
+
 pub(super) fn resolve_command(program: &OsStr, args: &[OsString]) -> Result<Command, ResolveError> {
-    let mut cmd = Command::new(program);
+    let path = std::env::var_os("PATH");
+    let resolved = find_program(program, path.as_deref())?;
+    let mut cmd = Command::new(resolved);
     cmd.args(args);
     Ok(cmd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn make_file(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p
+    }
+
+    #[test]
+    fn finds_executable_on_path_as_absolute() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let exe = make_file(b.path(), "tool", 0o755);
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        let got = find_program(OsStr::new("tool"), Some(&path)).unwrap();
+        assert_eq!(got, exe);
+        assert!(got.is_absolute());
+    }
+
+    #[test]
+    fn skips_non_executable_and_keeps_searching() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        make_file(a.path(), "tool", 0o644);
+        let exe = make_file(b.path(), "tool", 0o700);
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        assert_eq!(find_program(OsStr::new("tool"), Some(&path)).unwrap(), exe);
+    }
+
+    #[test]
+    fn only_non_executable_match_is_not_executable() {
+        let a = tempfile::tempdir().unwrap();
+        make_file(a.path(), "tool", 0o644);
+        let path = std::env::join_paths([a.path()]).unwrap();
+        assert_eq!(
+            find_program(OsStr::new("tool"), Some(&path)),
+            Err(ResolveError::NotExecutable("tool".into()))
+        );
+    }
+
+    #[test]
+    fn directory_on_path_is_not_a_program() {
+        let a = tempfile::tempdir().unwrap();
+        let sub = a.path().join("tool");
+        std::fs::create_dir(&sub).unwrap();
+        let path = std::env::join_paths([a.path()]).unwrap();
+        assert!(find_program(OsStr::new("tool"), Some(&path)).is_err());
+    }
+
+    #[test]
+    fn empty_and_relative_path_entries_are_ignored() {
+        let a = tempfile::tempdir().unwrap();
+        make_file(a.path(), "tool", 0o755);
+        // A relative entry naming the same directory must not be searched.
+        let rel = a.path().strip_prefix("/").unwrap().as_os_str().to_owned();
+        let mut path = OsString::from(":");
+        path.push(&rel);
+        path.push(":.");
+        assert_eq!(
+            find_program(OsStr::new("tool"), Some(&path)),
+            Err(ResolveError::NotFound("tool".into()))
+        );
+    }
+
+    #[test]
+    fn path_with_separator_is_checked_directly() {
+        let a = tempfile::tempdir().unwrap();
+        let exe = make_file(a.path(), "tool", 0o755);
+        let plain = make_file(a.path(), "data", 0o644);
+        let empty = OsStr::new("");
+        assert_eq!(find_program(exe.as_os_str(), Some(empty)).unwrap(), exe);
+        assert_eq!(
+            find_program(plain.as_os_str(), Some(empty)),
+            Err(ResolveError::NotExecutable(
+                plain.to_string_lossy().into_owned()
+            ))
+        );
+        let missing = a.path().join("nope");
+        assert!(matches!(
+            find_program(missing.as_os_str(), Some(empty)),
+            Err(ResolveError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn errors_name_the_program_but_not_arguments() {
+        let err = resolve_command(
+            OsStr::new("mcpdoze-test-no-such-program-xyz"),
+            &[OsString::from("--token=secret-arg-value")],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mcpdoze-test-no-such-program-xyz"), "{msg}");
+        assert!(!msg.contains("secret-arg-value"), "{msg}");
+    }
+
+    #[test]
+    fn resolves_sh_to_an_absolute_path() {
+        let cmd = resolve_command(OsStr::new("sh"), &[]).unwrap();
+        assert!(Path::new(cmd.as_std().get_program()).is_absolute());
+    }
 }

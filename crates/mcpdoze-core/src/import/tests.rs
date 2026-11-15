@@ -358,7 +358,7 @@ fn claude_round_trip_and_rollback() {
 }
 
 #[test]
-fn rollback_refused_when_file_changed() {
+fn rollback_refused_when_json_invalid() {
     let f = fx();
     let cj = f.env.home.join(".claude.json");
     write(&cj, &claude_user_json());
@@ -366,14 +366,143 @@ fn rollback_refused_when_file_changed() {
     let res = apply(&p, &f.env.data_dir, &ApplyOptions::default())
         .unwrap()
         .unwrap();
-    let edited = format!("{} ", read(&cj));
+    let edited = format!("{} {{ broken", read(&cj));
     fs::write(&cj, &edited).unwrap();
     let broker_before = read(&f.env.broker_config);
     let err = rollback(&res.manifest_path).unwrap_err();
-    assert!(matches!(err, ImportError::Changed(_)), "{err}");
+    assert!(matches!(err, ImportError::Parse { .. }), "{err}");
     assert!(err.to_string().contains(".claude.json"));
-    // Nothing touched.
+    assert!(err.to_string().contains("refusing"));
+    // Nothing touched; the manifest is still usable.
     assert_eq!(read(&cj), edited);
+    assert_eq!(read(&f.env.broker_config), broker_before);
+    assert!(!read(&res.manifest_path).contains("rolled_back_utc"));
+}
+
+#[test]
+fn surgical_rollback_after_agent_rewrite() {
+    let f = fx();
+    let cj = f.env.home.join(".claude.json");
+    let original = claude_user_json();
+    write(&cj, &original);
+    let p = plan_for(&f, Agent::ClaudeCode);
+    let res = apply(&p, &f.env.data_dir, &ApplyOptions { now_secs: Some(0) })
+        .unwrap()
+        .unwrap();
+    // The manifest carries the entries but never the literal secret.
+    let mt = read(&res.manifest_path);
+    assert!(!mt.contains(SECRET));
+    assert!(mt.contains(REDACTED));
+    assert!(mt.contains("${OUTER_VAR}"));
+
+    // The agent rewrites its file: new unrelated keys, a changed value, a
+    // new server of its own.
+    let mut cur: serde_json::Value = serde_json::from_str(&read(&cj)).unwrap();
+    cur["numStartups"] = 4.into();
+    cur["tipsHistory"] = serde_json::json!({ "a": 1 });
+    cur["mcpServers"]["added-later"] = serde_json::json!({ "command": "mock2" });
+    fs::write(&cj, serde_json::to_string(&cur).unwrap()).unwrap();
+
+    let r = rollback(&res.manifest_path).unwrap();
+    assert_eq!(r.restored, vec![cj.clone()]);
+    assert_eq!(r.removed_servers.len(), p.items.len());
+    let after: serde_json::Value = serde_json::from_str(&read(&cj)).unwrap();
+    let orig: serde_json::Value = serde_json::from_str(&original).unwrap();
+    // Unrelated keys survive.
+    assert_eq!(after["numStartups"], 4);
+    assert_eq!(after["tipsHistory"]["a"], 1);
+    assert_eq!(after["mcpServers"]["added-later"]["command"], "mock2");
+    // Migrated entries are back, secrets included, in their old order.
+    for k in ["files", "remote one", "legacy", "mcpdoze"] {
+        assert_eq!(after["mcpServers"][k], orig["mcpServers"][k], "{k}");
+    }
+    let keys: Vec<&String> = after["mcpServers"].as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys,
+        ["files", "remote one", "legacy", "mcpdoze", "added-later"]
+    );
+    assert_eq!(
+        after["projects"]["/home/user/proj"],
+        orig["projects"]["/home/user/proj"]
+    );
+    assert!(Config::parse(&read(&f.env.broker_config))
+        .unwrap()
+        .servers
+        .is_empty());
+
+    // Second rollback: refused, nothing changes.
+    let snapshot = read(&cj);
+    assert!(matches!(
+        rollback(&res.manifest_path),
+        Err(ImportError::AlreadyRolledBack)
+    ));
+    assert_eq!(read(&cj), snapshot);
+}
+
+#[test]
+fn surgical_rollback_removes_created_container() {
+    let f = fx();
+    let cj = f.env.home.join(".claude.json");
+    // Only a project-scoped server: the import creates top-level mcpServers.
+    write(
+        &cj,
+        "{\"projects\": {\"/p\": {\"mcpServers\": {\"local\": {\"command\": \"mock\"}}}}}\n",
+    );
+    let p = plan_for(&f, Agent::ClaudeCode);
+    let res = apply(&p, &f.env.data_dir, &ApplyOptions::default())
+        .unwrap()
+        .unwrap();
+    let mut cur: serde_json::Value = serde_json::from_str(&read(&cj)).unwrap();
+    cur["other"] = true.into();
+    fs::write(&cj, serde_json::to_string(&cur).unwrap()).unwrap();
+    rollback(&res.manifest_path).unwrap();
+    let after: serde_json::Value = serde_json::from_str(&read(&cj)).unwrap();
+    assert!(after.get("mcpServers").is_none(), "{after}");
+    assert_eq!(after["other"], true);
+    assert_eq!(
+        after["projects"]["/p"]["mcpServers"]["local"]["command"],
+        "mock"
+    );
+}
+
+#[test]
+fn old_manifest_without_saved_entries_needs_identical_file() {
+    let f = fx();
+    let cj = f.env.home.join(".claude.json");
+    write(&cj, &claude_user_json());
+    let p = plan_for(&f, Agent::ClaudeCode);
+    let res = apply(&p, &f.env.data_dir, &ApplyOptions::default())
+        .unwrap()
+        .unwrap();
+    // Simulate a version 1 manifest.
+    let mut m: serde_json::Value = serde_json::from_str(&read(&res.manifest_path)).unwrap();
+    m["version"] = 1.into();
+    for file in m["files"].as_array_mut().unwrap() {
+        file.as_object_mut().unwrap().remove("json_edit");
+    }
+    fs::write(&res.manifest_path, m.to_string()).unwrap();
+    let edited = format!("{} ", read(&cj));
+    fs::write(&cj, &edited).unwrap();
+    let err = rollback(&res.manifest_path).unwrap_err();
+    assert!(matches!(err, ImportError::Changed(_)), "{err}");
+    assert_eq!(read(&cj), edited);
+}
+
+#[test]
+fn codex_rollback_refused_when_file_changed() {
+    let f = fx();
+    let cfg = f.env.codex_home.join("config.toml");
+    write(&cfg, "[mcp_servers.alpha]\ncommand = \"mock\"\n");
+    let p = plan_for(&f, Agent::Codex);
+    let res = apply(&p, &f.env.data_dir, &ApplyOptions::default())
+        .unwrap()
+        .unwrap();
+    let edited = format!("{}# edited\n", read(&cfg));
+    fs::write(&cfg, &edited).unwrap();
+    let broker_before = read(&f.env.broker_config);
+    let err = rollback(&res.manifest_path).unwrap_err();
+    assert!(matches!(err, ImportError::Changed(_)), "{err}");
+    assert_eq!(read(&cfg), edited);
     assert_eq!(read(&f.env.broker_config), broker_before);
 }
 

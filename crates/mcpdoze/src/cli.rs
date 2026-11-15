@@ -278,8 +278,9 @@ pub struct ImportCmdArgs {
     /// Do not ask for confirmation.
     #[arg(long, short = 'y')]
     pub yes: bool,
-    /// Restore a previous import from its backup file.
-    #[arg(long, value_name = "BACKUP")]
+    /// Undo a previous import, given the manifest path it printed
+    /// (`mcpdoze import --rollback <manifest>`; no agent argument needed).
+    #[arg(long, value_name = "MANIFEST")]
     pub rollback: Option<PathBuf>,
     /// MCPDoze config file to add the servers to.
     #[arg(long, value_name = "PATH", env = "MCPDOZE_CONFIG")]
@@ -470,6 +471,11 @@ mod tests {
         assert!(a.dry_run);
         assert!(Cli::try_parse_from(["mcpdoze", "import"]).is_err());
         assert!(Cli::try_parse_from(["mcpdoze", "import", "--rollback", "b.bak"]).is_ok());
+        let Command::Import(r) = parse(&["import", "--rollback", "m.json"]) else {
+            panic!()
+        };
+        assert!(r.from.is_none());
+        assert_eq!(r.rollback.as_deref(), Some(std::path::Path::new("m.json")));
         assert!(matches!(
             parse(&["autostart", "install", "--bind", "127.0.0.1:1"]),
             Command::Autostart {
