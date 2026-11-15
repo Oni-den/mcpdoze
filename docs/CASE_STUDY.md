@@ -53,3 +53,30 @@ The "2 processes" at idle are the broker plus its console host.
   scenarios.
 - The tool calls were deliberately light. Servers that grow with use (browsers,
   language servers) save more.
+
+## Field results: real servers behind the broker
+
+A second check used three real servers (a native stdio server backed by a
+local task database, an HTTP server, and a Node.js stdio server scoped per
+project directory) registered in one broker and reached from the agent through
+a single endpoint. The task-database benchmark ran against a throw-away copy,
+never live data, and the copy was deleted afterwards.
+
+| Measure (p50) | Direct stdio | Through the broker |
+|---|---:|---:|
+| Read call | 53-72 ms | 55-62 ms |
+| Write call | 69-322 ms | 70-278 ms |
+| First call, backend not running | 28 ms (own process) | 233 ms (spawn + handshake) |
+| First call after an explicit stop | n/a | 106 ms |
+| Broker memory, all backends unloaded | n/a | about 6 MB |
+
+- Steady-state latency through the broker was indistinguishable from a direct
+  stdio connection; the only cost is the one-off spawn on a cold backend.
+- After the idle TTL the real servers unloaded and no child processes were
+  left behind.
+- The tool catalog is served from disk, so `tools/list` answers with nothing
+  running. A per-project server's catalog grew from 19 to 55 tools after it was
+  first started in real project directories (the catalog self-heals on spawn).
+- Per-project scope gives one instance per directory, shared by every session
+  in that directory, instead of one per session.
+- Quiet-machine figures; single run. Treat them as indicative.
