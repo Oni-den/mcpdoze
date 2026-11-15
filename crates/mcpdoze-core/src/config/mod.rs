@@ -106,6 +106,14 @@ pub struct BrokerConfig {
     /// `127.0.0.1` and `[::1]` (needed for non-loopback binds).
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Directory of the on-disk tool catalog (`<catalog_dir>/<server>.json`);
+    /// `<data dir>/catalog` when unset.
+    #[serde(default)]
+    pub catalog_dir: Option<PathBuf>,
+    /// Default maximum catalog age before a background refresh (off when
+    /// unset); a server's own `catalog_max_age` wins.
+    #[serde(default, deserialize_with = "de_opt_duration")]
+    pub catalog_max_age: Option<Duration>,
 }
 
 impl Default for BrokerConfig {
@@ -119,6 +127,8 @@ impl Default for BrokerConfig {
             start_timeout: default_start_timeout(),
             log_dir: None,
             allowed_hosts: Vec::new(),
+            catalog_dir: None,
+            catalog_max_age: None,
         }
     }
 }
@@ -218,6 +228,20 @@ pub struct ServerConfig {
     /// Permit secret-looking literal values in `env` / `headers`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_literal_env: bool,
+    /// Probe the server once at registration (spawn, list, stop) when no
+    /// valid catalog exists. With `false` it stays uncatalogued until its
+    /// first `tools/list`, which starts it.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub probe: bool,
+    /// Refresh the catalog in the background once it is older than this
+    /// (falls back to `broker.catalog_max_age`; off when both are unset).
+    #[serde(
+        default,
+        deserialize_with = "de_opt_duration",
+        serialize_with = "ser_opt_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catalog_max_age: Option<Duration>,
 }
 
 fn is_default_scope(s: &Scope) -> bool {
@@ -243,6 +267,11 @@ impl ServerConfig {
     /// Idle TTL, falling back to the broker default.
     pub fn idle_ttl_or(&self, broker: &BrokerConfig) -> Duration {
         self.idle_ttl.unwrap_or(broker.default_idle_ttl)
+    }
+
+    /// Catalog maximum age, falling back to the broker default.
+    pub fn catalog_max_age_or(&self, broker: &BrokerConfig) -> Option<Duration> {
+        self.catalog_max_age.or(broker.catalog_max_age)
     }
 }
 
@@ -335,6 +364,12 @@ impl Config {
             if s.idle_ttl == Some(Duration::ZERO) {
                 errs.push(ValidationError::new(
                     f("idle_ttl"),
+                    "must be greater than 0",
+                ));
+            }
+            if s.catalog_max_age == Some(Duration::ZERO) {
+                errs.push(ValidationError::new(
+                    f("catalog_max_age"),
                     "must be greater than 0",
                 ));
             }

@@ -142,6 +142,40 @@ pub struct ReloadResponse {
     pub restart_required: Vec<String>,
 }
 
+/// `POST /servers/{name}/refresh` response, and one item of
+/// `POST /refresh`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RefreshResult {
+    /// Server name.
+    pub name: String,
+    /// True if any list differed from the stored catalog (it was updated and
+    /// streaming sessions were notified).
+    #[serde(default)]
+    pub changed: bool,
+    /// Tools listed.
+    #[serde(default)]
+    pub tools: usize,
+    /// Prompts listed.
+    #[serde(default)]
+    pub prompts: usize,
+    /// Resources listed.
+    #[serde(default)]
+    pub resources: usize,
+    /// Resource templates listed.
+    #[serde(default)]
+    pub resource_templates: usize,
+    /// Why listing failed (the catalog is then unchanged).
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `POST /refresh` response.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RefreshResponse {
+    /// One result per registered server, ordered by name.
+    pub servers: Vec<RefreshResult>,
+}
+
 /// `GET /servers/{name}/logs` query.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LogsQuery {

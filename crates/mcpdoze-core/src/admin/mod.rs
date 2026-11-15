@@ -31,7 +31,7 @@ use axum::Json;
 use crate::backend::stdio::STDERR_LINES;
 use crate::backend::{BackendSpec, Conn, Instance, StateKind};
 use crate::config::{self, Config, ServerConfig, Transport};
-use crate::router::Router;
+use crate::router::{CatalogOptions, Router};
 use api::*;
 
 /// Longest wait for in-flight calls on `stop` before the backend is killed.
@@ -106,6 +106,7 @@ impl IntoResponse for ControlError {
 struct Applied {
     prefix: String,
     spec: BackendSpec,
+    catalog: CatalogOptions,
 }
 
 #[derive(Default)]
@@ -173,6 +174,7 @@ fn broker_restart_fields(old: &config::BrokerConfig, new: &config::BrokerConfig)
     check("allow_remote", old.allow_remote == new.allow_remote);
     check("allowed_hosts", old.allowed_hosts == new.allowed_hosts);
     check("log_dir", old.log_dir == new.log_dir);
+    check("catalog_dir", old.catalog_dir == new.catalog_dir);
     out
 }
 
@@ -216,6 +218,25 @@ async fn write_config_text(path: &Path, text: String) -> Result<(), ControlError
 fn parse_config(text: &str) -> Result<Config, ControlError> {
     Config::parse(text)
         .map_err(|e| ControlError::Invalid("config file is invalid".into(), vec![e.to_string()]))
+}
+
+fn refresh_result(name: &str, res: Result<crate::router::RefreshOutcome, String>) -> RefreshResult {
+    match res {
+        Ok(o) => RefreshResult {
+            name: name.to_owned(),
+            changed: o.changed,
+            tools: o.tools,
+            prompts: o.prompts,
+            resources: o.resources,
+            resource_templates: o.resource_templates,
+            error: None,
+        },
+        Err(e) => RefreshResult {
+            name: name.to_owned(),
+            error: Some(e),
+            ..RefreshResult::default()
+        },
+    }
 }
 
 /// Unloads `instances` concurrently, each draining for at most `timeout`.
@@ -285,6 +306,10 @@ impl Control {
                         Applied {
                             prefix: s.effective_prefix(name),
                             spec,
+                            catalog: CatalogOptions {
+                                probe: s.probe,
+                                max_age: s.catalog_max_age_or(&new.broker),
+                            },
                         },
                     );
                 }
@@ -296,13 +321,24 @@ impl Control {
         }
         let mut unload = Vec::new();
         for (name, old) in &st.applied {
-            match desired.get(name) {
-                None => resp.removed.push(name.clone()),
-                Some(d) if d != old => resp.changed.push(name.clone()),
+            let removed = match desired.get(name) {
+                None => {
+                    resp.removed.push(name.clone());
+                    true
+                }
+                Some(d) if d != old => {
+                    resp.changed.push(name.clone());
+                    false
+                }
                 Some(_) => continue,
-            }
+            };
             if let Some(server) = self.router.unregister(name) {
                 unload.push(server.instance.clone());
+            }
+            // A changed server keeps its catalog; registration checks the
+            // fingerprint and re-probes if the launch spec differs.
+            if removed {
+                self.router.forget_catalog(name);
             }
         }
         unload_all(unload, RELOAD_DRAIN_TIMEOUT).await;
@@ -310,7 +346,10 @@ impl Control {
         for (name, d) in desired {
             let unchanged = st.applied.get(&name) == Some(&d);
             if !unchanged {
-                if let Err(e) = self.router.register(&name, &d.prefix, d.spec.clone()) {
+                if let Err(e) =
+                    self.router
+                        .register_with(&name, &d.prefix, d.spec.clone(), d.catalog)
+                {
                     resp.errors.push(format!("{name}: {e}"));
                     skipped.insert(name, e.to_string());
                     continue;
@@ -459,6 +498,7 @@ impl Control {
         }
         match self.router.unregister(name) {
             Some(server) => {
+                self.router.forget_catalog(name);
                 unload_all(vec![server.instance.clone()], STOP_DRAIN_TIMEOUT).await;
                 Ok(RemoveResponse {
                     name: name.to_owned(),
@@ -485,6 +525,41 @@ impl Control {
             name: name.to_owned(),
             state: state_name(inst.state()),
         })
+    }
+
+    /// Re-lists one server now (on its running process, else by probing)
+    /// and stores the catalog if it changed. A listing failure is reported
+    /// in `error`, not as an HTTP error.
+    pub async fn refresh(&self, name: &str) -> Result<RefreshResult, ControlError> {
+        let res = self
+            .router
+            .refresh(name)
+            .await
+            .ok_or_else(|| ControlError::NotFound(name.to_owned()))?;
+        Ok(refresh_result(name, res))
+    }
+
+    /// Re-lists every registered server, concurrently.
+    pub async fn refresh_all(&self) -> RefreshResponse {
+        let mut set = tokio::task::JoinSet::new();
+        for s in self.router.servers() {
+            let router = self.router.clone();
+            set.spawn(async move {
+                let res = router
+                    .refresh(&s.name)
+                    .await
+                    .unwrap_or_else(|| Err("server is no longer registered".into()));
+                refresh_result(&s.name, res)
+            });
+        }
+        let mut servers = Vec::new();
+        while let Some(r) = set.join_next().await {
+            if let Ok(r) = r {
+                servers.push(r);
+            }
+        }
+        servers.sort_by(|a, b| a.name.cmp(&b.name));
+        RefreshResponse { servers }
     }
 
     /// The last `lines` stderr lines of a server.
@@ -592,8 +667,21 @@ pub fn routes(control: Arc<Control>) -> axum::Router {
         .route("/servers/{name}", axum::routing::delete(delete_server))
         .route("/servers/{name}/stop", post(post_stop))
         .route("/servers/{name}/logs", get(get_logs))
+        .route("/servers/{name}/refresh", post(post_refresh_one))
         .route("/reload", post(post_reload))
+        .route("/refresh", post(post_refresh_all))
         .with_state(control)
+}
+
+async fn post_refresh_one(
+    State(c): State<Arc<Control>>,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Json<RefreshResult>, ControlError> {
+    c.refresh(&name).await.map(Json)
+}
+
+async fn post_refresh_all(State(c): State<Arc<Control>>) -> Json<RefreshResponse> {
+    Json(c.refresh_all().await)
 }
 
 async fn get_status(State(c): State<Arc<Control>>) -> Json<StatusResponse> {

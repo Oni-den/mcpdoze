@@ -256,8 +256,9 @@ fn mock_server_toml(name: &str, mock: &MockServerSpec) -> String {
 
 fn broker_toml(dir: &Path) -> String {
     format!(
-        "[broker]\nbind = \"127.0.0.1:0\"\ntoken_file = {}\n",
-        toml_str(&dir.join("token").to_string_lossy())
+        "[broker]\nbind = \"127.0.0.1:0\"\ntoken_file = {}\ncatalog_dir = {}\n",
+        toml_str(&dir.join("token").to_string_lossy()),
+        toml_str(&dir.join("catalog").to_string_lossy())
     )
 }
 
@@ -306,7 +307,7 @@ async fn host_origin_and_token_checks() {
             "localhost.example.com",
             "127.0.0.1.example.com",
             "example.com:7878",
-            "localhost@evil.example.com",
+            "localhost@example.com",
             "[::2]",
             "",
         ] {

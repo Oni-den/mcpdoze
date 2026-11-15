@@ -22,6 +22,10 @@ struct Config {
     sampling: bool,
     noise: bool,
     startup_delay_ms: u64,
+    prompts: Vec<String>,
+    resources: Vec<String>,
+    templates: Vec<String>,
+    log_messages: bool,
 }
 
 struct State {
@@ -65,6 +69,16 @@ fn parse_args() -> Result<Option<Config>, String> {
         sampling: false,
         noise: false,
         startup_delay_ms: 0,
+        prompts: vec!["greet".into()],
+        resources: vec!["mock://readme".into()],
+        templates: Vec::new(),
+        log_messages: false,
+    };
+    let list = |s: String| -> Vec<String> {
+        s.split(',')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -86,6 +100,10 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--garbage-on-start" => c.garbage = true,
             "--sampling-request" => c.sampling = true,
             "--stderr-noise" => c.noise = true,
+            "--prompts" => c.prompts = list(val()?),
+            "--resources" => c.resources = list(val()?),
+            "--resource-templates" => c.templates = list(val()?),
+            "--log-messages" => c.log_messages = true,
             "--sleep-forever" => return Ok(None),
             other => return Err(format!("unknown flag {other}")),
         }
@@ -132,6 +150,10 @@ fn handle_call(st: Arc<State>, id: Value, params: Value) {
                 "params":{"progressToken":token,"progress":p,"total":2}}));
         }
     };
+    if st.cfg.log_messages {
+        st.send(&json!({"jsonrpc":"2.0","method":"notifications/message",
+            "params":{"level":"info","logger":"mock","data":format!("calling {tool}")}}));
+    }
     let result = match tool.as_str() {
         "slow" => {
             progress(1);
@@ -233,10 +255,65 @@ fn handle(st: &Arc<State>, msg: Value) {
         }
         "ping" => reply(json!({})),
         "tools/list" => reply(tools_list(st)),
-        "prompts/list" => reply(json!({"prompts":[{"name":"greet","description":"mock prompt"}]})),
-        "resources/list" => reply(
-            json!({"resources":[{"uri":"mock://readme","name":"readme","mimeType":"text/plain"}]}),
-        ),
+        "prompts/list" => {
+            let prompts: Vec<Value> = st
+                .cfg
+                .prompts
+                .iter()
+                .map(|n| json!({"name":n,"description":"mock prompt"}))
+                .collect();
+            reply(json!({ "prompts": prompts }))
+        }
+        "prompts/get" => {
+            let name = params["name"].as_str().unwrap_or("");
+            if st.cfg.prompts.iter().any(|p| p == name) {
+                reply(
+                    json!({"description":"mock prompt","messages":[{"role":"user",
+                    "content":{"type":"text","text":format!("prompt {name} args {}",
+                        params.get("arguments").cloned().unwrap_or(json!({})))}}]}),
+                );
+            } else {
+                st.send(&json!({"jsonrpc":"2.0","id":id,
+                    "error":{"code":-32602,"message":format!("unknown prompt {name}")}}));
+            }
+        }
+        "resources/list" => {
+            let resources: Vec<Value> = st
+                .cfg
+                .resources
+                .iter()
+                .map(|u| {
+                    let name = u.rsplit('/').next().unwrap_or(u);
+                    json!({"uri":u,"name":name,"mimeType":"text/plain"})
+                })
+                .collect();
+            reply(json!({ "resources": resources }))
+        }
+        "resources/templates/list" => {
+            let templates: Vec<Value> = st
+                .cfg
+                .templates
+                .iter()
+                .map(|t| json!({"uriTemplate":t,"name":"template","mimeType":"text/plain"}))
+                .collect();
+            reply(json!({ "resourceTemplates": templates }))
+        }
+        "resources/read" => {
+            let uri = params["uri"].as_str().unwrap_or("").to_string();
+            let known = st.cfg.resources.contains(&uri)
+                || st.cfg.templates.iter().any(|t| {
+                    t.split('{')
+                        .next()
+                        .is_some_and(|lit| !lit.is_empty() && uri.starts_with(lit))
+                });
+            if known {
+                reply(json!({"contents":[{"uri":uri,"mimeType":"text/plain",
+                    "text":format!("contents of {uri}")}]}));
+            } else {
+                st.send(&json!({"jsonrpc":"2.0","id":id,
+                    "error":{"code":-32002,"message":"resource not found"}}));
+            }
+        }
         "tools/call" => {
             let st = st.clone();
             std::thread::spawn(move || handle_call(st, id, params));

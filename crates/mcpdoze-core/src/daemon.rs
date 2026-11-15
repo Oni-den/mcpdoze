@@ -20,7 +20,7 @@ use crate::auth::{self, Token};
 use crate::backend::Tuning;
 use crate::config::{self, BrokerConfig, Config, ConfigError};
 use crate::http::{self, Security};
-use crate::router::{Catalog, MemoryCatalog, Router};
+use crate::router::{Catalog, DiskCatalog, MemoryCatalog, Router};
 
 /// Quiet period after a config-file event before reloading.
 pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -28,6 +28,8 @@ pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// Token file name in the data directory when `token_file` is not set.
 pub const DEFAULT_TOKEN_FILE: &str = "token";
+/// Catalog directory name in the data directory when `catalog_dir` is not set.
+pub const DEFAULT_CATALOG_DIR: &str = "catalog";
 
 /// How to run the broker.
 #[derive(Clone)]
@@ -40,7 +42,7 @@ pub struct ServeOptions {
     pub watch: bool,
     /// Lifecycle timing.
     pub tuning: Tuning,
-    /// Tool catalog (in-memory when `None`).
+    /// Catalog; when `None`, a [`DiskCatalog`] in [`catalog_dir`].
     pub catalog: Option<Arc<dyn Catalog>>,
 }
 
@@ -165,6 +167,29 @@ fn token_path(broker: &BrokerConfig) -> Result<PathBuf, DaemonError> {
     Ok(dir.join(rel))
 }
 
+/// The catalog directory: `broker.catalog_dir` (a relative path is resolved
+/// against the platform data directory), else `<data dir>/catalog`.
+pub fn catalog_dir(broker: &BrokerConfig) -> Option<PathBuf> {
+    match &broker.catalog_dir {
+        Some(p) if p.is_absolute() => Some(p.clone()),
+        Some(p) => config::default_data_dir().map(|d| d.join(p)),
+        None => config::default_data_dir().map(|d| d.join(DEFAULT_CATALOG_DIR)),
+    }
+}
+
+fn default_catalog(broker: &BrokerConfig) -> Arc<dyn Catalog> {
+    match catalog_dir(broker) {
+        Some(dir) => {
+            tracing::info!(path = %dir.display(), "catalog directory");
+            Arc::new(DiskCatalog::new(dir))
+        }
+        None => {
+            tracing::warn!("cannot determine the data directory; the catalog stays in memory");
+            Arc::new(MemoryCatalog::default())
+        }
+    }
+}
+
 fn parse_bind(bind: &str) -> Result<SocketAddr, DaemonError> {
     let bad = |m: &str| DaemonError::Bind {
         addr: bind.to_owned(),
@@ -274,10 +299,10 @@ impl Daemon {
             addr: cfg.broker.bind.clone(),
             source,
         })?;
-        let catalog = opts
-            .catalog
-            .clone()
-            .unwrap_or_else(|| Arc::new(MemoryCatalog::default()));
+        let catalog = match opts.catalog.clone() {
+            Some(c) => c,
+            None => default_catalog(&cfg.broker),
+        };
         let router = Router::with(catalog, opts.tuning);
         let security = Security::new(token, cfg.broker.allowed_hosts.clone());
         let control = Control::new(router, cfg, path.clone());

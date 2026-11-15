@@ -127,7 +127,10 @@ table in the config file (durations as strings such as `"5m"`).
 - With a config file the new table is appended to it, keeping comments and
   formatting, by writing a temporary file and renaming it over the original.
   Without one the server lasts until the broker exits.
-- Nothing is spawned; the backend starts on its first call.
+- The backend itself is not started. Unless the server has `probe = false`,
+  and no valid catalog exists for it (see [CATALOG.md](CATALOG.md)), a
+  throwaway instance is probed once in the background (spawn, list tools,
+  prompts and resources, stop) so later lists need no process.
 
 Response `201`:
 
@@ -168,11 +171,35 @@ changes (`400`). `409` if the broker runs without a config file.
 
 `restart_required` lists `[broker]` settings that changed but only apply
 after a restart (`bind`, `token_file`, `token_env`, `allow_remote`,
-`allowed_hosts`, `log_dir`). `default_idle_ttl` and `start_timeout` apply on
-reload.
+`allowed_hosts`, `log_dir`, `catalog_dir`). `default_idle_ttl`,
+`start_timeout` and `catalog_max_age` apply on reload. A changed server whose
+launch fingerprint changed (command, arguments, working directory, URL,
+environment or header names) is probed again.
 
 `mcpdoze serve` also watches the config file and reloads it automatically
 (debounced) unless started with `--no-watch`.
+
+### `POST /servers/{name}/refresh`
+
+Re-lists one server's tools, prompts, resources and resource templates now:
+on its running process if it has one, else by probing a throwaway instance
+(started, listed, stopped; the server's own instance stays as it was). A
+non-empty difference is stored in the catalog and sent as
+`notifications/*/list_changed` to agent sessions with an open stream.
+
+```json
+{ "name": "example", "changed": true, "tools": 12, "prompts": 0,
+  "resources": 3, "resource_templates": 1, "error": null }
+```
+
+A listing failure is still `200`, with `error` set and the catalog unchanged.
+`404` if the server is unknown.
+
+### `POST /refresh`
+
+Refreshes every registered server concurrently, as above:
+`{ "servers": [ { "name": "example", "changed": false, ... } ] }`, ordered by
+name.
 
 ### `GET /servers/{name}/logs[?lines=N]`
 

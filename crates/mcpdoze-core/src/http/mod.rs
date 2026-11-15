@@ -8,8 +8,15 @@
 //!   `initialize` creates a session and returns `Mcp-Session-Id`.
 //!   Requests without a session id are served on an ephemeral session after
 //!   checking `MCP-Protocol-Version` (stateless clients).
-//! * `GET /mcp`: `405` until the SSE stream exists.
-//! * `DELETE /mcp`: ends the session and cancels its in-flight calls.
+//! * `GET /mcp` with `Mcp-Session-Id` and `Accept: text/event-stream`: the
+//!   session's notification stream (server-sent events: list changes,
+//!   progress, backend log messages; keep-alive comments every
+//!   [`SSE_KEEPALIVE`](crate::router::SSE_KEEPALIVE)). One stream per
+//!   session; a new one replaces the old. Without a session id `405`
+//!   (stateless clients have no stream), unknown session `404`, wrong
+//!   `Accept` `406`. No resumption (`Last-Event-ID` is ignored).
+//! * `DELETE /mcp`: ends the session, closes its stream and cancels its
+//!   in-flight calls.
 //! * `/admin/v1/...`: see [`crate::admin`].
 //! * `GET /healthz`: liveness (`ok`), no token required.
 //!
@@ -30,6 +37,8 @@
 //!
 //! If the agent disconnects mid-request the handler future is dropped, which
 //! cancels the backend call (see the router).
+
+mod sse;
 
 use std::future::Future;
 use std::io;
@@ -172,11 +181,16 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
     let app = app(control.clone(), Arc::new(security));
+    let router = control.router().clone();
     let res = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
+    .with_graceful_shutdown(async move {
+        shutdown.await;
+        // Open notification streams would otherwise hold the shutdown.
+        router.close_streams();
+    })
     .await;
     control.shutdown().await;
     res
@@ -288,10 +302,47 @@ async fn post_mcp(State(router): State<Arc<Router>>, headers: HeaderMap, body: B
     }
 }
 
-async fn get_mcp() -> Response {
+async fn get_mcp(State(router): State<Arc<Router>>, headers: HeaderMap) -> Response {
+    let Some(id) = header_str(&headers, SESSION_HEADER) else {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, "POST, DELETE")],
+        )
+            .into_response();
+    };
+    let wants_sse = headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.to_ascii_lowercase().contains("text/event-stream"));
+    if !wants_sse {
+        return StatusCode::NOT_ACCEPTABLE.into_response();
+    }
+    let Some(session) = router.session(id) else {
+        return rpc_error(
+            StatusCode::NOT_FOUND,
+            jsonrpc::INVALID_REQUEST,
+            "unknown session",
+        );
+    };
+    if router.is_closing() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(stream_id) = session.open_stream() else {
+        return rpc_error(
+            StatusCode::NOT_FOUND,
+            jsonrpc::INVALID_REQUEST,
+            "unknown session",
+        );
+    };
+    let stream = sse::SseStream::new(session, stream_id, router.sse_keepalive());
     (
-        StatusCode::METHOD_NOT_ALLOWED,
-        [(header::ALLOW, "POST, DELETE")],
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(stream),
     )
         .into_response()
 }

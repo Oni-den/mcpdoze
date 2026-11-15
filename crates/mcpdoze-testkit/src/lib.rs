@@ -42,9 +42,36 @@ pub struct MockServerSpec {
     sampling_request: bool,
     stderr_noise: bool,
     startup_delay_ms: Option<u64>,
+    prompts: Option<Vec<String>>,
+    resources: Option<Vec<String>>,
+    resource_templates: Option<Vec<String>>,
+    log_messages: bool,
 }
 
 impl MockServerSpec {
+    /// Prompt names offered (default `greet`); `prompts/get` echoes the
+    /// arguments.
+    pub fn prompts(mut self, p: &[&str]) -> Self {
+        self.prompts = Some(p.iter().map(|s| s.to_string()).collect());
+        self
+    }
+    /// Resource URIs offered (default `mock://readme`); `resources/read`
+    /// returns `contents of <uri>`.
+    pub fn resources(mut self, r: &[&str]) -> Self {
+        self.resources = Some(r.iter().map(|s| s.to_string()).collect());
+        self
+    }
+    /// Resource templates offered (default none). `resources/read` accepts
+    /// any URI starting with a template's text before its first `{`.
+    pub fn resource_templates(mut self, t: &[&str]) -> Self {
+        self.resource_templates = Some(t.iter().map(|s| s.to_string()).collect());
+        self
+    }
+    /// Emit a `notifications/message` log notification at each tool call.
+    pub fn log_messages(mut self) -> Self {
+        self.log_messages = true;
+        self
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -135,10 +162,20 @@ impl MockServerSpec {
         if let Some(v) = self.startup_delay_ms {
             kv("--startup-delay-ms", v.to_string());
         }
+        if let Some(v) = &self.prompts {
+            kv("--prompts", v.join(","));
+        }
+        if let Some(v) = &self.resources {
+            kv("--resources", v.join(","));
+        }
+        if let Some(v) = &self.resource_templates {
+            kv("--resource-templates", v.join(","));
+        }
         for (on, flag) in [
             (self.garbage_on_start, "--garbage-on-start"),
             (self.sampling_request, "--sampling-request"),
             (self.stderr_noise, "--stderr-noise"),
+            (self.log_messages, "--log-messages"),
         ] {
             if on {
                 a.push(flag.to_string());
