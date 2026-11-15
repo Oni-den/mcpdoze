@@ -120,6 +120,25 @@ Sequence: M0, M1, then M2 and M3 are sequential (core router and lifecycle).
 After M2 interfaces freeze, M4, M5, M6, the skill and docs run in parallel.
 M7 follows M3. M8 is last.
 
+## Status
+
+Updated from the code and git history. Note: `rmcp` is not used; the router is
+hand-written (see `decisions/0001-rmcp-vs-handrolled.md`), so the Architecture
+paragraph above is historical.
+
+| M | State | Notes |
+|---|---|---|
+| M0 | done | Workspace, license, CI, DCO check, PII lint, cargo-deny. |
+| M1 | done | Config, process-tree module, testkit mock; raw-passthrough decision recorded. |
+| M2 | done | HTTP endpoint, stdio backend, namespacing, id remap, lazy spawn. |
+| M3 | done | Lifecycle, idle TTL, cancellation, progress. |
+| M4 | done | Disk catalog, probe, refresh, `list_changed`, prompts and resources. |
+| M5 | done | Auth, Host/Origin checks, secret refs, admin API and CLI. |
+| M6 | done | HTTP passthrough. |
+| M7 | in progress | `per-cwd` / `per-session` scopes and server-to-client routing. |
+| M8 | partial | Autostart, migration skill, hook and case study done; release binaries in progress; soak and Linux/macOS verification todo; v0.1.0 not tagged. |
+
+
 ## Hardest problems
 
 1. TTL versus incoming-call race: single lock-guarded transition, RAII guards,
