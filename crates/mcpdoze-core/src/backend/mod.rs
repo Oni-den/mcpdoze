@@ -7,6 +7,7 @@
 //! * [`lifecycle`]: the per-instance state machine (lazy start, idle TTL,
 //!   crash backoff) that owns at most one [`stdio`] connection at a time.
 
+pub mod headers_helper;
 pub mod http;
 pub mod jsonrpc;
 pub mod lifecycle;
@@ -35,6 +36,10 @@ pub struct HttpSpec {
     pub url: String,
     /// Extra request headers, already resolved. Values are never logged.
     pub headers: BTreeMap<String, String>,
+    /// Shell command whose JSON-object output adds or overrides headers
+    /// (see [`headers_helper`]). Run on connect, re-initialise and once
+    /// after a 401/403. Its output is never logged.
+    pub headers_helper: Option<String>,
     /// Timeout for one upstream request (including a streamed response).
     pub request_timeout: Duration,
 }
@@ -203,9 +208,18 @@ impl BackendSpec {
         s.http = Some(HttpSpec {
             url: url.into(),
             headers: BTreeMap::new(),
+            headers_helper: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
         });
         s
+    }
+
+    /// Sets the headers helper command (HTTP backends only; no-op otherwise).
+    pub fn headers_helper(mut self, command: impl Into<String>) -> Self {
+        if let Some(h) = &mut self.http {
+            h.headers_helper = Some(command.into());
+        }
+        self
     }
 
     /// Adds a resolved request header (HTTP backends only; no-op otherwise).
@@ -257,6 +271,7 @@ impl fmt::Debug for HttpSpec {
         f.debug_struct("HttpSpec")
             .field("url", &"<redacted>")
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("headers_helper", &self.headers_helper.is_some())
             .field("request_timeout", &self.request_timeout)
             .finish()
     }

@@ -64,6 +64,7 @@ pub async fn run(cmd: Command, out: &mut dyn Write, stdout_is_tty: bool) -> Resu
                     config: a.config,
                     broker_url: a.broker_url,
                     scope: a.scope,
+                    allow_helpers: a.allow_helpers,
                 },
                 json,
             )?;
@@ -310,6 +311,7 @@ pub fn build_register(a: &AddArgs) -> Result<RegisterRequest> {
             enabled: true,
             url,
             headers,
+            headers_helper: None,
             allow_literal_env: a.allow_literal_env,
             probe: true,
             catalog_max_age: None,
@@ -412,6 +414,13 @@ async fn logs(a: LogsArgs, out: &mut dyn Write) -> Result<()> {
 
 fn token(a: TokenArgs, out: &mut dyn Write, tty: bool) -> Result<()> {
     let conn = Conn::resolve(&a.conn);
+    if a.headers_json {
+        // For an agent's headersHelper: machine-readable, so allowed when
+        // stdout is a pipe. Read errors never contain the token.
+        let header = format!("Bearer {}", conn.read_token()?);
+        writeln!(out, "{}", serde_json::json!({ "Authorization": header }))?;
+        return Ok(());
+    }
     if a.show {
         if !tty {
             bail!("refusing to print the token: stdout is not a terminal (use the token file path instead)");

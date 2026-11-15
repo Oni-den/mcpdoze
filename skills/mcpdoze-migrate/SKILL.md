@@ -77,6 +77,10 @@ session, which is what MCPDoze exists to prevent. Instead:
      NOT migrated automatically. Ask the user to put the secret in an
      environment variable they choose and re-run; never ask them to paste the
      secret into the chat.
+   - Entries with `headers_helper: true` carry a `headersHelper` command the
+     broker will run. Show the user the command (it is in their own config)
+     before applying. Project-scoped helpers are skipped unless the user, after
+     reviewing them, agrees to re-run with `--allow-helpers`.
 5. **Token environment variable.** Agents read the broker token from the
    `MCPDOZE_TOKEN` environment variable. `mcpdoze token` prints the token file
    *path* only. Tell the user to set `MCPDOZE_TOKEN` from that file in their

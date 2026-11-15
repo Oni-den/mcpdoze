@@ -35,6 +35,7 @@ const FIELD_ORDER: &[&str] = &[
     "cwd",
     "url",
     "headers",
+    "headers_helper",
     "scope",
     "max_instances",
     "idle_ttl",

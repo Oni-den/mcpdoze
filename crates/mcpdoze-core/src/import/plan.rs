@@ -44,6 +44,8 @@ pub struct PlanItem {
     pub env_keys: Vec<String>,
     pub url: Option<String>,
     pub header_names: Vec<String>,
+    /// A `headersHelper` command is migrated (never its output).
+    pub headers_helper: bool,
     pub scope: Scope,
     pub scope_reason: Option<String>,
     pub needs_env_var: Vec<NeedsEnvVar>,
@@ -128,6 +130,9 @@ impl Plan {
             }
             if !it.header_names.is_empty() {
                 let _ = writeln!(s, "      header names: {}", it.header_names.join(", "));
+            }
+            if it.headers_helper {
+                let _ = writeln!(s, "      headers helper: yes (command run by the broker)");
             }
             for n in &it.needs_env_var {
                 let _ = writeln!(
@@ -392,6 +397,34 @@ pub fn build_plan(
     env: &ImportEnv,
     scope_override: Option<Scope>,
 ) -> Result<Plan, ImportError> {
+    build_plan_with(
+        agent,
+        env,
+        &PlanOptions {
+            scope: scope_override,
+            ..PlanOptions::default()
+        },
+    )
+}
+
+/// Planning options.
+#[derive(Debug, Clone, Default)]
+pub struct PlanOptions {
+    /// Force one scope for every item.
+    pub scope: Option<Scope>,
+    /// Import `headersHelper` commands from project-scoped configs too
+    /// (user-scoped ones are always imported). Helpers are never run while
+    /// planning.
+    pub allow_helpers: bool,
+}
+
+/// [uild_plan] with all options.
+pub fn build_plan_with(
+    agent: Agent,
+    env: &ImportEnv,
+    opts: &PlanOptions,
+) -> Result<Plan, ImportError> {
+    let scope_override = opts.scope;
     let existing = if exists(&env.broker_config) {
         Config::load(&env.broker_config).map_err(|e| {
             ImportError::Invalid(format!(
@@ -455,7 +488,12 @@ pub fn build_plan(
                     ));
                     continue;
                 }
-                RawSpec::Http { url, headers, .. } => {
+                RawSpec::Http {
+                    url,
+                    headers,
+                    headers_helper,
+                    ..
+                } => {
                     if norm_url(url) == broker_norm {
                         skipped.push(skip(&raw, "already points at the broker"));
                         continue;
@@ -470,6 +508,19 @@ pub fn build_plan(
                     let mut c = blank(Transport::Http);
                     c.url = Some(url.clone());
                     c.headers = convert_map(&name, headers, true, &mut needs, &mut cwarn);
+                    if let Some(h) = headers_helper {
+                        if raw.source.project_scoped && !opts.allow_helpers {
+                            skipped.push(skip(
+                                &raw,
+                                "project-scoped headersHelper runs a command from the project; review it and pass --allow-helpers to import it",
+                            ));
+                            continue;
+                        }
+                        cwarn.push(
+                            "headersHelper is run by the broker (on connect and after a 401/403); its output is never logged".into(),
+                        );
+                        c.headers_helper = Some(h.clone());
+                    }
                     c
                 }
                 RawSpec::Stdio { command, args, env } => {
@@ -596,6 +647,7 @@ pub fn build_plan(
             env_keys: config.env.keys().cloned().collect(),
             url: config.url.clone(),
             header_names: config.headers.keys().cloned().collect(),
+            headers_helper: config.headers_helper.is_some(),
             scope: if already { config.scope } else { scope },
             scope_reason: if already { None } else { reason },
             needs_env_var: c.needs,

@@ -8,8 +8,9 @@
 //! text/event-stream with a progress notification first), `--require-header
 //! NAME=VALUE` (401 otherwise), `--drop-session-after N` (a session is dropped
 //! after N requests: later requests with it get 404 until re-initialised),
-//! `--slow-ms N`. Built-in tools: `echo`, `session_count` (initialize calls
-//! seen) and `delete_count` (DELETE requests seen).
+//! `--slow-ms N`, `--reject-calls N` (the first N `tools/call` requests get
+//! 401). Built-in tools: `echo`, `session_count` (initialize calls seen) and
+//! `delete_count` (DELETE requests seen).
 //!
 //! Minimal hand-written HTTP/1.1 (keep-alive, Content-Length bodies, chunked
 //! SSE responses) so the testkit needs no HTTP framework.
@@ -31,12 +32,14 @@ struct Cfg {
     require: Option<(String, String)>,
     drop_after: Option<u64>,
     slow_ms: u64,
+    reject_calls: u64,
 }
 
 #[derive(Default)]
 struct State {
     inits: u64,
     deletes: u64,
+    rejected: u64,
     next: u64,
     sessions: HashMap<String, u64>,
 }
@@ -70,6 +73,9 @@ fn parse_args() -> Cfg {
             }
             "--drop-session-after" => cfg.drop_after = it.next().and_then(|v| v.parse().ok()),
             "--slow-ms" => cfg.slow_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--reject-calls" => {
+                cfg.reject_calls = it.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
             _ => {}
         }
     }
@@ -199,6 +205,19 @@ async fn handle(
     };
     let method = msg["method"].as_str().unwrap_or("").to_owned();
     let id = msg.get("id").cloned().filter(|i| !i.is_null());
+    if method == "tools/call" {
+        let reject = {
+            let mut st = lock(state);
+            let r = st.rejected < cfg.reject_calls;
+            if r {
+                st.rejected += 1;
+            }
+            r
+        };
+        if reject {
+            return simple(s, "401 Unauthorized", &[], "text/plain", "expired").await;
+        }
+    }
 
     if method == "initialize" {
         let new_sid = {

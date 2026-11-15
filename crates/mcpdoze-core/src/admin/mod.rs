@@ -165,6 +165,9 @@ fn build_spec(server: &ServerConfig, broker: &config::BrokerConfig) -> Result<Ba
             for (k, v) in config::resolve_headers(server).map_err(|e| e.to_string())? {
                 spec = spec.header(k, v);
             }
+            if let Some(h) = &server.headers_helper {
+                spec = spec.headers_helper(h.clone());
+            }
             spec
         }
     };

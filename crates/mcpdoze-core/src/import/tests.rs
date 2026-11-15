@@ -583,3 +583,49 @@ fn agent_names_parse() {
     assert_eq!("VSCode".parse::<Agent>().unwrap(), Agent::VsCode);
     assert!("nope".parse::<Agent>().is_err());
 }
+
+#[test]
+fn headers_helper_import_and_project_opt_in() {
+    let f = fx();
+    let marker = f.env.cwd.join("helper-ran");
+    let helper = format!("example-helper --touch {}", marker.display());
+    write(
+        &f.env.home.join(".claude.json"),
+        &serde_json::json!({"mcpServers": {"user-remote": {
+            "type": "http", "url": "https://example.com/u",
+            "headersHelper": helper}}})
+        .to_string(),
+    );
+    write(
+        &f.env.cwd.join(".mcp.json"),
+        &serde_json::json!({"mcpServers": {"proj-remote": {
+            "type": "http", "url": "https://example.com/p",
+            "headersHelper": helper}}})
+        .to_string(),
+    );
+    // Default: user-scoped helpers import, project-scoped ones are skipped.
+    let p = plan_for(&f, Agent::ClaudeCode);
+    let u = item(&p, "user-remote");
+    assert!(u.headers_helper);
+    assert_eq!(u.config.headers_helper.as_deref(), Some(helper.as_str()));
+    assert!(p.render_text().contains("headers helper: yes"));
+    assert!(p.items.iter().all(|i| i.name != "proj-remote"));
+    let sk = p.skipped.iter().find(|s| s.name == "proj-remote").unwrap();
+    assert!(sk.reason.contains("--allow-helpers"), "{}", sk.reason);
+
+    // Explicit opt-in imports it; planning never runs a helper.
+    let opts = PlanOptions {
+        allow_helpers: true,
+        ..PlanOptions::default()
+    };
+    let p = build_plan_with(Agent::ClaudeCode, &f.env, &opts).unwrap();
+    let pr = item(&p, "proj-remote");
+    assert!(pr.headers_helper);
+    assert_eq!(pr.scope, Scope::PerCwd);
+    assert!(!marker.exists());
+
+    // The migrated config validates and round-trips the helper.
+    let mut cfg = Config::default();
+    cfg.servers.insert(pr.name.clone(), pr.config.clone());
+    cfg.validate().unwrap();
+}

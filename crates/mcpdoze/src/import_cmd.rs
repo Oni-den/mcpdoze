@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use mcpdoze_core::config::{default_data_dir, Config, Scope};
-use mcpdoze_core::import::{apply, build_plan, rollback, Agent, ApplyOptions, ImportEnv};
+use mcpdoze_core::import::{
+    apply, build_plan_with, rollback, Agent, ApplyOptions, ImportEnv, PlanOptions,
+};
 
 /// Arguments of `mcpdoze import`.
 #[derive(Debug, Clone)]
@@ -23,6 +25,8 @@ pub struct ImportArgs {
     pub config: Option<PathBuf>,
     pub broker_url: String,
     pub scope: Option<String>,
+    /// Import `headersHelper` commands from project-scoped configs too.
+    pub allow_helpers: bool,
 }
 
 /// Runs the import with human-readable output.
@@ -43,7 +47,14 @@ pub fn run_with(args: ImportArgs, json: bool) -> anyhow::Result<()> {
         None => None,
         Some(s) => Some(parse_scope(s)?),
     };
-    let plan = build_plan(agent, &env, scope)?;
+    let plan = build_plan_with(
+        agent,
+        &env,
+        &PlanOptions {
+            scope,
+            allow_helpers: args.allow_helpers,
+        },
+    )?;
     if args.dry_run {
         if json {
             println!("{}", plan.to_json());

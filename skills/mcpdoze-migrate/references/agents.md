@@ -17,6 +17,14 @@ Notes:
 - OpenCode files containing comments are skipped rather than rewritten (a
   rewrite would drop the comments); migrate those by hand using
   `mcpdoze add`.
+- Claude Code `headersHelper` (http entries) is copied to the broker's
+  `headers_helper` and run by the broker, never by the import (not even with
+  `--dry-run`). Helpers from project-scoped files are skipped unless
+  `--allow-helpers` is given. See docs/CONFIGURATION.md, "Headers helper".
+- Instead of the `MCPDOZE_TOKEN` variable, a Claude Code entry may use
+  `"headersHelper": "mcpdoze token --headers-json"`, which prints
+  `{"Authorization":"Bearer <token>"}` from the token file or
+  `broker.token_env`.
 - Literal secret values are never migrated. They are reported by key name so
   the user can move them into an environment variable.
 - Agents not listed: register servers manually with

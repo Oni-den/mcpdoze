@@ -162,8 +162,12 @@ pub struct TokenArgs {
     #[command(flatten)]
     pub conn: ConnArgs,
     /// Print the token itself (only when stdout is a terminal).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "headers_json")]
     pub show: bool,
+    /// Print `{"Authorization":"Bearer <token>"}` for an agent's
+    /// `headersHelper` (allowed when stdout is not a terminal).
+    #[arg(long)]
+    pub headers_json: bool,
 }
 
 /// Transport of a server being added.
@@ -291,6 +295,10 @@ pub struct ImportCmdArgs {
     /// Instance scope for imported servers.
     #[arg(long)]
     pub scope: Option<String>,
+    /// Also import `headersHelper` commands from project-scoped configs
+    /// (review them first: the broker runs them).
+    #[arg(long)]
+    pub allow_helpers: bool,
     /// Print the plan or result as JSON.
     #[arg(long)]
     pub json: bool,
@@ -456,6 +464,11 @@ mod tests {
             panic!()
         };
         assert!(a.show);
+        let Command::Token(a) = parse(&["token", "--headers-json"]) else {
+            panic!()
+        };
+        assert!(a.headers_json && !a.show);
+        assert!(Cli::try_parse_from(["mcpdoze", "token", "--show", "--headers-json"]).is_err());
         assert!(matches!(parse(&["status", "--json"]), Command::Status(s) if s.json));
         assert!(matches!(parse(&["doctor"]), Command::Doctor(_)));
         assert!(matches!(parse(&["reload"]), Command::Reload(_)));

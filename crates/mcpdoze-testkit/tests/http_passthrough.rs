@@ -221,3 +221,133 @@ async fn header_values_never_reach_tracing_output() {
     })
     .await;
 }
+
+// ------------------------------------------------------------ headers helper
+
+const HELPER: &str = env!("CARGO_BIN_EXE_mock-headers-helper");
+
+/// A `headers_helper` command running the mock helper with `args`, counting
+/// its runs in `counter`.
+fn helper_cmd(counter: &std::path::Path, args: &str) -> String {
+    format!("\"{HELPER}\" --counter \"{}\" {args}", counter.display())
+}
+
+fn runs(counter: &std::path::Path) -> u64 {
+    std::fs::read_to_string(counter)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn helper_headers_override_static_headers() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let srv = mock(MockHttpSpec::new().require_header("Authorization", "from-helper")).await;
+        let spec = BackendSpec::http(srv.url())
+            .header("Authorization", "static-value")
+            .headers_helper(helper_cmd(&counter, "--values from-helper"));
+        let (r, s) = setup(spec);
+        assert_eq!(
+            text(&call(&r, &s, 1, "m__echo").await),
+            "echo:{\"text\":\"hi\"}"
+        );
+        assert_eq!(runs(&counter), 1, "helper runs once on connect");
+        assert_eq!(
+            text(&call(&r, &s, 2, "m__echo").await),
+            "echo:{\"text\":\"hi\"}"
+        );
+        assert_eq!(runs(&counter), 1, "not re-run while the session lives");
+        r.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthorized_reruns_helper_exactly_once() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        // One 401: the helper runs again and the retried call succeeds.
+        let counter = dir.path().join("a");
+        let srv = mock(MockHttpSpec::new().reject_calls(1)).await;
+        let spec = BackendSpec::http(srv.url()).headers_helper(helper_cmd(&counter, ""));
+        let (r, s) = setup(spec);
+        let resp = call(&r, &s, 1, "m__echo").await;
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(runs(&counter), 2);
+        r.shutdown().await;
+
+        // Persistent 401: one re-run, then the error is returned.
+        let counter = dir.path().join("b");
+        let srv = mock(MockHttpSpec::new().reject_calls(100)).await;
+        let spec = BackendSpec::http(srv.url()).headers_helper(helper_cmd(&counter, ""));
+        let (r, s) = setup(spec);
+        let resp = call(&r, &s, 1, "m__echo").await;
+        assert_eq!(resp["error"]["code"], jsonrpc::BACKEND_UNAVAILABLE);
+        assert_eq!(runs(&counter), 2);
+        r.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failing_helper_fails_the_connect_cleanly() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let srv = mock(MockHttpSpec::new()).await;
+        let spec = BackendSpec::http(srv.url())
+            .headers_helper(helper_cmd(&counter, "--raw not-json-output"));
+        let (r, s) = setup(spec);
+        let resp = call(&r, &s, 1, "m__echo").await;
+        assert_eq!(resp["error"]["code"], jsonrpc::BACKEND_UNAVAILABLE);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("headers helper"), "{msg}");
+        assert!(!msg.contains("not-json-output"), "{msg}");
+        r.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn helper_output_never_reaches_tracing_output() {
+    guarded(async {
+        const SECRET: &str = "helper-s3cr3t-4d1";
+        let dir = tempfile::tempdir().unwrap();
+        let cap = Capture::start();
+        let srv = mock(
+            MockHttpSpec::new()
+                .require_header("Authorization", SECRET)
+                .drop_session_after(1),
+        )
+        .await;
+        let counter = dir.path().join("ok");
+        let spec = BackendSpec::http(srv.url())
+            .headers_helper(helper_cmd(&counter, &format!("--values {SECRET}")));
+        let (r, s) = setup(spec);
+        for i in 1..=3 {
+            let resp = call(&r, &s, i, "m__echo").await;
+            assert!(resp.get("error").is_none(), "{resp}");
+        }
+        assert!(runs(&counter) >= 2, "re-init re-runs the helper");
+        r.shutdown().await;
+
+        // Invalid output that contains the secret.
+        let counter = dir.path().join("bad");
+        let spec = BackendSpec::http(srv.url())
+            .headers_helper(helper_cmd(&counter, &format!("--raw {SECRET}-garbage")));
+        let (r, s) = setup(spec);
+        let resp = call(&r, &s, 1, "m__echo").await;
+        assert!(!resp.to_string().contains(SECRET));
+        r.shutdown().await;
+
+        let out = cap.text();
+        assert!(
+            out.contains("headers helper"),
+            "expected helper lines:\n{out}"
+        );
+        assert!(!out.contains(SECRET), "helper output leaked into tracing");
+    })
+    .await;
+}

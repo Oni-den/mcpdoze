@@ -31,6 +31,8 @@ pub const MAX_PREFIX_LEN: usize = 32;
 const SEP: &str = "__";
 const DEFAULT_BIND: &str = "127.0.0.1:7878";
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+/// Longest accepted `headers_helper` command.
+pub const MAX_HELPER_COMMAND_LEN: usize = 4096;
 
 /// Errors loading a config file.
 #[derive(Debug, thiserror::Error)]
@@ -251,6 +253,11 @@ pub struct ServerConfig {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, EnvValue>,
+    /// Shell command printing a JSON object of extra request headers (http
+    /// only). Run on connect, on re-initialise and once after a 401/403; its
+    /// headers override `headers`. Its output is never logged or stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers_helper: Option<String>,
     /// Permit secret-looking literal values in `env` / `headers`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_literal_env: bool,
@@ -375,6 +382,12 @@ impl Config {
                             "`headers` is only for http",
                         ));
                     }
+                    if s.headers_helper.is_some() {
+                        errs.push(ValidationError::new(
+                            f("headers_helper"),
+                            "`headers_helper` is only for http",
+                        ));
+                    }
                 }
                 Transport::Http => {
                     match s.url.as_deref() {
@@ -393,6 +406,23 @@ impl Config {
                             f("command"),
                             "`command` is only for stdio",
                         ));
+                    }
+                    if let Some(h) = &s.headers_helper {
+                        if h.trim().is_empty() {
+                            errs.push(ValidationError::new(
+                                f("headers_helper"),
+                                "`headers_helper` must not be empty",
+                            ));
+                        } else if h.len() > MAX_HELPER_COMMAND_LEN || h.contains(['\0', '\n', '\r'])
+                        {
+                            errs.push(ValidationError::new(
+                                f("headers_helper"),
+                                format!(
+                                    "`headers_helper` must be one line of at most \
+                                     {MAX_HELPER_COMMAND_LEN} characters"
+                                ),
+                            ));
+                        }
                     }
                 }
             }

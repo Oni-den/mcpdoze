@@ -17,6 +17,9 @@
 //!   reports itself closed so the lifecycle enters its normal backoff.
 //! * Configured headers are applied to every request. They are marked
 //!   sensitive and never logged; errors are stripped of URLs.
+//! * A `headers_helper` (see [`super::headers_helper`]) runs before every
+//!   `initialize` and once more after a 401/403 on a call; its headers
+//!   override the static ones.
 //! * One shared [`reqwest::Client`] serves every HTTP backend.
 
 use std::collections::HashMap;
@@ -30,6 +33,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
+use super::headers_helper;
 use super::jsonrpc::{self, Kind};
 use super::stdio::{lock, BACKEND_PROTOCOL_VERSION};
 use super::{
@@ -117,7 +121,12 @@ pub struct HttpConn {
     server: String,
     generation: u64,
     url: String,
-    headers: Vec<(HeaderName, HeaderValue)>,
+    /// Configured (static) headers.
+    static_headers: Vec<(HeaderName, HeaderValue)>,
+    /// `headers_helper` command, if any.
+    helper: Option<String>,
+    /// Headers sent: static ones overridden by the helper's latest output.
+    headers: Mutex<Vec<(HeaderName, HeaderValue)>>,
     timeout: Duration,
     events: Arc<dyn BackendEvents>,
     started: Instant,
@@ -163,7 +172,9 @@ impl HttpConn {
             server: server.to_owned(),
             generation,
             url: http.url.clone(),
-            headers,
+            headers: Mutex::new(headers.clone()),
+            static_headers: headers,
+            helper: http.headers_helper.clone(),
             timeout: http.request_timeout,
             events,
             started: Instant::now(),
@@ -213,7 +224,31 @@ impl HttpConn {
         self.do_init().await
     }
 
+    /// Re-runs the headers helper (no-op without one) and installs its
+    /// headers over the static ones. The output is never logged.
+    async fn refresh_headers(&self) -> Result<(), String> {
+        let Some(cmd) = &self.helper else {
+            return Ok(());
+        };
+        match headers_helper::run(cmd).await {
+            Ok(extra) => {
+                tracing::debug!(server = %self.server, count = extra.len(), "headers helper ran");
+                *lock(&self.headers) = headers_helper::merge(&self.static_headers, extra);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(server = %self.server, error = %e, "headers helper failed");
+                Err(e.to_string())
+            }
+        }
+    }
+
+    fn current_headers(&self) -> Vec<(HeaderName, HeaderValue)> {
+        lock(&self.headers).clone()
+    }
+
     async fn do_init(self: &Arc<Self>) -> Result<Value, String> {
+        self.refresh_headers().await?;
         {
             let mut s = lock(&self.session);
             s.id = None;
@@ -294,8 +329,8 @@ impl HttpConn {
             .timeout(self.timeout)
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json");
-        for (k, v) in &self.headers {
-            req = req.header(k.clone(), v.clone());
+        for (k, v) in self.current_headers() {
+            req = req.header(k, v);
         }
         let had_session = session.is_some();
         if let Some(s) = session {
@@ -416,6 +451,7 @@ impl HttpConn {
     async fn send_request(self: &Arc<Self>, id: u64, method: &str, params: Value) -> CallResult {
         let body = jsonrpc::request(id, method, params);
         let mut attempt = 0;
+        let mut helper_rerun = false;
         loop {
             let (sid, epoch) = self.snapshot();
             let proto = lock(&self.session).protocol.clone();
@@ -432,6 +468,13 @@ impl HttpConn {
                 Err(XErr::Transport(_)) if attempt == 0 => {
                     attempt += 1;
                     self.reconnect(epoch).await?;
+                }
+                // Credentials may have expired: ask the helper once more.
+                Err(XErr::Status(401 | 403)) if self.helper.is_some() && !helper_rerun => {
+                    helper_rerun = true;
+                    self.refresh_headers()
+                        .await
+                        .map_err(CallError::Unavailable)?;
                 }
                 Err(e) => return Err(e.into_call()),
             }
@@ -548,8 +591,8 @@ impl HttpConn {
             .delete(&self.url)
             .timeout(grace.max(Duration::from_secs(2)))
             .header("Mcp-Session-Id", sid);
-        for (k, v) in &self.headers {
-            req = req.header(k.clone(), v.clone());
+        for (k, v) in self.current_headers() {
+            req = req.header(k, v);
         }
         if let Some(p) = proto {
             req = req.header("MCP-Protocol-Version", p);

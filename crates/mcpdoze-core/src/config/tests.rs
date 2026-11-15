@@ -476,3 +476,21 @@ session_idle_timeout = \"1m\"
         std::time::Duration::from_secs(60)
     );
 }
+
+#[test]
+fn headers_helper_validation() {
+    let ok = cfg(
+        "[servers.r]\ntransport = \"http\"\nurl = \"https://example.com/mcp\"\nheaders_helper = \"example-helper --json\"\n",
+    );
+    ok.validate().unwrap();
+    assert_eq!(
+        ok.servers["r"].headers_helper.as_deref(),
+        Some("example-helper --json")
+    );
+    let e = errs("[servers.s]\ntransport = \"stdio\"\ncommand = \"x\"\nheaders_helper = \"h\"\n");
+    assert!(has(&e, "servers.s.headers_helper"), "{e:?}");
+    let e = errs(
+        "[servers.r]\ntransport = \"http\"\nurl = \"https://example.com/mcp\"\nheaders_helper = \"  \"\n",
+    );
+    assert!(has(&e, "servers.r.headers_helper"), "{e:?}");
+}

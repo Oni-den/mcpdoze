@@ -257,6 +257,11 @@ impl MockHttpSpec {
             .extend(["--drop-session-after".into(), n.to_string()]);
         self
     }
+    /// Answer the first `n` `tools/call` requests with 401.
+    pub fn reject_calls(mut self, n: u64) -> Self {
+        self.args.extend(["--reject-calls".into(), n.to_string()]);
+        self
+    }
     /// Delay every non-initialize response by `ms`.
     pub fn slow_ms(mut self, ms: u64) -> Self {
         self.args.extend(["--slow-ms".into(), ms.to_string()]);

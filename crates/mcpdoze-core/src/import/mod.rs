@@ -39,7 +39,9 @@ pub use apply::{
 pub use parse::{
     agent_files, parse_file, AgentFile, FileRole, ParsedFile, RawServer, RawSpec, RawValue,
 };
-pub use plan::{build_plan, NeedsEnvVar, Plan, PlanItem, Skipped, Source};
+pub use plan::{
+    build_plan, build_plan_with, NeedsEnvVar, Plan, PlanItem, PlanOptions, Skipped, Source,
+};
 pub use util::{sha256_hex, utc_timestamp};
 
 use std::path::{Path, PathBuf};

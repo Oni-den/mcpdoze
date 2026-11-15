@@ -14,8 +14,9 @@
 //! "no catalog": the server is probed again and the file rewritten.
 //!
 //! The fingerprint covers transport, command, arguments, working directory,
-//! URL, environment variable NAMES and header NAMES. Values of environment
-//! variables and headers are never hashed, stored or logged.
+//! URL, environment variable NAMES, header NAMES and the `headers_helper`
+//! command. Values of environment variables and headers (and the helper's
+//! output) are never hashed, stored or logged.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -289,6 +290,10 @@ pub fn fingerprint(spec: &BackendSpec) -> String {
             for name in h.headers.keys() {
                 field("header", &name.to_ascii_lowercase());
             }
+            // The command (configuration, never its output).
+            if let Some(cmd) = &h.headers_helper {
+                field("headers_helper", cmd);
+            }
         }
         None => {
             field("transport", "stdio");
@@ -351,6 +356,12 @@ mod tests {
         let h2 = BackendSpec::http("https://example.com/mcp").header("X-Key", "two");
         assert_eq!(fingerprint(&h1), fingerprint(&h2));
         assert!(fingerprint(&h1).starts_with("v1-"));
+        let h3 = h1.clone().headers_helper("example-helper");
+        assert_ne!(fingerprint(&h1), fingerprint(&h3));
+        assert_ne!(
+            fingerprint(&h3),
+            fingerprint(&h1.clone().headers_helper("other-helper"))
+        );
     }
 
     #[test]

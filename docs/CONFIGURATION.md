@@ -74,6 +74,7 @@ suffix.
 | `enabled` | bool | `true` | `false` keeps the entry but does not register it. |
 | `url` | string | required for http | `http://` or `https://` endpoint. Not allowed for stdio. |
 | `headers` | table | `{}` | Headers sent to an http server, same value forms as `env`. Not allowed for stdio. |
+| `headers_helper` | string | unset | Shell command that prints a JSON object of headers for an http server; see [Headers helper](#headers-helper). Not allowed for stdio. |
 | `allow_literal_env` | bool | `false` | Permit secret-looking literal values in `env` or `headers`. |
 | `probe` | bool | `true` | At registration, start a throwaway instance once to list tools when no valid catalog exists. With `false`, the first `tools/list` starts the server. |
 | `catalog_max_age` | duration | `broker.catalog_max_age` | Background catalog refresh age for this server. |
@@ -86,6 +87,41 @@ headers = { Authorization = { from_env = "REMOTE_AUTH" } }
 idle_ttl = "30m"
 prefix = "rem"
 ```
+
+## Headers helper
+
+For credentials that expire (OAuth access tokens, short-lived API keys) an
+http server can name a command that produces its headers:
+
+```toml
+[servers.remote]
+transport = "http"
+url = "https://example.com/mcp"
+headers_helper = "example-token-tool --json"
+```
+
+- The command runs through the platform shell (`cmd /d /s /c` on Windows,
+  `sh -c` elsewhere) in the broker's environment (without `MCPDOZE_TOKEN`),
+  with stdin and stderr closed.
+- It must exit 0 within 10 seconds and print at most 64 KiB: one JSON object
+  of string values, e.g. `{"Authorization": "Bearer <token>"}`. Names and
+  values must be valid HTTP headers (at most 64).
+- It runs before every upstream `initialize` (first connect, re-initialise
+  after a lost session or an idle unload) and once more when a call is
+  answered with 401 or 403; the call is then retried once.
+- Its headers override `headers` entries of the same name (case-insensitive).
+- The output is never logged, stored or shown in errors. A failure (timeout,
+  non-zero exit, invalid output) fails the connect with a short reason.
+- The command (not its output) is part of the catalog fingerprint, so
+  changing it re-lists the server.
+- `mcpdoze import` copies `headersHelper` from Claude Code configs without
+  running it. Helpers from project-scoped files (`./.mcp.json`, project
+  entries) are only imported with `--allow-helpers`.
+
+The opposite direction, an agent authenticating to the broker, can use
+`mcpdoze token --headers-json` as the agent's own headers helper: it prints
+`{"Authorization":"Bearer <token>"}` (also when stdout is a pipe) from the
+token file or `broker.token_env`.
 
 ## Secrets: environment variable names, not values
 

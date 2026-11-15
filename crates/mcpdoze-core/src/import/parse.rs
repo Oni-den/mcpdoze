@@ -63,6 +63,8 @@ pub enum RawSpec {
         headers: Vec<(String, RawValue)>,
         /// Legacy SSE transport.
         sse: bool,
+        /// `headersHelper` command (Claude Code). Never run by the import.
+        headers_helper: Option<String>,
     },
     /// Cannot be migrated; the string says why.
     Unsupported(String),
@@ -270,6 +272,10 @@ fn json_spec(v: &Value) -> RawSpec {
             url: url.to_string(),
             headers: kv_map(o.get("headers")),
             sse: ty == "sse",
+            headers_helper: o
+                .get("headersHelper")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         };
     }
     RawSpec::Unsupported("entry has neither `command` nor `url`".into())
@@ -299,6 +305,7 @@ fn opencode_spec(v: &Value) -> (RawSpec, bool) {
                 url: url.to_string(),
                 headers: kv_map(o.get("headers")),
                 sse: false,
+                headers_helper: None,
             },
             None => RawSpec::Unsupported("remote entry has no `url`".into()),
         },
@@ -377,6 +384,7 @@ fn parse_codex(file: &AgentFile, text: &str) -> Result<ParsedFile, ImportError> 
                 url: url.to_string(),
                 headers,
                 sse: false,
+                headers_helper: None,
             }
         } else {
             RawSpec::Unsupported("entry has neither `command` nor `url`".into())

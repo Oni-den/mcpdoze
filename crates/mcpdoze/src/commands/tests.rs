@@ -164,6 +164,7 @@ fn token_show_refused_when_not_a_terminal() {
             token_file: Some(tf.clone()),
         },
         show: true,
+        headers_json: false,
     };
     let mut out = Vec::new();
     let e = token(args, &mut out, false).unwrap_err().to_string();
@@ -177,6 +178,7 @@ fn token_show_refused_when_not_a_terminal() {
             token_file: Some(tf.clone()),
         },
         show: false,
+        headers_json: false,
     };
     token(args, &mut out, false).unwrap();
     let s = String::from_utf8(out).unwrap();
@@ -189,12 +191,59 @@ fn token_show_refused_when_not_a_terminal() {
             token_file: Some(tf),
         },
         show: true,
+        headers_json: false,
     };
     let mut out = Vec::new();
     token(args, &mut out, true).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap().trim(),
         "unit-test-token-value-1"
+    );
+}
+
+#[test]
+fn token_headers_json_from_file_and_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let tf = dir.path().join("token");
+    std::fs::write(&tf, "unit-test-token-value-2\n").unwrap();
+    let args = TokenArgs {
+        conn: ConnArgs {
+            config: Some(dir.path().join("absent.toml")),
+            url: None,
+            token_file: Some(tf),
+        },
+        show: false,
+        headers_json: true,
+    };
+    let mut out = Vec::new();
+    // Allowed when stdout is not a terminal.
+    token(args, &mut out, false).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"Authorization": "Bearer unit-test-token-value-2"})
+    );
+
+    const VAR: &str = "MCPDOZE_UNIT_TEST_HEADERS_JSON_TOKEN";
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, format!("[broker]\ntoken_env = \"{VAR}\"\n")).unwrap();
+    std::env::set_var(VAR, "unit-test-env-token-3");
+    let args = TokenArgs {
+        conn: ConnArgs {
+            config: Some(cfg),
+            url: None,
+            token_file: None,
+        },
+        show: false,
+        headers_json: true,
+    };
+    let mut out = Vec::new();
+    token(args, &mut out, false).unwrap();
+    std::env::remove_var(VAR);
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.trim(),
+        r#"{"Authorization":"Bearer unit-test-env-token-3"}"#
     );
 }
 

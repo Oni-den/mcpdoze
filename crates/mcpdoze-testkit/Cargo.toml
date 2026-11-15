@@ -31,3 +31,7 @@ path = "src/bin/mock_mcp_stdio.rs"
 [[bin]]
 name = "mock-mcp-http"
 path = "src/bin/mock_mcp_http.rs"
+
+[[bin]]
+name = "mock-headers-helper"
+path = "src/bin/mock_headers_helper.rs"
