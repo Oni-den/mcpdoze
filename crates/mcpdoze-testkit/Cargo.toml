@@ -8,3 +8,10 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "mock-mcp-stdio"
+path = "src/bin/mock_mcp_stdio.rs"
