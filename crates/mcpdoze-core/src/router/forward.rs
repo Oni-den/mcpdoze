@@ -108,11 +108,8 @@ impl Router {
                 json!({"resourceTemplates": self.list_resource_templates(session).await}),
             ),
             "resources/read" => self.read_resource(session, id, params).await,
-            "resources/subscribe" | "resources/unsubscribe" => jsonrpc::error(
-                id,
-                jsonrpc::METHOD_NOT_FOUND,
-                "resource subscriptions are not supported by the mcpdoze broker yet",
-            ),
+            "resources/subscribe" => self.subscribe_request(session, id, params).await,
+            "resources/unsubscribe" => self.unsubscribe_request(session, id, params).await,
             method => jsonrpc::error(
                 id,
                 jsonrpc::METHOD_NOT_FOUND,

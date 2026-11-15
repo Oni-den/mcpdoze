@@ -64,6 +64,8 @@ refreshed after each spawn, on backend `list_changed` notifications, on
 unknown-tool errors, on demand (`mcpdoze refresh`) and optionally by age. A
 change reaches agents as `notifications/*/list_changed`. Resource URIs are
 mapped to `mcpdoze://<prefix>/<encoded-uri>`. Details: [CATALOG.md](CATALOG.md).
+Resource subscriptions are shared per backend instance and pin it against
+idle unload: [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md).
 
 ## Scopes
 

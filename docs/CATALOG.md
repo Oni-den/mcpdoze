@@ -130,6 +130,7 @@ are kept verbatim so clients can expand them: `mock://items/{id}` becomes
 decodes once, an expanded value reaches the backend decoded once (a `{path}`
 value `a/b` arrives as `a/b`, not `a%2Fb`).
 
-Resource subscriptions (`resources/subscribe`, `resources/unsubscribe`) are
-not supported yet and return `-32601`; the broker advertises
-`resources.subscribe = false`. Planned for v0.2.
+Resource subscriptions (`resources/subscribe`, `resources/unsubscribe`, and
+`resourceSubscriptions` of a 2026-07-28 `subscriptions/listen`) take the
+mapped URI; see [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md). The broker advertises
+`resources.subscribe = true` only while some backend does.

@@ -494,3 +494,24 @@ fn headers_helper_validation() {
     );
     assert!(has(&e, "servers.r.headers_helper"), "{e:?}");
 }
+
+#[test]
+fn subscriptions_policy_parses() {
+    let c = cfg("[servers.a]\ntransport = \"stdio\"\ncommand = \"x\"\n");
+    assert_eq!(c.servers["a"].subscriptions, SubscriptionPolicy::KeepAlive);
+    let c = cfg(
+        "[servers.a]\ntransport = \"stdio\"\ncommand = \"x\"\nsubscriptions = \"allow-unload\"\n",
+    );
+    assert_eq!(
+        c.servers["a"].subscriptions,
+        SubscriptionPolicy::AllowUnload
+    );
+    assert!(Config::parse(
+        "[servers.a]\ntransport = \"stdio\"\ncommand = \"x\"\nsubscriptions = \"never\"\n"
+    )
+    .is_err());
+    // The default is not written back.
+    assert!(!toml::to_string(&c.servers["a"])
+        .unwrap()
+        .contains("keep-alive"));
+}

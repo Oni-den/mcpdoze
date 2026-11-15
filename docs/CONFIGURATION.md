@@ -78,6 +78,7 @@ suffix.
 | `allow_literal_env` | bool | `false` | Permit secret-looking literal values in `env` or `headers`. |
 | `probe` | bool | `true` | At registration, start a throwaway instance once to list tools when no valid catalog exists. With `false`, the first `tools/list` starts the server. |
 | `catalog_max_age` | duration | `broker.catalog_max_age` | Background catalog refresh age for this server. |
+| `subscriptions` | `"keep-alive"` or `"allow-unload"` | `"keep-alive"` | What an instance holding resource subscriptions does at its idle TTL: stay loaded (and respawn eagerly after a crash), or unload and resubscribe on its next start. See [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md). |
 
 ```toml
 [servers.remote]

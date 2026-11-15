@@ -30,6 +30,8 @@ struct Config {
     log_messages: bool,
     /// Extra variable names the `info` tool reports (`--echo-env NAME`).
     echo_env: Vec<String>,
+    /// Advertise `resources.subscribe` and serve subscribe/unsubscribe.
+    subscribe: bool,
 }
 
 struct State {
@@ -42,6 +44,10 @@ struct State {
     cancelled: Mutex<HashSet<String>>,
     /// Client capabilities from `initialize`.
     client_caps: Mutex<Value>,
+    /// Subscribed URIs and request counters (`sub_stats` tool).
+    subs: Mutex<HashSet<String>>,
+    subscribes: AtomicU64,
+    unsubscribes: AtomicU64,
 }
 
 impl State {
@@ -82,6 +88,7 @@ fn parse_args() -> Result<Option<Config>, String> {
         templates: Vec::new(),
         log_messages: false,
         echo_env: Vec::new(),
+        subscribe: false,
     };
     let list = |s: String| -> Vec<String> {
         s.split(',')
@@ -115,6 +122,7 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--resources" => c.resources = list(val()?),
             "--resource-templates" => c.templates = list(val()?),
             "--log-messages" => c.log_messages = true,
+            "--subscribe" => c.subscribe = true,
             "--echo-env" => c.echo_env.push(val()?),
             "--sleep-forever" => return Ok(None),
             other => return Err(format!("unknown flag {other}")),
@@ -208,6 +216,27 @@ fn handle_call(st: Arc<State>, id: Value, params: Value) {
             json!({"message":"pick one","requestedSchema":{"type":"object",
                 "properties":{"choice":{"type":"string"}}}}),
         ),
+        "touch" => {
+            // Report a change of resource `uri` (default: the first one).
+            let uri = args["uri"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| st.cfg.resources.first().cloned())
+                .unwrap_or_default();
+            st.send(
+                &json!({"jsonrpc":"2.0","method":"notifications/resources/updated",
+                "params":{"uri":uri}}),
+            );
+            text_result(uri.clone(), json!({"tool":"touch","uri":uri}))
+        }
+        "sub_stats" => {
+            let mut active: Vec<String> = st.subs.lock().unwrap().iter().cloned().collect();
+            active.sort();
+            let v = json!({"tool":"sub_stats","pid":std::process::id(),
+                "subscribes":st.subscribes.load(Ordering::SeqCst),
+                "unsubscribes":st.unsubscribes.load(Ordering::SeqCst),"active":active});
+            text_result(v.to_string(), v)
+        }
         "roots" if st.cfg.roots => client_request(&st, "roots", "roots/list", json!({})),
         "info" => {
             let env: serde_json::Map<String, Value> = std::env::vars()
@@ -312,8 +341,13 @@ fn handle(st: &Arc<State>, msg: Value) {
             let v = params["protocolVersion"]
                 .as_str()
                 .unwrap_or(DEFAULT_VERSION);
+            let resources = if st.cfg.subscribe {
+                json!({"subscribe":true})
+            } else {
+                json!({})
+            };
             reply(json!({"protocolVersion":v,
-                "capabilities":{"tools":{"listChanged":true},"prompts":{},"resources":{}},
+                "capabilities":{"tools":{"listChanged":true},"prompts":{},"resources":resources},
                 "serverInfo":{"name":st.cfg.name,"version":"0.0.1"}}));
         }
         "ping" => reply(json!({})),
@@ -377,6 +411,17 @@ fn handle(st: &Arc<State>, msg: Value) {
                     "error":{"code":-32002,"message":"resource not found"}}));
             }
         }
+        "resources/subscribe" | "resources/unsubscribe" if st.cfg.subscribe => {
+            let uri = params["uri"].as_str().unwrap_or("").to_string();
+            if method == "resources/subscribe" {
+                st.subscribes.fetch_add(1, Ordering::SeqCst);
+                st.subs.lock().unwrap().insert(uri);
+            } else {
+                st.unsubscribes.fetch_add(1, Ordering::SeqCst);
+                st.subs.lock().unwrap().remove(&uri);
+            }
+            reply(json!({}))
+        }
         "tools/call" => {
             let st = st.clone();
             std::thread::spawn(move || handle_call(st, id, params));
@@ -411,6 +456,9 @@ fn main() {
         waiters: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashSet::new()),
         client_caps: Mutex::new(Value::Null),
+        subs: Mutex::new(HashSet::new()),
+        subscribes: AtomicU64::new(0),
+        unsubscribes: AtomicU64::new(0),
     });
     if st.cfg.garbage {
         let mut o = st.out.lock().unwrap();

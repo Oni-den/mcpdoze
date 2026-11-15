@@ -316,6 +316,7 @@ pub fn build_register(a: &AddArgs) -> Result<RegisterRequest> {
             probe: true,
             catalog_max_age: None,
             max_instances: None,
+            subscriptions: Default::default(),
         },
     })
 }

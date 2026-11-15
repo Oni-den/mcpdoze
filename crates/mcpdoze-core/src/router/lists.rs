@@ -375,7 +375,7 @@ impl Router {
                 if on {
                     let msg = json!({"jsonrpc": "2.0", "method": method});
                     for s in self.streaming_sessions() {
-                        if self.reads_key(server, &s, ckey) {
+                        if s.wants_notification(method) && self.reads_key(server, &s, ckey) {
                             s.push(msg.clone());
                         }
                     }

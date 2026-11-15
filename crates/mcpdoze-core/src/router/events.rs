@@ -49,6 +49,11 @@ impl BackendEvents for RouterEvents {
                     r.on_list_changed(server, scope_key);
                 }
             }
+            "notifications/resources/updated" => {
+                if let Some(r) = self.router.upgrade() {
+                    r.on_resource_updated(server, scope_key, msg);
+                }
+            }
             method => tracing::debug!(server, method, "backend notification dropped"),
         }
     }

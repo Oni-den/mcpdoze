@@ -9,7 +9,10 @@
 //! NAME=VALUE` (401 otherwise), `--drop-session-after N` (a session is dropped
 //! after N requests: later requests with it get 404 until re-initialised),
 //! `--slow-ms N`, `--reject-calls N` (the first N `tools/call` requests get
-//! 401). Built-in tools: `echo`, `session_count` (initialize calls seen) and
+//! 401), `--subscribe` (advertise `resources.subscribe`, serve
+//! subscribe/unsubscribe and keep `GET` event streams open; tool `touch`
+//! sends `notifications/resources/updated` on them, tool `sub_stats`
+//! reports counters). Built-in tools: `echo`, `session_count` (initialize calls seen) and
 //! `delete_count` (DELETE requests seen).
 //!
 //! Minimal hand-written HTTP/1.1 (keep-alive, Content-Length bodies, chunked
@@ -33,6 +36,7 @@ struct Cfg {
     drop_after: Option<u64>,
     slow_ms: u64,
     reject_calls: u64,
+    subscribe: bool,
 }
 
 #[derive(Default)]
@@ -42,6 +46,10 @@ struct State {
     rejected: u64,
     next: u64,
     sessions: HashMap<String, u64>,
+    subscribes: u64,
+    unsubscribes: u64,
+    /// Open `GET` event streams.
+    listeners: Vec<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 struct Req {
@@ -65,6 +73,7 @@ fn parse_args() -> Cfg {
                     .collect()
             }
             "--sse" => cfg.sse = true,
+            "--subscribe" => cfg.subscribe = true,
             "--require-header" => {
                 let v = it.next().unwrap_or_default();
                 if let Some((k, v)) = v.split_once('=') {
@@ -197,6 +206,37 @@ async fn handle(
         }
         return simple(s, "200 OK", &[], "text/plain", "").await;
     }
+    if req.method == "GET" && cfg.subscribe {
+        let known = sid
+            .as_ref()
+            .is_some_and(|k| lock(state).sessions.contains_key(k));
+        if !known {
+            return simple(s, "404 Not Found", &[], "text/plain", "unknown session").await;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        lock(state).listeners.push(tx);
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n";
+        s.write_all(head.as_bytes()).await?;
+        s.flush().await?;
+        let mut scratch = [0u8; 256];
+        loop {
+            // Also watch the socket, so a client that goes away ends this.
+            let next = tokio::select! {
+                m = rx.recv() => m,
+                r = s.read(&mut scratch) => match r {
+                    Ok(n) if n > 0 => continue,
+                    _ => None,
+                },
+            };
+            let Some(m) = next else { break };
+            let ev = format!("event: message\ndata: {m}\n\n");
+            s.write_all(format!("{:x}\r\n{ev}\r\n", ev.len()).as_bytes())
+                .await?;
+            s.flush().await?;
+        }
+        return Ok(());
+    }
     if req.method != "POST" {
         return simple(s, "405 Method Not Allowed", &[], "text/plain", "").await;
     }
@@ -231,7 +271,11 @@ async fn handle(
         };
         let body = json!({"jsonrpc":"2.0","id":id,"result":{
             "protocolVersion": "2025-11-25",
-            "capabilities": {"tools": {}},
+            "capabilities": if cfg.subscribe {
+                json!({"tools": {}, "resources": {"subscribe": true}})
+            } else {
+                json!({"tools": {}})
+            },
             "serverInfo": {"name": "mock-mcp-http", "version": "0.0.1"}}});
         return simple(
             s,
@@ -302,8 +346,22 @@ fn answer(method: &str, msg: &Value, id: Value, cfg: &Cfg, state: &Mutex<State>)
     let ok = |r: Value| json!({"jsonrpc":"2.0","id":id.clone(),"result":r});
     match method {
         "ping" => ok(json!({})),
+        "resources/list" if cfg.subscribe => ok(json!({"resources": [
+            {"uri": "mock://remote", "name": "remote", "mimeType": "text/plain"}]})),
+        "resources/subscribe" | "resources/unsubscribe" if cfg.subscribe => {
+            let mut st = lock(state);
+            if method == "resources/subscribe" {
+                st.subscribes += 1;
+            } else {
+                st.unsubscribes += 1;
+            }
+            ok(json!({}))
+        }
         "tools/list" => {
             let mut names = vec!["echo", "session_count", "delete_count"];
+            if cfg.subscribe {
+                names.extend(["touch", "sub_stats"]);
+            }
             names.extend(cfg.tools.iter().map(String::as_str));
             let tools: Vec<Value> = names
                 .iter()
@@ -320,6 +378,22 @@ fn answer(method: &str, msg: &Value, id: Value, cfg: &Cfg, state: &Mutex<State>)
             let text = match name {
                 "session_count" => lock(state).inits.to_string(),
                 "delete_count" => lock(state).deletes.to_string(),
+                "touch" => {
+                    let uri = args["uri"].as_str().unwrap_or("mock://remote").to_owned();
+                    let note = json!({"jsonrpc":"2.0","method":"notifications/resources/updated",
+                        "params":{"uri":uri}})
+                    .to_string();
+                    let mut st = lock(state);
+                    st.listeners.retain(|l| l.send(note.clone()).is_ok());
+                    format!("listeners:{}", st.listeners.len())
+                }
+                "sub_stats" => {
+                    let mut st = lock(state);
+                    st.listeners.retain(|l| !l.is_closed());
+                    json!({"subscribes": st.subscribes, "unsubscribes": st.unsubscribes,
+                        "listeners": st.listeners.len()})
+                    .to_string()
+                }
                 n if n == "echo" || cfg.tools.iter().any(|t| t == n) => {
                     format!("{n}:{}", args)
                 }

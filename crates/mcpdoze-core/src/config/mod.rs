@@ -279,10 +279,29 @@ pub struct ServerConfig {
     /// per-session scopes); [`DEFAULT_MAX_INSTANCES`] when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_instances: Option<usize>,
+    /// What an instance with live resource subscriptions does when its idle
+    /// TTL expires (see `docs/SUBSCRIPTIONS.md`).
+    #[serde(default, skip_serializing_if = "is_default_subscriptions")]
+    pub subscriptions: SubscriptionPolicy,
+}
+
+/// Idle policy of a backend instance that holds resource subscriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionPolicy {
+    /// Never unload while subscribed; respawn eagerly after a crash.
+    #[default]
+    KeepAlive,
+    /// Unload at the idle TTL anyway; subscriptions are replayed on the
+    /// next spawn.
+    AllowUnload,
 }
 
 fn is_default_scope(s: &Scope) -> bool {
     *s == Scope::Shared
+}
+fn is_default_subscriptions(s: &SubscriptionPolicy) -> bool {
+    *s == SubscriptionPolicy::KeepAlive
 }
 fn is_true(b: &bool) -> bool {
     *b

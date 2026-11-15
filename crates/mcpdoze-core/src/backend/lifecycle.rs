@@ -34,7 +34,7 @@ use tokio::time::Instant;
 
 use super::http::HttpConn;
 use super::stdio::{lock, StderrRing, StdioConn};
-use super::{BackendEvents, BackendSpec, CallError, Conn};
+use super::{BackendEvents, BackendSpec, CallError, Conn, SubscriptionPolicy};
 
 /// Timing knobs of the lifecycle; defaults follow the development plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +128,8 @@ struct Inner {
     /// Stop as soon as the in-flight count reaches zero.
     drain: bool,
     last_error: Option<String>,
+    /// Live resource subscriptions held on this instance.
+    pins: usize,
 }
 
 /// One backend instance: at most one process at a time, started lazily and
@@ -189,6 +191,7 @@ impl Instance {
                 generation: 0,
                 drain: false,
                 last_error: None,
+                pins: 0,
             }),
             spawns: AtomicU64::new(0),
             calls: AtomicU64::new(0),
@@ -202,6 +205,35 @@ impl Instance {
     /// kept for the life of the instance and must not block.
     pub fn on_spawn(&self, hook: impl Fn(u64) + Send + Sync + 'static) {
         lock(&self.spawn_hooks).push(Arc::new(hook));
+    }
+
+    /// Adds one resource-subscription pin. With the `keep-alive` policy a
+    /// pinned instance is not unloaded at its idle TTL and is respawned
+    /// eagerly after a crash.
+    pub fn pin(&self) {
+        lock(&self.inner).pins += 1;
+    }
+
+    /// Removes one pin; the idle timer restarts when the last goes.
+    pub fn unpin(&self) {
+        let g = &mut *lock(&self.inner);
+        g.pins = g.pins.saturating_sub(1);
+        if g.pins == 0 && g.in_flight == 0 {
+            if let State::Running { idle, .. } = &g.state {
+                let idle = idle.clone();
+                g.idle_deadline = Some(Instant::now() + self.spec.idle_ttl);
+                idle.notify_one();
+            }
+        }
+    }
+
+    /// Resource-subscription pins held.
+    pub fn pins(&self) -> usize {
+        lock(&self.inner).pins
+    }
+
+    fn keeps_alive(&self, g: &Inner) -> bool {
+        g.pins > 0 && self.spec.subscriptions == SubscriptionPolicy::KeepAlive
     }
 
     /// Server name.
@@ -538,6 +570,12 @@ impl Instance {
         if g.in_flight != 0 || !expired {
             return false;
         }
+        // Checked in the same critical section: a subscription pinned the
+        // instance (keep-alive policy). Re-arm instead of unloading.
+        if self.keeps_alive(g) {
+            g.idle_deadline = Some(Instant::now() + self.spec.idle_ttl);
+            return false;
+        }
         // The atomic step: still Running, nothing in flight, deadline passed.
         self.begin_stop(g);
         true
@@ -551,7 +589,8 @@ impl Instance {
         Some(g.idle_deadline)
     }
 
-    fn on_closed(&self, generation: u64) {
+    fn on_closed(self: &Arc<Self>, generation: u64) {
+        let eager;
         let conn = {
             let g = &mut *lock(&self.inner);
             if g.generation != generation || !matches!(g.state, State::Running { .. }) {
@@ -575,10 +614,14 @@ impl Instance {
                 error: "backend exited unexpectedly".into(),
             };
             tracing::warn!(server = %self.name, pid = ?conn.pid(), backoff_ms = wait.as_millis() as u64, "backend crashed");
+            eager = self.keeps_alive(g);
             conn
         };
         // Reap whatever is left of the tree (grandchildren).
         tokio::spawn(async move { conn.shutdown(Duration::ZERO).await });
+        if eager {
+            tokio::spawn(respawn_pinned(Arc::downgrade(self)));
+        }
     }
 
     fn release(self: &Arc<Self>, conn: &Conn) {
@@ -595,6 +638,44 @@ impl Instance {
             let idle = idle.clone();
             g.idle_deadline = Some(Instant::now() + self.spec.idle_ttl);
             idle.notify_one();
+        }
+    }
+}
+
+/// Restarts a crashed instance that holds subscriptions (keep-alive), after
+/// each backoff, until it runs again or nothing pins it any more. The spawn
+/// hooks then replay the subscriptions.
+async fn respawn_pinned(inst: Weak<Instance>) {
+    loop {
+        let wait = {
+            let Some(i) = inst.upgrade() else { return };
+            let g = lock(&i.inner);
+            if !i.keeps_alive(&g) {
+                return;
+            }
+            match &g.state {
+                State::Failed { until, .. } => until.saturating_duration_since(Instant::now()),
+                State::Stopped => Duration::ZERO,
+                // Running, or a start / stop is under way.
+                _ => return,
+            }
+        };
+        tokio::time::sleep(wait).await;
+        let Some(i) = inst.upgrade() else { return };
+        if !i.keeps_alive(&lock(&i.inner)) {
+            return;
+        }
+        match i.acquire().await {
+            Ok(guard) => {
+                tracing::info!(server = %i.name, "pinned backend respawned");
+                drop(guard);
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(server = %i.name, error = %e, "pinned backend respawn failed");
+                // Back to `Failed` with a longer backoff; loop.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 }

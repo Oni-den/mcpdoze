@@ -84,6 +84,8 @@ pub struct Session {
     pub(super) cwd_fallback_logged: AtomicBool,
     /// Run once when the session ends.
     end_hooks: Mutex<Vec<EndHook>>,
+    /// The subscription release hook is registered.
+    pub(super) subs_hooked: AtomicBool,
 }
 
 impl std::fmt::Debug for Session {
@@ -115,7 +117,14 @@ impl Session {
             roots_lock: tokio::sync::Mutex::new(()),
             client_pending: Mutex::new(HashMap::new()),
             cwd_fallback_logged: AtomicBool::new(false),
+            subs_hooked: AtomicBool::new(false),
         }
+    }
+
+    /// True if a notification with `method` may be queued for this session.
+    pub fn wants_notification(&self, method: &str) -> bool {
+        let _ = method;
+        true
     }
 
     /// Protocol generation of this session ([`Era::Legacy`] by default).

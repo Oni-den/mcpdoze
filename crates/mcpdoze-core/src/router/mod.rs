@@ -6,7 +6,8 @@
 //!   protocol version; every backend sees one synthetic client, the broker.
 //! * Tools and prompts are exposed as `<prefix>__<name>` ([`naming`]);
 //!   resource URIs are mapped reversibly to `mcpdoze://<prefix>/...`
-//!   ([`uri`]). Resource subscriptions are not supported (v0.2).
+//!   ([`uri`]). Resource subscriptions are shared per backend instance
+//!   (`subs.rs`, `docs/SUBSCRIPTIONS.md`).
 //! * Each forwarded request gets a fresh per-backend id; the backend id map
 //!   holds `(session, original id, progress token)` until the response.
 //! * Progress tokens are rewritten to broker tokens and routed back by token.
@@ -68,6 +69,7 @@ mod forward;
 mod lists;
 pub mod naming;
 mod session;
+mod subs;
 pub mod uri;
 
 use std::collections::{BTreeMap, HashMap};
@@ -91,6 +93,7 @@ use lists::expired;
 use session::random_id;
 use session::RootsState;
 pub use session::{Era, Session, StreamPoll};
+pub use subs::SubscriptionStats;
 
 /// Protocol versions accepted from agents, newest first.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
@@ -353,7 +356,7 @@ impl Server {
                 StateKind::Failed => failed,
                 _ => false,
             };
-            !(idle && Arc::strong_count(i) == 1 && i.in_flight() == 0)
+            !(idle && Arc::strong_count(i) == 1 && i.in_flight() == 0 && i.pins() == 0)
         });
     }
 }
@@ -392,6 +395,7 @@ pub struct Router {
     session_idle: Mutex<Duration>,
     reaper: AtomicBool,
     next_client_id: AtomicU64,
+    subs: subs::Subscriptions,
 }
 
 impl std::fmt::Debug for Router {
@@ -430,6 +434,7 @@ impl Router {
             session_idle: Mutex::new(DEFAULT_SESSION_IDLE_TIMEOUT),
             reaper: AtomicBool::new(false),
             next_client_id: AtomicU64::new(1),
+            subs: subs::Subscriptions::default(),
         })
     }
 
@@ -508,6 +513,7 @@ impl Router {
             reg.by_prefix.insert(prefix.to_owned(), server.clone());
             server
         };
+        self.hook_instance(name, &server.instance);
         self.check_catalog(&server);
         Ok(())
     }
@@ -647,7 +653,7 @@ impl Router {
             "capabilities": {
                 "tools": {"listChanged": true},
                 "prompts": {"listChanged": true},
-                "resources": {"listChanged": true, "subscribe": false},
+                "resources": {"listChanged": true, "subscribe": self.any_subscribe()},
             },
             "serverInfo": {"name": "mcpdoze", "version": env!("CARGO_PKG_VERSION")},
         });
@@ -1058,6 +1064,7 @@ impl Router {
         let mut spec = make();
         spec.client.scope_key = key.clone();
         let inst = Instance::with_tuning(&server.name, spec, self.events.clone(), self.tuning);
+        self.hook_instance(&server.name, &inst);
         tracing::info!(server = %server.name, scope = scope_name(server.scope.scope), "new scoped instance");
         map.insert(key, inst.clone());
         Ok(inst)
@@ -1312,7 +1319,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp["error"]["code"], jsonrpc::METHOD_NOT_FOUND);
+        assert_eq!(resp["error"]["code"], jsonrpc::INVALID_PARAMS);
         let resp = r
             .handle(
                 &s,

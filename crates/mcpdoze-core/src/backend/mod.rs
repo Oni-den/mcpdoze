@@ -23,6 +23,7 @@ use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
+pub use crate::config::SubscriptionPolicy;
 pub use lifecycle::{CallGuard, Instance, SpawnHook, StateKind, Tuning};
 pub use stdio::{CallError, CallMeta, StdioConn};
 
@@ -151,6 +152,8 @@ pub struct BackendSpec {
     /// broker token). An entry of the same name in `env`, which the user
     /// configured explicitly, is still passed.
     pub strip_env: BTreeSet<String>,
+    /// Idle behaviour while the instance holds resource subscriptions.
+    pub subscriptions: SubscriptionPolicy,
 }
 
 /// Variable agents carry the broker token in; never inherited by backends.
@@ -175,6 +178,7 @@ impl BackendSpec {
             ref_env: BTreeSet::new(),
             client: ClientSide::default(),
             strip_env: BTreeSet::from([TOKEN_ENV_VAR.to_string()]),
+            subscriptions: SubscriptionPolicy::default(),
         }
     }
 
@@ -383,6 +387,15 @@ impl Conn {
         match self {
             Conn::Stdio(c) => c.cancel(id, reason),
             Conn::Http(c) => c.cancel(id, reason),
+        }
+    }
+
+    /// HTTP backends: keep an upstream `GET` event stream open while `on`,
+    /// so server-initiated notifications (resource updates) arrive. Stdio
+    /// backends deliver those on stdout anyway; no-op there.
+    pub(crate) fn set_listening(&self, on: bool) {
+        if let Conn::Http(c) = self {
+            c.set_listening(on);
         }
     }
 

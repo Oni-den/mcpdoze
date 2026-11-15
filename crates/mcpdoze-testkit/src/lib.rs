@@ -49,6 +49,7 @@ pub struct MockServerSpec {
     resource_templates: Option<Vec<String>>,
     log_messages: bool,
     echo_env: Vec<String>,
+    subscribe: bool,
 }
 
 impl MockServerSpec {
@@ -73,6 +74,14 @@ impl MockServerSpec {
     /// Also report variable `name` (when set) in the `info` tool's `env`.
     pub fn echo_env(mut self, name: &str) -> Self {
         self.echo_env.push(name.to_string());
+        self
+    }
+    /// Advertise `resources.subscribe` and serve `resources/subscribe` /
+    /// `unsubscribe`. Tool `touch` (argument `uri`) emits
+    /// `notifications/resources/updated`; tool `sub_stats` reports the
+    /// counters and subscribed URIs.
+    pub fn subscribe(mut self) -> Self {
+        self.subscribe = true;
         self
     }
     /// Emit a `notifications/message` log notification at each tool call.
@@ -200,6 +209,7 @@ impl MockServerSpec {
             (self.roots_request, "--roots-request"),
             (self.stderr_noise, "--stderr-noise"),
             (self.log_messages, "--log-messages"),
+            (self.subscribe, "--subscribe"),
         ] {
             if on {
                 a.push(flag.to_string());
@@ -260,6 +270,14 @@ impl MockHttpSpec {
     /// Answer the first `n` `tools/call` requests with 401.
     pub fn reject_calls(mut self, n: u64) -> Self {
         self.args.extend(["--reject-calls".into(), n.to_string()]);
+        self
+    }
+    /// Advertise `resources.subscribe`, serve subscribe/unsubscribe, keep
+    /// `GET` event streams open; tool `touch` (argument `uri`) sends
+    /// `notifications/resources/updated` on every open stream, tool
+    /// `sub_stats` reports counters and the number of open streams.
+    pub fn subscribe(mut self) -> Self {
+        self.args.push("--subscribe".into());
         self
     }
     /// Delay every non-initialize response by `ms`.

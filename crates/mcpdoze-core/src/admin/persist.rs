@@ -44,6 +44,7 @@ const FIELD_ORDER: &[&str] = &[
     "allow_literal_env",
     "probe",
     "catalog_max_age",
+    "subscriptions",
 ];
 
 fn parse(text: &str) -> Result<DocumentMut, PersistError> {

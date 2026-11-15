@@ -22,6 +22,9 @@
 //!   override the static ones.
 //! * One shared [`reqwest::Client`] serves every HTTP backend.
 
+#[path = "http_listen.rs"]
+mod listen;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -138,6 +141,8 @@ pub struct HttpConn {
     closed: watch::Receiver<bool>,
     init: Mutex<Value>,
     client: ClientSide,
+    /// The upstream `GET` event stream task (see `http_listen.rs`).
+    listen: Mutex<Option<AbortHandle>>,
 }
 
 impl std::fmt::Debug for HttpConn {
@@ -186,6 +191,7 @@ impl HttpConn {
             closed,
             init: Mutex::new(Value::Null),
             client: spec.client.clone(),
+            listen: Mutex::new(None),
         }))
     }
 
@@ -312,6 +318,9 @@ impl HttpConn {
     }
 
     fn mark_closed(&self) {
+        if let Some(h) = lock(&self.listen).take() {
+            h.abort();
+        }
         fail_all(&self.pending);
         let _ = self.closed_tx.send(true);
     }
@@ -573,6 +582,7 @@ impl HttpConn {
     /// Ends the upstream session: aborts in-flight POSTs, fails pending calls
     /// and DELETEs the session. Idempotent.
     pub(crate) async fn shutdown(self: &Arc<Self>, grace: Duration) {
+        self.set_listening(false);
         let aborts: Vec<AbortHandle> = lock(&self.pending)
             .calls
             .values_mut()

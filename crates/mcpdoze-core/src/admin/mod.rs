@@ -171,7 +171,9 @@ fn build_spec(server: &ServerConfig, broker: &config::BrokerConfig) -> Result<Ba
             spec
         }
     };
-    Ok(spec.idle_ttl(ttl).start_timeout(broker.start_timeout))
+    let mut spec = spec.idle_ttl(ttl).start_timeout(broker.start_timeout);
+    spec.subscriptions = server.subscriptions;
+    Ok(spec)
 }
 
 fn broker_restart_fields(old: &config::BrokerConfig, new: &config::BrokerConfig) -> Vec<String> {

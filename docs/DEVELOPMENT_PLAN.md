@@ -52,7 +52,7 @@ resource metadata, capabilities, fingerprint of command/args/env names/URL).
 spawn (background diff), on backend `list_changed`, or `mcpdoze refresh`.
 A non-empty diff sends `list_changed` to stateful agent sessions. Prompts and
 resources are listed/fetched through the same prefixing in v1; resource
-subscriptions are v0.2.
+subscriptions came in v0.2 (`SUBSCRIPTIONS.md`).
 
 **Sessions and scopes.** Agent sessions are broker-side objects. Backend
 instances are keyed by `(server, scope_key)`: `shared` (default, one instance
