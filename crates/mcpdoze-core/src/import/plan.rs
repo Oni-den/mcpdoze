@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::config::{sanitize_prefix, Config, EnvValue, Scope, ServerConfig, Transport};
 
 use super::parse::{agent_files, exists, parse_file, RawServer, RawSpec, RawValue};
+use super::plugins::CWD_MARKER;
 use super::{Agent, ImportEnv, ImportError};
 
 /// Where an entry lives in an agent file (used to remove it again).
@@ -20,6 +21,21 @@ pub struct Source {
     pub container: Vec<String>,
     pub key: String,
     pub project_scoped: bool,
+}
+
+/// The plugin a server comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PluginRef {
+    /// `<plugin>@<marketplace>`.
+    pub id: String,
+    pub plugin: String,
+    pub server: String,
+    /// How the agent names the server to disable it: `plugin:<plugin>:<server>`.
+    pub disable_as: String,
+    /// Plugin install directory (read only).
+    pub root: PathBuf,
+    /// Uses `${CLAUDE_PROJECT_DIR}`.
+    pub per_cwd: bool,
 }
 
 /// A secret the user must provide through the environment.
@@ -53,6 +69,9 @@ pub struct PlanItem {
     pub sources: Vec<Source>,
     /// An identical server is already in the broker config.
     pub already_registered: bool,
+    /// Provided by an agent plugin: registered with the broker, but the
+    /// plugin is never changed (`sources` is empty).
+    pub plugin: Option<PluginRef>,
     #[serde(skip)]
     pub config: ServerConfig,
 }
@@ -80,6 +99,13 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// True if applying would change anything: an agent file to rewrite or
+    /// a server not yet in the broker config. (Plugin servers stay in their
+    /// plugin, so a repeated import lists them as already registered.)
+    pub fn has_changes(&self) -> bool {
+        !self.files.is_empty() || self.items.iter().any(|i| !i.already_registered)
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into())
     }
@@ -146,6 +172,13 @@ impl Plan {
             }
             for src in &it.sources {
                 let _ = writeln!(s, "      from: {}", src.file.display());
+            }
+            if let Some(p) = &it.plugin {
+                let _ = writeln!(
+                    s,
+                    "      from plugin: {} (not changed; disable in agent as {})",
+                    p.id, p.disable_as
+                );
             }
         }
         for sk in &self.skipped {
@@ -330,6 +363,33 @@ struct Candidate {
     needs: Vec<NeedsEnvVar>,
     warnings: Vec<String>,
     sources: Vec<Source>,
+    plugin: Option<PluginRef>,
+}
+
+/// Puts the broker's `${cwd}` where a plugin used `${CLAUDE_PROJECT_DIR}`.
+fn restore_cwd(c: &mut ServerConfig) {
+    let fix = |s: &mut String| {
+        if s.contains(CWD_MARKER) {
+            *s = s.replace(CWD_MARKER, crate::backend::CWD_VAR);
+        }
+    };
+    if let Some(cmd) = &mut c.command {
+        fix(cmd);
+    }
+    c.args.iter_mut().for_each(fix);
+    for v in c.env.values_mut().chain(c.headers.values_mut()) {
+        if let EnvValue::Literal(s) = v {
+            fix(s);
+        }
+    }
+    if let Some(u) = &mut c.url {
+        fix(u);
+    }
+    if let Some(d) = &mut c.cwd {
+        let mut s = d.to_string_lossy().into_owned();
+        fix(&mut s);
+        *d = PathBuf::from(s);
+    }
 }
 
 /// Convert key/value pairs into broker env values.
@@ -441,6 +501,7 @@ pub fn build_plan_with(
     let mut skipped = Vec::new();
     let mut cands: Vec<Candidate> = Vec::new();
     let mut found_any_file = false;
+    let mut raws: Vec<(RawServer, bool)> = Vec::new();
 
     for file in agent_files(agent, env) {
         if !exists(&file.path) {
@@ -454,8 +515,47 @@ pub fn build_plan_with(
                 continue;
             }
         };
-        for raw in parsed.servers {
-            if parsed.lenient {
+        let lenient = parsed.lenient;
+        raws.extend(parsed.servers.into_iter().map(|r| (r, lenient)));
+    }
+    if agent == Agent::ClaudeCode {
+        let scan = super::plugins::scan(env);
+        warnings.extend(scan.warnings);
+        for p in scan.servers {
+            let raw = RawServer {
+                name: p.server.clone(),
+                spec: p.spec,
+                disabled: false,
+                uses_inputs: false,
+                source: Source {
+                    file: p.root.clone(),
+                    container: Vec::new(),
+                    key: p.server.clone(),
+                    project_scoped: false,
+                },
+                plugin: Some(PluginRef {
+                    disable_as: format!("plugin:{}:{}", p.plugin, p.server),
+                    id: p.id.clone(),
+                    plugin: p.plugin,
+                    server: p.server,
+                    root: p.root,
+                    per_cwd: p.per_cwd,
+                }),
+            };
+            if !p.enabled {
+                skipped.push(skip(&raw, &format!("plugin `{}` is disabled", p.id)));
+                continue;
+            }
+            if let Some(why) = &p.skip {
+                skipped.push(skip(&raw, why));
+                continue;
+            }
+            raws.push((raw, false));
+        }
+    }
+    {
+        for (raw, lenient) in raws {
+            if lenient {
                 skipped.push(skip(
                     &raw,
                     "file contains comments or trailing commas; rewriting would drop them (edit by hand or remove them first)",
@@ -538,12 +638,28 @@ pub fn build_plan_with(
                     c
                 }
             };
+            let mut config = config;
+            restore_cwd(&mut config);
+            if let Some(p) = &raw.plugin {
+                cwarn.push(format!(
+                    "provided by plugin `{}`: the plugin's files are not changed; disable it in the agent as {} (or disable the plugin), otherwise its tools are listed twice (mcp__plugin_{}_{}__* and mcp__{}__<prefix>__*)",
+                    p.id,
+                    p.disable_as,
+                    p.plugin,
+                    p.server,
+                    super::BROKER_ENTRY_NAME
+                ));
+            }
             // Merge with an identical candidate of the same name.
-            if let Some(c) = cands
-                .iter_mut()
-                .find(|c| c.orig_name == name && c.config == config && c.needs == needs)
-            {
-                c.sources.push(raw.source.clone());
+            if let Some(c) = cands.iter_mut().find(|c| {
+                c.orig_name == name
+                    && c.config == config
+                    && c.needs == needs
+                    && c.plugin == raw.plugin
+            }) {
+                if raw.plugin.is_none() {
+                    c.sources.push(raw.source.clone());
+                }
                 continue;
             }
             cands.push(Candidate {
@@ -551,7 +667,12 @@ pub fn build_plan_with(
                 config,
                 needs,
                 warnings: cwarn,
-                sources: vec![raw.source.clone()],
+                sources: if raw.plugin.is_none() {
+                    vec![raw.source.clone()]
+                } else {
+                    Vec::new()
+                },
+                plugin: raw.plugin.clone(),
             });
         }
     }
@@ -627,6 +748,11 @@ pub fn build_plan_with(
                 Scope::PerCwd,
                 Some("entry comes from a project-scoped config".to_string()),
             )
+        } else if c.plugin.as_ref().is_some_and(|p| p.per_cwd) {
+            (
+                Scope::PerCwd,
+                Some("plugin server uses ${CLAUDE_PROJECT_DIR}".to_string()),
+            )
         } else if config.args.iter().any(|a| arg_marks_cwd(a)) {
             (
                 Scope::PerCwd,
@@ -654,6 +780,7 @@ pub fn build_plan_with(
             warnings: c.warnings,
             sources: c.sources,
             already_registered: already,
+            plugin: c.plugin,
             config,
         });
     }

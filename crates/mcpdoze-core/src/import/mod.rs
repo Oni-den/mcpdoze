@@ -30,6 +30,7 @@
 mod apply;
 mod parse;
 mod plan;
+mod plugins;
 mod util;
 
 pub use apply::{
@@ -40,7 +41,8 @@ pub use parse::{
     agent_files, parse_file, AgentFile, FileRole, ParsedFile, RawServer, RawSpec, RawValue,
 };
 pub use plan::{
-    build_plan, build_plan_with, NeedsEnvVar, Plan, PlanItem, PlanOptions, Skipped, Source,
+    build_plan, build_plan_with, NeedsEnvVar, Plan, PlanItem, PlanOptions, PluginRef, Skipped,
+    Source,
 };
 pub use util::{sha256_hex, utc_timestamp};
 

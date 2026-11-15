@@ -446,7 +446,8 @@ async fn warm_catalog_survives_restart_with_zero_processes() {
             "env name stored:\n{text}"
         );
         let c: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(c["version"], 1);
+        assert_eq!(c["version"], 2);
+        assert!(c.get("cwd_key").is_none(), "shared entry has no cwd key");
         assert!(c["fingerprint"].as_str().unwrap().starts_with("v1-"));
         assert_eq!(c["server_info"]["name"], "mock");
         assert_eq!(api.tool_names().await, ["mock__echo", "mock__pid"]);

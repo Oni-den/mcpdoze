@@ -8,10 +8,19 @@
 //! [`fingerprint`] of its launch spec. The router discards an entry whose
 //! fingerprint no longer matches the spec.
 //!
-//! [`DiskCatalog`] keeps one JSON file per server at
-//! `<dir>/<server>.json`, written atomically (temporary file plus rename).
-//! Missing, unreadable, corrupt, oversized or wrong-version files count as
-//! "no catalog": the server is probed again and the file rewritten.
+//! Entries are keyed by `(server, cwd key)`. The key is `None` for the
+//! shared entry every server has; `per-cwd` servers can also hold one entry
+//! per agent directory (normalised with [`super::cwd_key`]), listed from
+//! the instance running there. A lookup with a key falls back to the shared
+//! entry when that directory has none.
+//!
+//! [`DiskCatalog`] keeps one JSON file per entry: `<dir>/<server>.json` for
+//! the shared entry and `<dir>/<server>@<hash>.json` for a directory (the
+//! hash is 16 hex digits of the cwd key, which the file also records).
+//! Files are written atomically (temporary file plus rename). Missing,
+//! unreadable, corrupt, oversized or unknown-version files count as "no
+//! catalog": the server is probed again and the file rewritten. Files of
+//! format version 1 (before per-directory entries) still load.
 //!
 //! The fingerprint covers transport, command, arguments, working directory,
 //! URL, environment variable NAMES, header NAMES and the `headers_helper`
@@ -29,8 +38,11 @@ use serde_json::Value;
 use crate::backend::stdio::lock;
 use crate::backend::BackendSpec;
 
-/// On-disk format version; files with another version are ignored.
-pub const CATALOG_VERSION: u32 = 1;
+/// On-disk format version written; files of a version from
+/// [`MIN_CATALOG_VERSION`] up to this one load, others are ignored.
+pub const CATALOG_VERSION: u32 = 2;
+/// Oldest on-disk format version still read.
+pub const MIN_CATALOG_VERSION: u32 = 1;
 /// Largest catalog file read from disk.
 pub const MAX_CATALOG_FILE: u64 = 32 * 1024 * 1024;
 
@@ -44,6 +56,9 @@ pub struct CatalogEntry {
     /// snapshots stored without one (accepted for any spec).
     #[serde(default)]
     pub fingerprint: String,
+    /// The cwd key of a per-directory entry; `None` for the shared entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_key: Option<String>,
     /// When the lists were taken, in seconds since the Unix epoch.
     #[serde(default)]
     pub updated_at: u64,
@@ -102,15 +117,38 @@ impl CatalogEntry {
     }
 }
 
-/// Storage for per-server catalog entries.
+/// Storage for catalog entries keyed by `(server, cwd key)`.
+///
+/// Implementations only have to provide the shared entry ([`entry`],
+/// [`put`]); the keyed methods then default to "no per-directory entries",
+/// so every lookup falls back to the shared entry.
+///
+/// [`entry`]: Catalog::entry
+/// [`put`]: Catalog::put
 pub trait Catalog: Send + Sync + 'static {
-    /// The entry for `server`, if a valid one exists.
+    /// The shared entry for `server`, if a valid one exists.
     fn entry(&self, server: &str) -> Option<Arc<CatalogEntry>>;
-    /// Stores the entry for `server`.
+    /// Stores the shared entry for `server`.
     fn put(&self, server: &str, entry: CatalogEntry);
-    /// Forgets the entry for `server` (server removed or changed).
+    /// Forgets every entry of `server` (server removed or changed).
     fn remove(&self, server: &str) {
         let _ = server;
+    }
+
+    /// The entry stored for `server` at `cwd` exactly (no fallback);
+    /// `None` is the shared entry.
+    fn entry_at(&self, server: &str, cwd: Option<&str>) -> Option<Arc<CatalogEntry>> {
+        match cwd {
+            None => self.entry(server),
+            Some(_) => None,
+        }
+    }
+
+    /// Stores the entry for `server` at `cwd` (`None`: shared).
+    fn put_at(&self, server: &str, cwd: Option<&str>, entry: CatalogEntry) {
+        if cwd.is_none() {
+            self.put(server, entry);
+        }
     }
 
     /// The tool snapshot for `server`, if one exists.
@@ -128,32 +166,47 @@ pub trait Catalog: Send + Sync + 'static {
     }
 }
 
+type Key = (String, Option<String>);
+
+fn key(server: &str, cwd: Option<&str>) -> Key {
+    (server.to_owned(), cwd.map(str::to_owned))
+}
+
 /// In-memory [`Catalog`].
 #[derive(Debug, Default)]
 pub struct MemoryCatalog {
-    entries: Mutex<HashMap<String, Arc<CatalogEntry>>>,
+    entries: Mutex<HashMap<Key, Arc<CatalogEntry>>>,
 }
 
 impl Catalog for MemoryCatalog {
     fn entry(&self, server: &str) -> Option<Arc<CatalogEntry>> {
-        lock(&self.entries).get(server).cloned()
+        self.entry_at(server, None)
     }
 
     fn put(&self, server: &str, entry: CatalogEntry) {
-        lock(&self.entries).insert(server.to_owned(), Arc::new(entry));
+        self.put_at(server, None, entry);
     }
 
     fn remove(&self, server: &str) {
-        lock(&self.entries).remove(server);
+        lock(&self.entries).retain(|(s, _), _| s != server);
+    }
+
+    fn entry_at(&self, server: &str, cwd: Option<&str>) -> Option<Arc<CatalogEntry>> {
+        lock(&self.entries).get(&key(server, cwd)).cloned()
+    }
+
+    fn put_at(&self, server: &str, cwd: Option<&str>, mut entry: CatalogEntry) {
+        entry.cwd_key = cwd.map(str::to_owned);
+        lock(&self.entries).insert(key(server, cwd), Arc::new(entry));
     }
 }
 
-/// [`Catalog`] backed by one JSON file per server, with an in-memory cache.
+/// [`Catalog`] backed by one JSON file per entry, with an in-memory cache.
 #[derive(Debug)]
 pub struct DiskCatalog {
     dir: PathBuf,
     /// `None` caches "no valid file".
-    cache: Mutex<HashMap<String, Option<Arc<CatalogEntry>>>>,
+    cache: Mutex<HashMap<Key, Option<Arc<CatalogEntry>>>>,
 }
 
 impl DiskCatalog {
@@ -170,13 +223,25 @@ impl DiskCatalog {
         &self.dir
     }
 
-    /// The file of `server`.
+    /// The file of the shared entry of `server`.
     pub fn path_of(&self, server: &str) -> PathBuf {
-        self.dir.join(format!("{}.json", file_stem(server)))
+        self.path_at(server, None)
     }
 
-    fn load(&self, server: &str) -> Option<Arc<CatalogEntry>> {
-        let path = self.path_of(server);
+    /// The file of `server`'s entry at `cwd` (`None`: shared).
+    pub fn path_at(&self, server: &str, cwd: Option<&str>) -> PathBuf {
+        match cwd {
+            None => self.dir.join(format!("{}.json", file_stem(server))),
+            Some(k) => self.dir.join(format!(
+                "{}@{:016x}.json",
+                file_stem(server),
+                fnv1a64(0xcbf2_9ce4_8422_2325, k.as_bytes())
+            )),
+        }
+    }
+
+    fn load(&self, server: &str, cwd: Option<&str>) -> Option<Arc<CatalogEntry>> {
+        let path = self.path_at(server, cwd);
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -195,7 +260,15 @@ impl DiskCatalog {
             return None;
         }
         match serde_json::from_slice::<CatalogEntry>(&text) {
-            Ok(e) if e.version == CATALOG_VERSION => Some(Arc::new(e)),
+            Ok(e) if (MIN_CATALOG_VERSION..=CATALOG_VERSION).contains(&e.version) => {
+                // A hash collision or a hand-copied file: the recorded key
+                // must be the one asked for.
+                if e.cwd_key.as_deref() != cwd {
+                    tracing::info!(server, "catalog file is for another directory; ignoring it");
+                    return None;
+                }
+                Some(Arc::new(e))
+            }
             Ok(e) => {
                 tracing::info!(
                     server,
@@ -214,17 +287,27 @@ impl DiskCatalog {
 
 impl Catalog for DiskCatalog {
     fn entry(&self, server: &str) -> Option<Arc<CatalogEntry>> {
-        if let Some(e) = lock(&self.cache).get(server) {
+        self.entry_at(server, None)
+    }
+
+    fn put(&self, server: &str, entry: CatalogEntry) {
+        self.put_at(server, None, entry);
+    }
+
+    fn entry_at(&self, server: &str, cwd: Option<&str>) -> Option<Arc<CatalogEntry>> {
+        let k = key(server, cwd);
+        if let Some(e) = lock(&self.cache).get(&k) {
             return e.clone();
         }
-        let loaded = self.load(server);
-        lock(&self.cache).insert(server.to_owned(), loaded.clone());
+        let loaded = self.load(server, cwd);
+        lock(&self.cache).insert(k, loaded.clone());
         loaded
     }
 
-    fn put(&self, server: &str, mut entry: CatalogEntry) {
+    fn put_at(&self, server: &str, cwd: Option<&str>, mut entry: CatalogEntry) {
         entry.version = CATALOG_VERSION;
-        let path = self.path_of(server);
+        entry.cwd_key = cwd.map(str::to_owned);
+        let path = self.path_at(server, cwd);
         match serde_json::to_string_pretty(&entry) {
             Ok(text) => {
                 if let Err(e) = crate::admin::persist::write_atomic(&path, &text) {
@@ -233,15 +316,32 @@ impl Catalog for DiskCatalog {
             }
             Err(e) => tracing::warn!(server, error = %e, "cannot serialize catalog"),
         }
-        lock(&self.cache).insert(server.to_owned(), Some(Arc::new(entry)));
+        lock(&self.cache).insert(key(server, cwd), Some(Arc::new(entry)));
     }
 
     fn remove(&self, server: &str) {
-        lock(&self.cache).insert(server.to_owned(), None);
-        match std::fs::remove_file(self.path_of(server)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(server, error = %e, "cannot remove catalog file"),
+        {
+            let mut cache = lock(&self.cache);
+            cache.retain(|(s, _), _| s != server);
+            cache.insert(key(server, None), None);
+        }
+        let stem = file_stem(server);
+        let keyed = format!("{stem}@");
+        let mut paths = vec![self.path_of(server)];
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&keyed) && name.ends_with(".json") {
+                    paths.push(e.path());
+                }
+            }
+        }
+        for p in paths {
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(server, error = %e, "cannot remove catalog file"),
+            }
         }
     }
 }
@@ -387,6 +487,78 @@ mod tests {
         c.remove("srv");
         assert!(!c.path_of("srv").exists());
         assert!(c.entry("srv").is_none());
+    }
+
+    #[test]
+    fn keyed_entries_round_trip_and_old_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = DiskCatalog::new(dir.path());
+        let e = |t: &str| CatalogEntry {
+            tools: vec![json!({"name": t})],
+            ..CatalogEntry::default()
+        };
+        c.put("srv", e("shared"));
+        c.put_at("srv", Some("/example/a"), e("a"));
+        c.put_at("other", Some("/example/a"), e("o"));
+        let fresh = DiskCatalog::new(dir.path());
+        assert!(fresh.entry("srv").unwrap().has_tool("shared"));
+        let a = fresh.entry_at("srv", Some("/example/a")).unwrap();
+        assert!(a.has_tool("a"));
+        assert_eq!(a.cwd_key.as_deref(), Some("/example/a"));
+        assert!(fresh.entry_at("srv", Some("/example/b")).is_none());
+        let p = c.path_at("srv", Some("/example/a"));
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("srv@") && name.ends_with(".json"),
+            "{name}"
+        );
+        // A file copied to another directory's name is not trusted.
+        std::fs::copy(&p, c.path_at("srv", Some("/example/b"))).unwrap();
+        assert!(DiskCatalog::new(dir.path())
+            .entry_at("srv", Some("/example/b"))
+            .is_none());
+        // Version-1 files (no cwd_key) still load as shared entries.
+        std::fs::write(
+            c.path_of("old"),
+            br#"{"version": 1, "fingerprint": "v1-x", "tools": [{"name": "t"}]}"#,
+        )
+        .unwrap();
+        assert!(DiskCatalog::new(dir.path())
+            .entry("old")
+            .unwrap()
+            .has_tool("t"));
+        // Removing a server drops its keyed files too, not other servers'.
+        c.remove("srv");
+        assert!(!c.path_at("srv", Some("/example/a")).exists());
+        assert!(!c.path_of("srv").exists());
+        assert!(c.entry_at("srv", Some("/example/a")).is_none());
+        assert!(c.path_at("other", Some("/example/a")).exists());
+    }
+
+    #[test]
+    fn memory_catalog_keys_and_default_fallback() {
+        let c = MemoryCatalog::default();
+        c.put_at("s", Some("k"), CatalogEntry::default());
+        assert!(c.entry("s").is_none());
+        assert!(c.entry_at("s", Some("k")).is_some());
+        c.remove("s");
+        assert!(c.entry_at("s", Some("k")).is_none());
+
+        // A catalog with only shared entries ignores keyed writes.
+        struct Shared(MemoryCatalog);
+        impl Catalog for Shared {
+            fn entry(&self, s: &str) -> Option<Arc<CatalogEntry>> {
+                self.0.entry(s)
+            }
+            fn put(&self, s: &str, e: CatalogEntry) {
+                self.0.put(s, e)
+            }
+        }
+        let s = Shared(MemoryCatalog::default());
+        s.put_at("x", Some("k"), CatalogEntry::default());
+        assert!(s.entry_at("x", Some("k")).is_none());
+        s.put_at("x", None, CatalogEntry::default());
+        assert!(s.entry_at("x", None).is_some());
     }
 
     #[test]

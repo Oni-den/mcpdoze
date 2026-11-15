@@ -143,14 +143,17 @@ impl Router {
             .await;
         // Stale catalog: the backend rejected a listed tool, or served one
         // the catalog does not know.
-        if let Some(entry) = self.catalog.entry(&server.name) {
+        let ckey = self
+            .session_key_now(session)
+            .and_then(|k| server.catalog_key_of(&k));
+        if let Some((entry, _)) = self.entry_for(&server, ckey.as_deref()) {
             let rejected = matches!(
                 resp["error"]["code"].as_i64(),
                 Some(jsonrpc::INVALID_PARAMS | jsonrpc::METHOD_NOT_FOUND)
             );
             if rejected || !entry.has_tool(&tool) {
-                if let Some(conn) = server.any_running_conn() {
-                    self.spawn_dedup_refresh(&server, Some(conn), false, "stale catalog");
+                if let Some(target) = server.running_for(ckey.as_deref()) {
+                    self.spawn_dedup_refresh(&server, Some(target), false, "stale catalog");
                 }
             }
         }
@@ -252,8 +255,9 @@ impl Router {
             Ok(g) => g,
             Err(e) => return jsonrpc::error(id, jsonrpc::BACKEND_UNAVAILABLE, e.to_string()),
         };
+        let inst_key = inst.spec().client.scope_key.clone();
         drop(inst);
-        self.note_conn(server, guard.conn());
+        self.note_conn(server, &inst_key, guard.conn());
         let key = jsonrpc::id_key(&id);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         lock(&session.inflight).insert(key.clone(), cancel_tx);

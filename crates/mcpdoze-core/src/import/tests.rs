@@ -629,3 +629,177 @@ fn headers_helper_import_and_project_opt_in() {
     cfg.servers.insert(pr.name.clone(), pr.config.clone());
     cfg.validate().unwrap();
 }
+
+/// A Claude Code plugin setup: `alpha@mk` enabled (three servers, one using
+/// `user_config`), `beta@mk` installed but disabled.
+fn plugin_fixture(f: &Fx) -> (PathBuf, PathBuf) {
+    let plugins = f.env.home.join(".claude").join("plugins");
+    let alpha = plugins.join("cache").join("mk").join("alpha").join("1.0.0");
+    let beta = plugins.join("cache").join("mk").join("beta").join("1.0.0");
+    write(
+        &f.env.home.join(".claude").join("settings.json"),
+        r#"{"enabledPlugins": {"alpha@mk": true, "beta@mk": false}}"#,
+    );
+    write(
+        &plugins.join("installed_plugins.json"),
+        &serde_json::json!({"version": 2, "plugins": {
+            "alpha@mk": [{"scope": "user", "installPath": alpha}],
+            "beta@mk": [{"scope": "user", "installPath": beta}],
+        }})
+        .to_string(),
+    );
+    write(
+        &alpha.join(".mcp.json"),
+        r#"{"mcpServers": {"tools": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/srv",
+            "args": ["--data", "${CLAUDE_PLUGIN_DATA}", "--project", "${CLAUDE_PROJECT_DIR}"]}}}"#,
+    );
+    write(
+        &alpha.join(".claude-plugin").join("plugin.json"),
+        r#"{"name": "alpha", "mcpServers": {
+            "tools": {"command": "ignored-duplicate"},
+            "remote": {"type": "http", "url": "https://example.com/mcp"},
+            "cfg": {"type": "http", "url": "https://example.com/x",
+                    "headers": {"Authorization": "Bearer ${user_config.api_key}"}}}}"#,
+    );
+    write(
+        &beta.join(".mcp.json"),
+        r#"{"mcpServers": {"bsrv": {"command": "beta-mcp"}}}"#,
+    );
+    (alpha, beta)
+}
+
+fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push((p.clone(), fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn plugin_servers_are_planned_read_only() {
+    let f = fx();
+    let (alpha, beta) = plugin_fixture(&f);
+    write(
+        &f.env.home.join(".claude.json"),
+        r#"{"mcpServers": {"own": {"command": "own-mcp"}}}"#,
+    );
+    let plugins_root = f.env.home.join(".claude").join("plugins");
+    let before = snapshot(&plugins_root);
+
+    let p = plan_for(&f, Agent::ClaudeCode);
+    let tools = item(&p, "tools");
+    let pr = tools.plugin.as_ref().unwrap();
+    assert_eq!(pr.disable_as, "plugin:alpha:tools");
+    assert!(tools.sources.is_empty());
+    assert_eq!(tools.scope, Scope::PerCwd);
+    let root = alpha.to_string_lossy().into_owned();
+    assert_eq!(
+        tools.command.as_deref(),
+        Some(format!("{root}/bin/srv").as_str())
+    );
+    let data = plugins_root.join("data").join("alpha-mk");
+    assert_eq!(
+        tools.args,
+        [
+            "--data".to_string(),
+            data.to_string_lossy().into_owned(),
+            "--project".into(),
+            "${cwd}".into()
+        ]
+    );
+    assert!(tools
+        .warnings
+        .iter()
+        .any(|w| w.contains("plugin:alpha:tools") && w.contains("mcp__plugin_alpha_tools__")));
+    let remote = item(&p, "remote");
+    assert_eq!(remote.scope, Scope::Shared);
+    assert!(remote.plugin.is_some());
+    assert!(item(&p, "own").plugin.is_none());
+    let reason = |n: &str| {
+        p.skipped
+            .iter()
+            .find(|s| s.name == n)
+            .unwrap_or_else(|| panic!("{n} not skipped"))
+            .reason
+            .clone()
+    };
+    assert!(reason("bsrv").contains("disabled"));
+    assert!(reason("cfg").contains("user_config"));
+    assert!(p.items.iter().all(|i| i.name != "bsrv"));
+    assert_eq!(p.files, [f.env.home.join(".claude.json")]);
+    assert!(p
+        .render_text()
+        .contains("disable in agent as plugin:alpha:tools"));
+
+    // Apply and roll back: plugin files are never touched.
+    let res = apply(&p, &f.env.data_dir, &ApplyOptions::default())
+        .unwrap()
+        .unwrap();
+    for n in ["tools", "remote", "own"] {
+        assert!(res.manifest.registered_servers.contains(&n.to_string()));
+    }
+    let cfg = Config::load(&f.env.broker_config).unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(cfg.servers["tools"].args[3], "${cwd}");
+    assert_eq!(snapshot(&plugins_root), before);
+    // Re-planning lists the plugin servers as already registered: no change.
+    let again = plan_for(&f, Agent::ClaudeCode);
+    assert!(!again.has_changes(), "{}", again.render_text());
+    assert!(apply(&again, &f.env.data_dir, &ApplyOptions::default())
+        .unwrap()
+        .is_none());
+    rollback(&res.manifest_path).unwrap();
+    assert_eq!(snapshot(&plugins_root), before);
+    assert!(!Config::load(&f.env.broker_config)
+        .unwrap()
+        .servers
+        .contains_key("tools"));
+    let _ = beta;
+}
+
+#[test]
+fn unrecognised_plugin_registry_is_skipped_with_a_warning() {
+    let f = fx();
+    plugin_fixture(&f);
+    let reg = f
+        .env
+        .home
+        .join(".claude")
+        .join("plugins")
+        .join("installed_plugins.json");
+    write(&reg, r#"{"version": 9, "plugins": {}}"#);
+    let p = plan_for(&f, Agent::ClaudeCode);
+    assert!(p.items.iter().all(|i| i.plugin.is_none()));
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("unrecognised plugin registry layout")),
+        "{:?}",
+        p.warnings
+    );
+    write(&reg, r#"{"plugins": []}"#);
+    let p = plan_for(&f, Agent::ClaudeCode);
+    assert!(p
+        .warnings
+        .iter()
+        .any(|w| w.contains("unrecognised plugin registry layout")));
+    // Version 1 layout (one object per plugin) is understood.
+    let alpha = f.env.home.join(".claude/plugins/cache/mk/alpha/1.0.0");
+    write(
+        &reg,
+        &serde_json::json!({"version": 1, "plugins": {"alpha@mk": {"installPath": alpha}}})
+            .to_string(),
+    );
+    let p = plan_for(&f, Agent::ClaudeCode);
+    assert!(item(&p, "remote").plugin.is_some());
+}

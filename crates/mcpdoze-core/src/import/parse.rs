@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::plan::Source;
+use super::plan::{PluginRef, Source};
 use super::util::{read_capped, to_text};
 use super::{Agent, ImportEnv, ImportError};
 
@@ -79,6 +79,8 @@ pub struct RawServer {
     /// Entry mentions inputs/prompts the broker cannot resolve.
     pub uses_inputs: bool,
     pub source: Source,
+    /// Provided by a plugin (read-only; `source` is not rewritten).
+    pub plugin: Option<PluginRef>,
 }
 
 /// Result of parsing one file.
@@ -223,6 +225,7 @@ pub(crate) fn parse_text(
                     key: key.clone(),
                     project_scoped,
                 },
+                plugin: None,
             });
         }
     }
@@ -253,7 +256,7 @@ fn kv_map(v: Option<&Value>) -> Vec<(String, RawValue)> {
 }
 
 /// Claude Code / Cursor / VS Code entry.
-fn json_spec(v: &Value) -> RawSpec {
+pub(crate) fn json_spec(v: &Value) -> RawSpec {
     let Some(o) = v.as_object() else {
         return RawSpec::Unsupported("entry is not an object".into());
     };
@@ -400,6 +403,7 @@ fn parse_codex(file: &AgentFile, text: &str) -> Result<ParsedFile, ImportError> 
                 key: name.clone(),
                 project_scoped: file.role == FileRole::Project,
             },
+            plugin: None,
         });
     }
     Ok(out)

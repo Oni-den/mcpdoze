@@ -77,6 +77,10 @@ session, which is what MCPDoze exists to prevent. Instead:
      NOT migrated automatically. Ask the user to put the secret in an
      environment variable they choose and re-run; never ask them to paste the
      secret into the chat.
+   - Entries with a `plugin` come from an agent plugin (Claude Code). The
+     plugin is not changed; after applying, tell the user to disable each
+     one in the agent as shown (`plugin:<plugin>:<server>` in `/mcp`, or
+     disable the plugin), or its tools appear twice.
    - Entries with `headers_helper: true` carry a `headersHelper` command the
      broker will run. Show the user the command (it is in their own config)
      before applying. Project-scoped helpers are skipped unless the user, after

@@ -27,7 +27,7 @@ pub(super) struct RouterEvents {
 }
 
 impl BackendEvents for RouterEvents {
-    fn notification(&self, server: &str, _scope_key: &str, mut msg: Value) {
+    fn notification(&self, server: &str, scope_key: &str, mut msg: Value) {
         match msg["method"].as_str().unwrap_or("") {
             "notifications/progress" => {
                 let Some(token) = msg["params"]["progressToken"].as_str().map(str::to_owned) else {
@@ -46,7 +46,7 @@ impl BackendEvents for RouterEvents {
             | "notifications/resources/list_changed" => {
                 tracing::debug!(server, "backend list changed");
                 if let Some(r) = self.router.upgrade() {
-                    r.on_list_changed(server);
+                    r.on_list_changed(server, scope_key);
                 }
             }
             method => tracing::debug!(server, method, "backend notification dropped"),

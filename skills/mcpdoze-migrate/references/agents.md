@@ -17,6 +17,20 @@ Notes:
 - OpenCode files containing comments are skipped rather than rewritten (a
   rewrite would drop the comments); migrate those by hand using
   `mcpdoze add`.
+- Claude Code plugins: servers of enabled plugins (`enabledPlugins` in
+  `~/.claude/settings.json` and the project's `.claude/settings*.json`;
+  install paths from `~/.claude/plugins/installed_plugins.json`; servers
+  from the plugin's `.mcp.json`, `.claude-plugin/plugin.json` `mcpServers`
+  or its marketplace entry) are registered with the broker too. Plugin
+  files are never changed, backed up or rolled back. `${CLAUDE_PLUGIN_ROOT}`
+  and `${CLAUDE_PLUGIN_DATA}` are expanded; `${CLAUDE_PROJECT_DIR}` becomes
+  `${cwd}` and the server `per-cwd`. Disabled plugins and servers using
+  `${user_config.*}` are skipped. An unknown registry layout is skipped with
+  a warning. After the import the user must disable each plugin server in
+  the agent (`/mcp`, shown as `plugin:<plugin>:<server>`) or disable the
+  plugin; otherwise its tools appear twice (`mcp__plugin_<plugin>_<server>__*`
+  and `mcp__mcpdoze__<prefix>__*`). A repeated import lists them as already
+  registered.
 - Claude Code `headersHelper` (http entries) is copied to the broker's
   `headers_helper` and run by the broker, never by the import (not even with
   `--dry-run`). Helpers from project-scoped files are skipped unless

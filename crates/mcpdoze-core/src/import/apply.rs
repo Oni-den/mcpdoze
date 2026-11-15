@@ -519,7 +519,7 @@ pub fn apply(
     data_dir: &Path,
     opts: &ApplyOptions,
 ) -> Result<Option<ApplyResult>, ImportError> {
-    if plan.items.is_empty() {
+    if !plan.has_changes() {
         return Ok(None);
     }
     let secs = opts.now_secs.unwrap_or_else(now_secs);

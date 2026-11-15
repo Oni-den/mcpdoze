@@ -46,8 +46,12 @@
 //! `per-session` keys by agent session id; `per-cwd` keys by the agent's
 //! working directory (its first `file://` root, else `X-Mcpdoze-Cwd` /
 //! `?cwd=`), falling back to the shared instance when unknown. Each instance
-//! has its own lifecycle; the catalog stays one entry per server. At most
-//! `max_instances` scoped instances exist per server.
+//! has its own lifecycle. At most `max_instances` scoped instances exist per
+//! server. The catalog is keyed by `(server, cwd key)`: a `per-cwd`
+//! server's scoped instance lists into its directory's entry, and a
+//! session's lists use the entry of its directory, falling back to the
+//! server's shared entry. List changes go only to sessions reading the
+//! changed entry.
 //!
 //! # Server-to-client requests
 //!
@@ -201,8 +205,9 @@ pub struct Server {
     options: CatalogOptions,
     /// Serialises listing and catalog updates of this server.
     refresh_lock: tokio::sync::Mutex<()>,
-    /// Instance generation whose lists are known (0: none).
-    listed_gen: AtomicU64,
+    /// Per instance (scope key, "" for the shared one): the connection
+    /// generation whose lists are known.
+    listed: Mutex<HashMap<String, u64>>,
     /// A deduplicated background refresh is queued or running.
     bg_refresh: AtomicBool,
 }
@@ -276,6 +281,47 @@ impl Server {
     /// A running connection of any instance (catalog re-lists).
     pub fn any_running_conn(&self) -> Option<Arc<Conn>> {
         self.all_instances().iter().find_map(|i| i.running_conn())
+    }
+
+    /// The catalog key of instance scope_key: its directory for a
+    /// per-cwd server's scoped instance, else None (the shared entry).
+    pub fn catalog_key_of(&self, scope_key: &str) -> Option<String> {
+        (self.scope.scope == Scope::PerCwd && !scope_key.is_empty()).then(|| scope_key.to_owned())
+    }
+
+    /// A running connection whose lists belong to catalog key ckey, with
+    /// its instance's scope key: the scoped instance of that directory, or
+    /// for None the shared instance (and, unless the server is per-cwd,
+    /// any scoped instance).
+    pub(crate) fn running_for(&self, ckey: Option<&str>) -> Option<(String, Arc<Conn>)> {
+        match ckey {
+            Some(k) => self
+                .scoped_instance(k)
+                .and_then(|i| i.running_conn())
+                .map(|c| (k.to_owned(), c)),
+            None => {
+                if let Some(c) = self.instance.running_conn() {
+                    return Some((String::new(), c));
+                }
+                if self.scope.scope == Scope::PerCwd {
+                    return None;
+                }
+                lock(&self.scoped)
+                    .iter()
+                    .find_map(|(k, i)| i.running_conn().map(|c| (k.clone(), c)))
+            }
+        }
+    }
+
+    /// Running scoped instances of a per-cwd server, by directory key.
+    pub(crate) fn running_keyed(&self) -> Vec<(String, Arc<Conn>)> {
+        if self.scope.scope != Scope::PerCwd {
+            return Vec::new();
+        }
+        lock(&self.scoped)
+            .iter()
+            .filter_map(|(k, i)| i.running_conn().map(|c| (k.clone(), c)))
+            .collect()
     }
 
     /// The most active state over all instances.
@@ -455,7 +501,7 @@ impl Router {
                 scoped: Mutex::new(BTreeMap::new()),
                 options,
                 refresh_lock: tokio::sync::Mutex::new(()),
-                listed_gen: AtomicU64::new(0),
+                listed: Mutex::new(HashMap::new()),
                 bg_refresh: AtomicBool::new(false),
             });
             reg.by_name.insert(name.to_owned(), server.clone());
@@ -735,14 +781,18 @@ impl Router {
 
     /// Queues `msg` for every stored session with an open stream.
     pub fn broadcast(&self, msg: &Value) {
-        let all: Vec<_> = lock(&self.sessions)
+        for s in self.streaming_sessions() {
+            s.push(msg.clone());
+        }
+    }
+
+    /// Stored sessions with an open notification stream.
+    fn streaming_sessions(&self) -> Vec<Arc<Session>> {
+        lock(&self.sessions)
             .values()
             .filter(|s| s.has_stream())
             .cloned()
-            .collect();
-        for s in all {
-            s.push(msg.clone());
-        }
+            .collect()
     }
 
     /// Stops every backend and probe and closes every stream (broker
@@ -1161,6 +1211,81 @@ mod tests {
         r.register("y", "y", spec).unwrap();
         assert!(c.entry("x").is_none());
         assert!(c.entry("y").is_some());
+    }
+
+    fn tools_entry(fp: &str, tools: &[&str]) -> CatalogEntry {
+        CatalogEntry {
+            fingerprint: fp.to_owned(),
+            tools: tools.iter().map(|t| json!({"name": t})).collect(),
+            ..CatalogEntry::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn per_cwd_catalog_resolves_and_notifies_by_key() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (ka, kb) = (cwd_key(a.path()), cwd_key(b.path()));
+        let c = Arc::new(MemoryCatalog::default());
+        let r = Router::with(c.clone(), Tuning::default());
+        let spec = BackendSpec::new("example-never-run", ["--dir", "${cwd}"]);
+        let fp = fingerprint(&spec);
+        c.put("srv", tools_entry(&fp, &["shared"]));
+        c.put_at("srv", Some(&ka), tools_entry(&fp, &["in_a"]));
+        // A stale per-directory entry (other launch spec) is ignored.
+        c.put_at("srv", Some(&kb), tools_entry("v1-other", &["stale"]));
+        r.register_scoped(
+            "srv",
+            "s",
+            spec,
+            CatalogOptions::default(),
+            ScopeOptions {
+                scope: Scope::PerCwd,
+                max_instances: 4,
+            },
+        )
+        .unwrap();
+        let sa = r.create_session("2025-11-25");
+        r.note_client_cwd(&sa, &a.path().to_string_lossy(), false);
+        let sb = r.create_session("2025-11-25");
+        r.note_client_cwd(&sb, &b.path().to_string_lossy(), false);
+        let sn = r.create_session("2025-11-25");
+        let names = |v: Vec<Value>| -> Vec<String> {
+            v.iter()
+                .map(|t| t["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(names(r.list_tools(&sa).await), ["s__in_a"]);
+        assert_eq!(names(r.list_tools(&sb).await), ["s__shared"]);
+        assert_eq!(names(r.list_tools(&sn).await), ["s__shared"]);
+        let server = r.server("srv").unwrap();
+        assert_eq!(server.instance.spawn_count(), 0);
+        assert_eq!(server.scoped_count(), 0);
+
+        for s in [&sa, &sb, &sn] {
+            s.open_stream().unwrap();
+        }
+        let changed = |s: &Session| {
+            s.take_notifications()
+                .iter()
+                .any(|n| n["method"] == "notifications/tools/list_changed")
+        };
+        // A change in directory A reaches only the session in A.
+        r.apply_entry(&server, Some(&ka), tools_entry("", &["in_a", "more"]));
+        assert!(changed(&sa));
+        assert!(!changed(&sb));
+        assert!(!changed(&sn));
+        assert!(c.entry_at("srv", Some(&ka)).unwrap().has_tool("more"));
+        // A shared change reaches the sessions without their own entry.
+        r.apply_entry(&server, None, tools_entry("", &["shared2"]));
+        assert!(!changed(&sa));
+        assert!(changed(&sb));
+        assert!(changed(&sn));
+        assert_eq!(names(r.list_tools(&sa).await), ["s__in_a", "s__more"]);
+        assert_eq!(names(r.list_tools(&sn).await), ["s__shared2"]);
+        // Removing the server drops every key.
+        r.forget_catalog("srv");
+        assert!(c.entry_at("srv", Some(&ka)).is_none());
     }
 
     #[tokio::test]

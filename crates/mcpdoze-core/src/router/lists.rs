@@ -14,6 +14,7 @@ use super::{
 };
 use crate::backend::stdio::lock;
 use crate::backend::{CallError, CallMeta, Conn, Instance, NoEvents};
+use crate::config::Scope;
 
 /// Clears a server's deduplication flag when a background refresh ends.
 pub(super) struct BgFlag(Arc<Server>);
@@ -144,13 +145,17 @@ impl Router {
     /// else by probing. `None` if unknown.
     pub async fn refresh(&self, name: &str) -> Option<Result<RefreshOutcome, String>> {
         let server = self.server(name)?;
+        // Per-directory entries are re-listed on their running instances.
+        for target in server.running_keyed() {
+            self.spawn_refresh(&server, Some(target), false, "requested");
+        }
         Some(self.refresh_server(&server, None, true, "requested").await)
     }
 
     pub(super) fn spawn_refresh(
         &self,
         server: &Arc<Server>,
-        conn: Option<Arc<Conn>>,
+        conn: Option<(String, Arc<Conn>)>,
         allow_probe: bool,
         why: &'static str,
     ) {
@@ -167,7 +172,7 @@ impl Router {
     pub(super) fn spawn_dedup_refresh(
         &self,
         server: &Arc<Server>,
-        conn: Option<Arc<Conn>>,
+        conn: Option<(String, Arc<Conn>)>,
         allow_probe: bool,
         why: &'static str,
     ) {
@@ -185,10 +190,13 @@ impl Router {
         });
     }
 
+    /// Re-lists `server` on `conn` (an instance's scope key and connection;
+    /// the catalog key follows from the scope key), else on a running
+    /// connection of the shared entry, else (with `allow_probe`) by probing.
     pub(super) async fn refresh_server(
         &self,
         server: &Arc<Server>,
-        conn: Option<Arc<Conn>>,
+        conn: Option<(String, Arc<Conn>)>,
         allow_probe: bool,
         why: &'static str,
     ) -> Result<RefreshOutcome, String> {
@@ -196,18 +204,21 @@ impl Router {
         if !self.is_current(server) {
             return Err("server is no longer registered".into());
         }
-        let conn = conn.or_else(|| server.any_running_conn());
-        let listed = match conn {
-            Some(c) => {
-                server.listed_gen.store(c.generation(), Ordering::SeqCst);
-                list_all(&c).await.map_err(|e| e.to_string())
+        let conn = conn.or_else(|| server.running_for(None));
+        let (ckey, listed) = match conn {
+            Some((inst_key, c)) => {
+                lock(&server.listed).insert(inst_key.clone(), c.generation());
+                (
+                    server.catalog_key_of(&inst_key),
+                    list_all(&c).await.map_err(|e| e.to_string()),
+                )
             }
-            None if allow_probe => self.probe_list(server).await,
+            None if allow_probe => (None, self.probe_list(server).await),
             None => return Err("backend not running".into()),
         };
         match listed {
             Ok(entry) => {
-                let (outcome, _) = self.apply_entry(server, entry);
+                let (outcome, _) = self.apply_entry(server, ckey.as_deref(), entry);
                 tracing::debug!(server = %server.name, why, changed = outcome.changed, "catalog refreshed");
                 Ok(outcome)
             }
@@ -245,17 +256,80 @@ impl Router {
         res
     }
 
-    /// Stores `new` as the entry of `server` when it differs and tells
-    /// streaming sessions about changed lists.
+    /// The entry stored for `server` at `ckey` exactly, if its fingerprint
+    /// matches the server's launch spec.
+    pub(super) fn valid_entry(
+        &self,
+        server: &Server,
+        ckey: Option<&str>,
+    ) -> Option<Arc<CatalogEntry>> {
+        self.catalog
+            .entry_at(&server.name, ckey)
+            .filter(|e| e.fingerprint.is_empty() || e.fingerprint == server.fingerprint)
+    }
+
+    /// The entry that answers lists for catalog key `ckey`: the
+    /// per-directory one, else the shared one. The flag is true for a
+    /// per-directory hit.
+    pub(super) fn entry_for(
+        &self,
+        server: &Server,
+        ckey: Option<&str>,
+    ) -> Option<(Arc<CatalogEntry>, bool)> {
+        if let Some(k) = ckey {
+            if let Some(e) = self.valid_entry(server, Some(k)) {
+                return Some((e, true));
+            }
+        }
+        self.valid_entry(server, None).map(|e| (e, false))
+    }
+
+    /// The cwd key of `session` known right now (no `roots/list` round
+    /// trip): its roots directory, else its declared directory.
+    pub(super) fn session_key_now(&self, session: &Session) -> Option<String> {
+        session
+            .roots_cwd()
+            .or_else(|| {
+                session
+                    .declared_cwd()
+                    .filter(|p| p.is_absolute() && p.is_dir())
+            })
+            .map(|p| super::cwd_key(&p))
+    }
+
+    /// True if `session` reads `server`'s lists from catalog key `ckey`.
+    fn reads_key(&self, server: &Server, session: &Session, ckey: Option<&str>) -> bool {
+        if server.scope() != Scope::PerCwd {
+            return ckey.is_none();
+        }
+        match (ckey, self.session_key_now(session)) {
+            (Some(k), Some(mine)) => k == mine,
+            (Some(_), None) => false,
+            (None, None) => true,
+            (None, Some(mine)) => self.valid_entry(server, Some(&mine)).is_none(),
+        }
+    }
+
+    /// Stores `new` as the entry of `server` at catalog key `ckey` when it
+    /// differs and tells the streaming sessions reading that key about
+    /// changed lists. The first per-directory entry of a server without a
+    /// shared one also becomes the shared entry.
     pub(super) fn apply_entry(
         &self,
         server: &Arc<Server>,
+        ckey: Option<&str>,
         mut new: CatalogEntry,
     ) -> (RefreshOutcome, Arc<CatalogEntry>) {
         new.version = CATALOG_VERSION;
         new.fingerprint = server.fingerprint.clone();
         new.updated_at = catalog::now_secs();
-        let old = self.catalog.entry(&server.name);
+        new.cwd_key = ckey.map(str::to_owned);
+        let stored = self.valid_entry(server, ckey);
+        // What the sessions reading this key saw so far.
+        let old = match (&stored, ckey) {
+            (None, Some(_)) => self.valid_entry(server, None),
+            _ => stored.clone(),
+        };
         let changes = match &old {
             Some(o) => o.diff(&new),
             None => CatalogEntry::default().diff(&new),
@@ -277,8 +351,13 @@ impl Router {
         if !self.is_current(server) {
             return (outcome, new);
         }
-        if changes.any() || meta_changed || server.options.max_age.is_some() {
-            self.catalog.put(&server.name, (*new).clone());
+        if changes.any() || meta_changed || stored.is_none() || server.options.max_age.is_some() {
+            self.catalog.put_at(&server.name, ckey, (*new).clone());
+        }
+        if ckey.is_some() && self.valid_entry(server, None).is_none() {
+            let mut shared = (*new).clone();
+            shared.cwd_key = None;
+            self.catalog.put_at(&server.name, None, shared);
         }
         if changes.any() {
             tracing::info!(
@@ -294,33 +373,55 @@ impl Router {
                 (changes.resources, "notifications/resources/list_changed"),
             ] {
                 if on {
-                    self.broadcast(&json!({"jsonrpc": "2.0", "method": method}));
+                    let msg = json!({"jsonrpc": "2.0", "method": method});
+                    for s in self.streaming_sessions() {
+                        if self.reads_key(server, &s, ckey) {
+                            s.push(msg.clone());
+                        }
+                    }
                 }
             }
         }
         (outcome, new)
     }
 
-    pub(super) fn on_list_changed(&self, server: &str) {
+    /// A backend instance (scope key `scope_key`) said a list changed:
+    /// re-list that instance, into its own catalog key.
+    pub(super) fn on_list_changed(&self, server: &str, scope_key: &str) {
         let Some(server) = self.server(server) else {
             return;
         };
-        if let Some(conn) = server.any_running_conn() {
-            self.spawn_refresh(&server, Some(conn), false, "list_changed");
+        let inst = if scope_key.is_empty() {
+            Some(server.instance.clone())
+        } else {
+            server.scoped_instance(scope_key)
+        };
+        let target = inst
+            .and_then(|i| i.running_conn())
+            .map(|c| (scope_key.to_owned(), c))
+            .or_else(|| server.running_for(None));
+        if let Some(target) = target {
+            self.spawn_refresh(&server, Some(target), false, "list_changed");
         }
     }
 
-    /// Called with every connection a forwarded call uses: a new process of
-    /// a catalogued server is re-listed in the background.
-    pub(super) fn note_conn(&self, server: &Arc<Server>, conn: &Arc<Conn>) {
+    /// Called with every connection a forwarded call uses (`inst_key` is
+    /// the instance's scope key): a new process of a catalogued server is
+    /// re-listed in the background, into its own catalog key.
+    pub(super) fn note_conn(&self, server: &Arc<Server>, inst_key: &str, conn: &Arc<Conn>) {
         let generation = conn.generation();
-        if server.listed_gen.load(Ordering::SeqCst) == generation
-            || self.catalog.entry(&server.name).is_none()
-        {
+        let ckey = server.catalog_key_of(inst_key);
+        if self.entry_for(server, ckey.as_deref()).is_none() {
             return;
         }
-        if server.listed_gen.swap(generation, Ordering::SeqCst) != generation {
-            self.spawn_refresh(server, Some(conn.clone()), false, "spawn");
+        let prev = lock(&server.listed).insert(inst_key.to_owned(), generation);
+        if prev != Some(generation) {
+            self.spawn_refresh(
+                server,
+                Some((inst_key.to_owned(), conn.clone())),
+                false,
+                "spawn",
+            );
         }
     }
 
@@ -331,29 +432,48 @@ impl Router {
         server: &Arc<Server>,
     ) -> Result<Arc<CatalogEntry>, String> {
         let _g = server.refresh_lock.lock().await;
-        if let Some(e) = self.catalog.entry(&server.name) {
+        if let Some(e) = self.valid_entry(server, None) {
             return Ok(e);
         }
         let guard = server.instance.acquire().await.map_err(|e| e.to_string())?;
-        server
-            .listed_gen
-            .store(guard.conn().generation(), Ordering::SeqCst);
+        lock(&server.listed).insert(String::new(), guard.conn().generation());
         let entry = list_all(guard.conn()).await.map_err(|e| e.to_string())?;
         drop(guard);
-        Ok(self.apply_entry(server, entry).1)
+        Ok(self.apply_entry(server, None, entry).1)
     }
 
-    /// Catalog entries of every server; servers without one are listed now,
-    /// failures are logged and skipped. `session` is the asking agent
-    /// session (not used yet: every session sees the same catalog).
+    /// Catalog entries of every server as `session` sees them: for
+    /// `per-cwd` servers the entry of the session's directory, else the
+    /// shared one. Servers without any entry are listed now; failures are
+    /// logged and skipped.
     pub async fn catalog_entries(
         &self,
-        _session: &Session,
+        session: &Session,
     ) -> Vec<(Arc<Server>, Arc<CatalogEntry>)> {
+        let servers = self.servers();
+        let key = if servers.iter().any(|s| s.scope() == Scope::PerCwd) {
+            self.session_cwd(session).await.map(|p| super::cwd_key(&p))
+        } else {
+            None
+        };
         let mut out = Vec::new();
-        for server in self.servers() {
-            let entry = match self.catalog.entry(&server.name) {
-                Some(e) => {
+        for server in servers {
+            let ckey = key.as_deref().and_then(|k| server.catalog_key_of(k));
+            let entry = match self.entry_for(&server, ckey.as_deref()) {
+                Some((e, true)) => {
+                    if expired(&e, &server) {
+                        if let Some(target) = server.running_for(ckey.as_deref()) {
+                            self.spawn_dedup_refresh(
+                                &server,
+                                Some(target),
+                                false,
+                                "catalog expired",
+                            );
+                        }
+                    }
+                    e
+                }
+                Some((e, false)) => {
                     if expired(&e, &server) {
                         self.spawn_dedup_refresh(
                             &server,

@@ -26,6 +26,11 @@ Every `mcpdoze import` apply:
   entries) does not match;
 - removes the registered servers from the MCPDoze config.
 
+Plugin-provided servers (Claude Code plugins) are registered with the broker
+but their plugin files are never in the manifest: an import does not change
+them and a rollback does not restore them. If the user disabled plugin
+servers in the agent after the import, they re-enable them there.
+
 A manifest can be rolled back once; a second run is refused and changes
 nothing.
 

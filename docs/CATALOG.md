@@ -9,15 +9,37 @@ backend process.
 - File: `<catalog_dir>/<server>.json` (`broker.catalog_dir`, default
   `catalog` in the platform data directory; a relative path is resolved
   against that directory). Written atomically (temporary file, then rename).
-- Content: `version` (currently `1`), `fingerprint`, `updated_at` (Unix
+- Content: `version` (currently `2`), `fingerprint`, `updated_at` (Unix
   seconds), `server_info`, `capabilities`, `tools`, `prompts`, `resources`,
   `resource_templates`, exactly as the backend listed them (backend names,
-  not prefixed).
+  not prefixed), and `cwd_key` for a per-directory entry.
 - Fingerprint: a hash of transport, command, arguments, working directory,
-  URL, environment variable NAMES and header NAMES. Values of environment
-  variables and headers are never hashed or stored.
-- A missing, unreadable, corrupt, oversized (over 32 MiB) or other-version
+  URL, environment variable NAMES, header NAMES and the `headers_helper`
+  command. Values of environment variables and headers (and helper output)
+  are never hashed or stored.
+- A missing, unreadable, corrupt, oversized (over 32 MiB) or unknown-version
   file counts as no catalog; it is rewritten by the next probe or list.
+  Version `1` files (written before per-directory entries) still load.
+
+### Per-directory entries (`per-cwd` servers)
+
+A `per-cwd` server's tools can depend on the directory it runs in (for
+example a server started with `--project ${cwd}`). Its catalog therefore
+has the shared entry above plus one entry per agent directory:
+
+- File: `<catalog_dir>/<server>@<hash>.json`, where `<hash>` is 16 hex
+  digits of the normalised directory; the file records the directory in
+  `cwd_key` and is ignored if that does not match.
+- Written when a scoped instance of that directory is listed (after it
+  spawns, on its `list_changed`, after a stale call, on refresh). The first
+  such listing also fills a missing shared entry.
+- A session's lists use the entry of its directory (first `file://` root,
+  else `X-Mcpdoze-Cwd` / `?cwd=`), else the shared entry, so two agents in
+  different directories see their own tool lists without any backend
+  running.
+- `list_changed` for a directory goes only to sessions in that directory; a
+  shared change goes to sessions without their own entry.
+- Removing a server, or a fingerprint change, drops every entry of it.
 
 ### Probe
 
@@ -55,7 +77,8 @@ server:
 - on a fingerprint change (re-probe at registration).
 
 A non-empty difference is stored and `notifications/<list>/list_changed` is
-sent to every agent session with an open notification stream.
+sent to every agent session with an open notification stream that reads the
+changed entry (see per-directory entries above).
 
 ## Notification stream (`GET /mcp`)
 

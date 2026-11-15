@@ -64,7 +64,7 @@ pub fn run_with(args: ImportArgs, json: bool) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    if plan.items.is_empty() {
+    if !plan.has_changes() {
         if json {
             println!("{}", plan.to_json());
         } else {
