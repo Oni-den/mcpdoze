@@ -157,3 +157,121 @@ impl MockServerSpec {
         c
     }
 }
+
+/// Builder for the mock Streamable HTTP server (`mock-mcp-http`).
+#[derive(Debug, Clone, Default)]
+pub struct MockHttpSpec {
+    program: Option<PathBuf>,
+    args: Vec<String>,
+}
+
+impl MockHttpSpec {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Explicit binary path (e.g. `env!("CARGO_BIN_EXE_mock-mcp-http")`).
+    pub fn program(mut self, p: impl Into<PathBuf>) -> Self {
+        self.program = Some(p.into());
+        self
+    }
+    /// Extra tool names.
+    pub fn tools(mut self, t: &[&str]) -> Self {
+        self.args.extend(["--tools".into(), t.join(",")]);
+        self
+    }
+    /// Stream responses as SSE with a progress notification first.
+    pub fn sse(mut self) -> Self {
+        self.args.push("--sse".into());
+        self
+    }
+    /// Require header `name: value`; 401 otherwise.
+    pub fn require_header(mut self, name: &str, value: &str) -> Self {
+        self.args
+            .extend(["--require-header".into(), format!("{name}={value}")]);
+        self
+    }
+    /// Drop a session after `n` requests (later ones get 404).
+    pub fn drop_session_after(mut self, n: u64) -> Self {
+        self.args
+            .extend(["--drop-session-after".into(), n.to_string()]);
+        self
+    }
+    /// Delay every non-initialize response by `ms`.
+    pub fn slow_ms(mut self, ms: u64) -> Self {
+        self.args.extend(["--slow-ms".into(), ms.to_string()]);
+        self
+    }
+
+    /// Path of the mock binary (explicit, `MCPDOZE_MOCK_MCP_HTTP`, or a
+    /// sibling of the current executable).
+    pub fn program_path(&self) -> PathBuf {
+        if let Some(p) = &self.program {
+            return p.clone();
+        }
+        if let Some(p) = std::env::var_os("MCPDOZE_MOCK_MCP_HTTP") {
+            return p.into();
+        }
+        let mut dir = std::env::current_exe().unwrap_or_default();
+        dir.pop();
+        if dir.ends_with("deps") {
+            dir.pop();
+        }
+        dir.join(format!("mock-mcp-http{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    /// Command-line arguments for the configured behaviours.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// Starts the server and waits (bounded) for its port line. The process
+    /// is killed when the returned handle is dropped.
+    pub async fn spawn(&self) -> std::io::Result<MockHttpServer> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new(self.program_path())
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdout"))?;
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            BufReader::new(stdout).read_line(&mut line),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("mock-mcp-http did not print a port"))??;
+        let port = line
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| std::io::Error::other(format!("bad port line ({read} bytes)")))?;
+        Ok(MockHttpServer { child, port })
+    }
+}
+
+/// A running `mock-mcp-http` process.
+#[derive(Debug)]
+pub struct MockHttpServer {
+    child: tokio::process::Child,
+    port: u16,
+}
+
+impl MockHttpServer {
+    /// Endpoint URL of the MCP resource.
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/mcp", self.port)
+    }
+    /// Listening port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+    /// Kills the process and waits for it.
+    pub async fn stop(&mut self) {
+        let _ = self.child.kill().await;
+    }
+}

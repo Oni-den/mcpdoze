@@ -17,6 +17,10 @@ pub trait Catalog: Send + Sync + 'static {
     fn get(&self, server: &str) -> Option<Arc<Vec<Value>>>;
     /// Replaces the snapshot for `server`.
     fn set(&self, server: &str, tools: Vec<Value>);
+    /// Forgets the snapshot for `server` (server removed or changed).
+    fn remove(&self, server: &str) {
+        let _ = server;
+    }
 }
 
 /// In-memory [`Catalog`].
@@ -32,6 +36,10 @@ impl Catalog for MemoryCatalog {
 
     fn set(&self, server: &str, tools: Vec<Value>) {
         lock(&self.tools).insert(server.to_owned(), Arc::new(tools));
+    }
+
+    fn remove(&self, server: &str) {
+        lock(&self.tools).remove(server);
     }
 }
 

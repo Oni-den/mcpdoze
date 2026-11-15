@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::de::{self, Deserializer};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 
 /// Maximum length of an exposed tool name.
 pub const MAX_TOOL_NAME_LEN: usize = 64;
@@ -87,7 +87,7 @@ pub struct Config {
 }
 
 /// Broker settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerConfig {
     #[serde(default = "default_bind")]
@@ -102,6 +102,10 @@ pub struct BrokerConfig {
     #[serde(default = "default_start_timeout", deserialize_with = "de_duration")]
     pub start_timeout: Duration,
     pub log_dir: Option<PathBuf>,
+    /// Extra `Host` / `Origin` host names accepted besides `localhost`,
+    /// `127.0.0.1` and `[::1]` (needed for non-loopback binds).
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for BrokerConfig {
@@ -114,6 +118,7 @@ impl Default for BrokerConfig {
             default_idle_ttl: default_idle_ttl(),
             start_timeout: default_start_timeout(),
             log_dir: None,
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -132,7 +137,7 @@ fn default_true() -> bool {
 }
 
 /// Backend transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     Stdio,
@@ -140,7 +145,7 @@ pub enum Transport {
 }
 
 /// Backend instance scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Scope {
     #[default]
@@ -150,7 +155,7 @@ pub enum Scope {
 }
 
 /// A literal value or a reference to the process environment.
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum EnvValue {
     Literal(String),
@@ -179,30 +184,50 @@ fn de_deny_empty<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     }
 }
 
-/// One backend server.
-#[derive(Debug, Clone, Deserialize)]
+/// One backend server. Serializes to the same shape it is read from
+/// (defaults omitted), so it round-trips through TOML and JSON.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub transport: Transport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_scope")]
     pub scope: Scope,
-    #[serde(default, deserialize_with = "de_opt_duration")]
+    #[serde(
+        default,
+        deserialize_with = "de_opt_duration",
+        serialize_with = "ser_opt_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idle_ttl: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, EnvValue>,
     /// Permit secret-looking literal values in `env` / `headers`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub allow_literal_env: bool,
+}
+
+fn is_default_scope(s: &Scope) -> bool {
+    *s == Scope::Shared
+}
+fn is_true(b: &bool) -> bool {
+    *b
+}
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl ServerConfig {
@@ -368,6 +393,19 @@ impl Config {
                 "broker.token_env",
                 "set only one of token_file and token_env",
             ));
+        }
+        for (i, h) in b.allowed_hosts.iter().enumerate() {
+            let bad = h.is_empty()
+                || h.chars().any(|c| {
+                    c.is_whitespace() || c.is_control() || matches!(c, '/' | '@' | '\\' | '*')
+                })
+                || (h.contains(':') && !(h.starts_with('[') && h.ends_with(']')));
+            if bad {
+                errs.push(ValidationError::new(
+                    format!("broker.allowed_hosts[{i}]"),
+                    "must be a host name or IP without port or wildcard (IPv6 in brackets)",
+                ));
+            }
         }
         match bind_is_loopback(&b.bind) {
             None => errs.push(ValidationError::new(
@@ -581,6 +619,30 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 fn de_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
     let s = String::deserialize(d)?;
     parse_duration(&s).map_err(de::Error::custom)
+}
+
+/// Formats a duration in the config syntax (`"500ms"`, `"30s"`, `"5m"`,
+/// `"2h"`); [`parse_duration`] reads it back exactly.
+pub fn format_duration(d: Duration) -> String {
+    let ms = d.as_millis();
+    if !ms.is_multiple_of(1000) {
+        return format!("{ms}ms");
+    }
+    let s = d.as_secs();
+    if s != 0 && s.is_multiple_of(3600) {
+        format!("{}h", s / 3600)
+    } else if s != 0 && s.is_multiple_of(60) {
+        format!("{}m", s / 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn ser_opt_duration<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+    match d {
+        Some(d) => s.serialize_str(&format_duration(*d)),
+        None => s.serialize_none(),
+    }
 }
 
 fn de_opt_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {

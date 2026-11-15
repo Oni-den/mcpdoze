@@ -32,8 +32,9 @@ use std::time::Duration;
 use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 
+use super::http::HttpConn;
 use super::stdio::{lock, StderrRing, StdioConn};
-use super::{BackendEvents, BackendSpec, CallError};
+use super::{BackendEvents, BackendSpec, CallError, Conn};
 
 /// Timing knobs of the lifecycle; defaults follow the development plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,23 +90,11 @@ pub enum StateKind {
 
 enum State {
     Stopped,
-    Starting {
-        done: watch::Receiver<bool>,
-    },
-    Running {
-        conn: Arc<StdioConn>,
-        idle: Arc<Notify>,
-    },
-    Draining {
-        done: watch::Receiver<bool>,
-    },
-    Stopping {
-        done: watch::Receiver<bool>,
-    },
-    Failed {
-        until: Instant,
-        error: String,
-    },
+    Starting { done: watch::Receiver<bool> },
+    Running { conn: Arc<Conn>, idle: Arc<Notify> },
+    Draining { done: watch::Receiver<bool> },
+    Stopping { done: watch::Receiver<bool> },
+    Failed { until: Instant, error: String },
 }
 
 impl State {
@@ -136,6 +125,9 @@ struct Inner {
     idle_deadline: Option<Instant>,
     failures: u32,
     generation: u64,
+    /// Stop as soon as the in-flight count reaches zero.
+    drain: bool,
+    last_error: Option<String>,
 }
 
 /// One backend instance: at most one process at a time, started lazily and
@@ -148,6 +140,7 @@ pub struct Instance {
     stderr: Arc<StderrRing>,
     inner: Mutex<Inner>,
     spawns: AtomicU64,
+    calls: AtomicU64,
 }
 
 impl std::fmt::Debug for Instance {
@@ -189,8 +182,11 @@ impl Instance {
                 idle_deadline: None,
                 failures: 0,
                 generation: 0,
+                drain: false,
+                last_error: None,
             }),
             spawns: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
         })
     }
 
@@ -212,7 +208,7 @@ impl Instance {
     /// Pid of the running process, if `Running`.
     pub fn pid(&self) -> Option<u32> {
         match &lock(&self.inner).state {
-            State::Running { conn, .. } => Some(conn.pid()),
+            State::Running { conn, .. } => conn.pid(),
             _ => None,
         }
     }
@@ -245,6 +241,73 @@ impl Instance {
         self.stderr.lines()
     }
 
+    /// Calls handed a [`CallGuard`] so far.
+    pub fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    /// The most recent start failure or crash, if any.
+    pub fn last_error(&self) -> Option<String> {
+        lock(&self.inner).last_error.clone()
+    }
+
+    /// Time left before the idle unload, when `Running` with nothing in
+    /// flight.
+    pub fn idle_remaining(&self) -> Option<Duration> {
+        let g = lock(&self.inner);
+        match (&g.state, g.idle_deadline) {
+            (State::Running { .. }, Some(d)) if g.in_flight == 0 => {
+                Some(d.saturating_duration_since(Instant::now()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The live connection, if `Running` (for status: pids, memory).
+    pub fn running_conn(&self) -> Option<Arc<Conn>> {
+        match &lock(&self.inner).state {
+            State::Running { conn, .. } => Some(conn.clone()),
+            _ => None,
+        }
+    }
+
+    /// Unloads the backend once no call is in flight, waiting at most
+    /// `timeout` before stopping it like [`shutdown`](Instance::shutdown)
+    /// (which fails the calls still running). Calls arriving meanwhile are
+    /// served; a later call starts a fresh process as usual.
+    pub async fn drain(self: &Arc<Self>, timeout: Duration) {
+        let graceful = tokio::time::timeout(timeout, async {
+            loop {
+                let done = {
+                    let g = &mut *lock(&self.inner);
+                    match &g.state {
+                        State::Stopped | State::Failed { .. } => return,
+                        State::Running { .. } if g.in_flight == 0 => Some(self.begin_stop(g)),
+                        State::Running { .. } => {
+                            // `release` begins the stop when the count hits zero.
+                            g.drain = true;
+                            None
+                        }
+                        s => s.done().cloned(),
+                    }
+                };
+                match done {
+                    Some(mut done) => {
+                        if done.wait_for(|d| *d).await.is_err() {
+                            self.abandon(&done);
+                        }
+                    }
+                    None => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await;
+        if graceful.is_err() {
+            lock(&self.inner).drain = false;
+            self.shutdown().await;
+        }
+    }
+
     /// Gets a running connection for one call, starting the backend if needed.
     /// The returned guard counts as in flight until dropped.
     pub async fn acquire(self: &Arc<Self>) -> Result<CallGuard, CallError> {
@@ -256,6 +319,7 @@ impl Instance {
                         let conn = conn.clone();
                         g.in_flight += 1;
                         g.idle_deadline = None;
+                        self.calls.fetch_add(1, Ordering::Relaxed);
                         return Ok(CallGuard {
                             inst: self.clone(),
                             conn,
@@ -328,14 +392,25 @@ impl Instance {
 
     async fn run_start(self: Arc<Self>, generation: u64, done: watch::Sender<bool>) {
         let start = async {
-            let conn = StdioConn::spawn(
-                &self.name,
-                generation,
-                &self.spec,
-                self.events.clone(),
-                self.stderr.clone(),
-            )
-            .map_err(|e| format!("spawn failed: {e}"))?;
+            let conn = if self.spec.http.is_some() {
+                Conn::Http(HttpConn::new(
+                    &self.name,
+                    generation,
+                    &self.spec,
+                    self.events.clone(),
+                )?)
+            } else {
+                Conn::Stdio(Box::new(
+                    StdioConn::spawn(
+                        &self.name,
+                        generation,
+                        &self.spec,
+                        self.events.clone(),
+                        self.stderr.clone(),
+                    )
+                    .map_err(|e| format!("spawn failed: {e}"))?,
+                ))
+            };
             let conn = Arc::new(conn);
             conn.initialize().await?;
             Ok::<_, String>(conn)
@@ -364,7 +439,7 @@ impl Instance {
                         g.idle_deadline = Some(Instant::now() + self.spec.idle_ttl);
                         idle.notify_one();
                     }
-                    tracing::info!(server = %self.name, pid = conn.pid(), "backend running");
+                    tracing::info!(server = %self.name, pid = ?conn.pid(), "backend running");
                     None
                 }
                 Ok(conn) => Some(conn),
@@ -372,6 +447,7 @@ impl Instance {
                     g.failures += 1;
                     let wait = self.tuning.backoff(g.failures);
                     tracing::warn!(server = %self.name, %error, backoff_ms = wait.as_millis() as u64, "backend start failed");
+                    g.last_error = Some(error.clone());
                     if current {
                         g.state = State::Failed {
                             until: Instant::now() + wait,
@@ -397,6 +473,7 @@ impl Instance {
         let (tx, rx) = watch::channel(false);
         g.state = State::Draining { done: rx.clone() };
         g.idle_deadline = None;
+        g.drain = false;
         tokio::spawn(self.clone().run_stop(g.generation, conn, tx));
         rx
     }
@@ -404,7 +481,7 @@ impl Instance {
     async fn run_stop(
         self: Arc<Self>,
         generation: u64,
-        conn: Arc<StdioConn>,
+        conn: Arc<Conn>,
         done: watch::Sender<bool>,
     ) {
         {
@@ -415,7 +492,7 @@ impl Instance {
                 }
             }
         }
-        tracing::info!(server = %self.name, pid = conn.pid(), "unloading backend");
+        tracing::info!(server = %self.name, pid = ?conn.pid(), "unloading backend");
         conn.shutdown(self.tuning.stop_grace).await;
         {
             let g = &mut *lock(&self.inner);
@@ -469,21 +546,27 @@ impl Instance {
             g.failures += 1;
             let wait = self.tuning.backoff(g.failures);
             g.idle_deadline = None;
+            g.drain = false;
+            g.last_error = Some("backend exited unexpectedly".into());
             g.state = State::Failed {
                 until: Instant::now() + wait,
                 error: "backend exited unexpectedly".into(),
             };
-            tracing::warn!(server = %self.name, pid = conn.pid(), backoff_ms = wait.as_millis() as u64, "backend crashed");
+            tracing::warn!(server = %self.name, pid = ?conn.pid(), backoff_ms = wait.as_millis() as u64, "backend crashed");
             conn
         };
         // Reap whatever is left of the tree (grandchildren).
         tokio::spawn(async move { conn.shutdown(Duration::ZERO).await });
     }
 
-    fn release(&self, conn: &StdioConn) {
+    fn release(self: &Arc<Self>, conn: &Conn) {
         let g = &mut *lock(&self.inner);
         g.in_flight = g.in_flight.saturating_sub(1);
         if g.in_flight != 0 || g.generation != conn.generation() {
+            return;
+        }
+        if g.drain && matches!(g.state, State::Running { .. }) {
+            self.begin_stop(g);
             return;
         }
         if let State::Running { idle, .. } = &g.state {
@@ -527,7 +610,7 @@ async fn idle_task(inst: Weak<Instance>, generation: u64, idle: Arc<Notify>) {
 /// claim on the instance (and may arm the idle timer).
 pub struct CallGuard {
     inst: Arc<Instance>,
-    conn: Arc<StdioConn>,
+    conn: Arc<Conn>,
 }
 
 impl std::fmt::Debug for CallGuard {
@@ -541,7 +624,7 @@ impl std::fmt::Debug for CallGuard {
 
 impl CallGuard {
     /// The connection this call uses.
-    pub fn conn(&self) -> &Arc<StdioConn> {
+    pub fn conn(&self) -> &Arc<Conn> {
         &self.conn
     }
 }

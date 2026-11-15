@@ -17,9 +17,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 subtle = "2.6.1"
 toml = "1.2.1"
 tokio = { version = "1.54.1", features = ["process", "rt", "macros", "time", "io-util", "sync", "net"] }
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
+toml_edit = { version = "0.25.19", default-features = false, features = ["parse", "display"] }
+notify = "8.2.2"
 serde_json = "1.0.149"
 tracing = "0.1.44"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "native-tls"] }
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_Security"] }
@@ -32,3 +35,4 @@ sysinfo = { version = "0.40.3", default-features = false, features = ["system"] 
 sysinfo = { version = "0.40.3", default-features = false, features = ["system"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "test-util"] }
 tempfile = "3.27.0"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }

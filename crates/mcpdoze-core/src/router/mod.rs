@@ -18,7 +18,6 @@ pub mod catalog;
 pub mod naming;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -27,8 +26,8 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::backend::jsonrpc::{self, Kind};
-use crate::backend::stdio::{lock, StdioConn};
-use crate::backend::{BackendEvents, BackendSpec, CallError, CallMeta, Instance, Tuning};
+use crate::backend::stdio::lock;
+use crate::backend::{BackendEvents, BackendSpec, CallError, CallMeta, Conn, Instance, Tuning};
 pub use catalog::{Catalog, MemoryCatalog};
 
 /// Protocol versions accepted from agents, newest first.
@@ -154,22 +153,15 @@ impl Session {
     }
 }
 
-/// 128-bit session id from the std randomly keyed hasher plus a counter and
-/// the clock. Not a security boundary: M5 adds bearer-token auth.
+/// 128-bit session id from the OS CSPRNG, as 32 lowercase hex digits.
 fn random_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let mut buf = [0u8; 16];
+    // The OS generator only fails on broken systems; refuse to hand out a
+    // guessable id rather than fall back to a weak source.
+    getrandom::fill(&mut buf).expect("OS random number generator unavailable");
     let mut out = String::with_capacity(32);
-    for salt in 0..2u8 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(n);
-        h.write_u128(t);
-        h.write_u8(salt);
-        out.push_str(&format!("{:016x}", h.finish()));
+    for b in buf {
+        out.push_str(&format!("{b:02x}"));
     }
     out
 }
@@ -237,7 +229,7 @@ impl Drop for InflightEntry<'_> {
 /// complete (agent cancel, session end, or the call future being dropped
 /// because the agent disconnected).
 struct CancelOnDrop {
-    conn: Arc<StdioConn>,
+    conn: Arc<Conn>,
     id: u64,
     armed: bool,
 }
@@ -314,7 +306,21 @@ impl Router {
         Ok(())
     }
 
-    fn servers(&self) -> Vec<Arc<Server>> {
+    /// Removes server `name` from routing and returns it (its instance keeps
+    /// running until the caller stops it). Its catalog snapshot is dropped.
+    pub fn unregister(&self, name: &str) -> Option<Arc<Server>> {
+        let server = {
+            let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
+            let server = reg.by_name.remove(name)?;
+            reg.by_prefix.remove(&server.prefix);
+            server
+        };
+        self.catalog.remove(name);
+        Some(server)
+    }
+
+    /// Every registered server, ordered by name.
+    pub fn servers(&self) -> Vec<Arc<Server>> {
         let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
         reg.by_name.values().cloned().collect()
     }

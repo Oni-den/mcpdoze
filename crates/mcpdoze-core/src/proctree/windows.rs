@@ -159,7 +159,7 @@ impl Tree {
     }
 
     /// Pids currently in the job (at most `MAX_PIDS`).
-    fn pids(&self) -> Vec<u32> {
+    pub(super) fn pids(&self) -> Vec<u32> {
         let header =
             offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / size_of::<usize>();
         let mut cap = 64usize;

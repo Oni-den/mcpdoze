@@ -93,6 +93,36 @@ impl Tree {
         self.signal(None)
     }
 
+    /// Pids of the live, non-zombie members of the session.
+    pub(super) fn pids(&self) -> Vec<u32> {
+        use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+        let pg = self.pgid.load(Ordering::SeqCst);
+        if pg <= 1 || self.gone.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let Ok(mut sys) = System::new() else {
+            return Vec::new();
+        };
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let sid = sysinfo::Pid::from_u32(pg as u32);
+        let mut out: Vec<u32> = sys
+            .processes()
+            .iter()
+            .filter(|(_, p)| {
+                p.session_id() == Some(sid)
+                    && p.status() != ProcessStatus::Zombie
+                    && p.thread_kind().is_none()
+            })
+            .map(|(pid, _)| pid.as_u32())
+            .collect();
+        out.sort_unstable_by_key(|p| (*p != pg as u32, *p));
+        out
+    }
+
     /// Sums memory over the live, non-zombie members of the session.
     pub(super) fn memory(&self) -> TreeMemory {
         use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};

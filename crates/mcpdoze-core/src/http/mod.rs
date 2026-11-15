@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Agent-facing Streamable HTTP endpoint (JSON response mode).
+//! Agent-facing Streamable HTTP endpoint (JSON response mode) plus the
+//! admin API.
 //!
 //! * `POST /mcp`: one JSON-RPC message per body. Requests get
 //!   `application/json`, notifications and responses get `202 Accepted`.
@@ -9,7 +10,23 @@
 //!   checking `MCP-Protocol-Version` (stateless clients).
 //! * `GET /mcp`: `405` until the SSE stream exists.
 //! * `DELETE /mcp`: ends the session and cancels its in-flight calls.
-//! * `GET /healthz`: liveness.
+//! * `/admin/v1/...`: see [`crate::admin`].
+//! * `GET /healthz`: liveness (`ok`), no token required.
+//!
+//! # Security layers
+//!
+//! One middleware runs on every request, in this order:
+//!
+//! 1. `Host` must be exactly one header naming `localhost`, `127.0.0.1`,
+//!    `[::1]` or a configured extra host (DNS-rebinding defence): else `403`.
+//! 2. `Origin`, when present, must name one of the same hosts: else `403`.
+//! 3. `/healthz` is answered without further checks.
+//! 4. `/admin/*` is refused (`403`) unless the TCP peer is loopback,
+//!    whatever the bind address.
+//! 5. Everything else needs `Authorization: Bearer <token>` (constant-time
+//!    compare): else `401` with `WWW-Authenticate: Bearer`.
+//!
+//! Header values, and in particular the token, are never logged.
 //!
 //! If the agent disconnects mid-request the handler future is dropped, which
 //! cancels the backend call (see the router).
@@ -20,13 +37,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::Value;
 
+use crate::admin::{self, Control};
+use crate::auth::{self, Token};
 use crate::backend::jsonrpc::{self, Kind};
+use crate::config::Config;
 use crate::router::{is_supported_version, Router};
 
 /// Session header.
@@ -36,24 +57,104 @@ pub const VERSION_HEADER: &str = "mcp-protocol-version";
 /// Largest accepted request body.
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
 
-/// Builds the axum application for `router`.
-pub fn app(router: Arc<Router>) -> axum::Router {
-    let app = axum::Router::new()
-        .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
-        .route("/healthz", get(|| async { "ok" }))
-        .layer(DefaultBodyLimit::max(MAX_BODY))
-        .with_state(router);
-    security_layers(app)
+/// Request admission settings: the bearer token and extra allowed hosts.
+#[derive(Debug, Clone)]
+pub struct Security {
+    token: Token,
+    allowed_hosts: Vec<String>,
 }
 
-/// ===== M5 INSERTION POINT =====
-///
-/// Bearer-token auth and `Host` / `Origin` validation (DNS rebinding) are
-/// added here as tower layers wrapping every route, e.g.
-/// `app.layer(axum::middleware::from_fn_with_state(auth, check))`.
-/// Until then the endpoint must only be bound to loopback.
-fn security_layers(app: axum::Router) -> axum::Router {
-    app
+impl Security {
+    /// `allowed_hosts` are host names accepted in `Host` / `Origin` besides
+    /// the loopback names (no port).
+    pub fn new(token: Token, allowed_hosts: Vec<String>) -> Self {
+        Self {
+            token,
+            allowed_hosts,
+        }
+    }
+}
+
+/// Builds the axum application: `/mcp`, the admin API and `/healthz`
+/// behind the security middleware.
+pub fn app(control: Arc<Control>, security: Arc<Security>) -> axum::Router {
+    let mcp = axum::Router::new()
+        .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
+        .with_state(control.router().clone());
+    axum::Router::new()
+        .merge(mcp)
+        .nest(admin::api::BASE, admin::routes(control))
+        .route("/healthz", get(|| async { "ok" }))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(axum::middleware::from_fn_with_state(security, guard))
+}
+
+fn reject(status: StatusCode, msg: &str) -> Response {
+    let body = admin::api::ErrorResponse {
+        error: msg.to_owned(),
+        details: Vec::new(),
+    };
+    let mut resp = (status, axum::Json(body)).into_response();
+    if status == StatusCode::UNAUTHORIZED {
+        resp.headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    }
+    resp
+}
+
+/// The single header `name`, if present exactly once and valid text.
+/// `Err` when repeated or not visible ASCII.
+fn single(headers: &HeaderMap, name: header::HeaderName) -> Result<Option<&str>, ()> {
+    let mut it = headers.get_all(name).iter();
+    match (it.next(), it.next()) {
+        (None, _) => Ok(None),
+        (Some(v), None) => v.to_str().map(Some).map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+async fn guard(State(sec): State<Arc<Security>>, req: Request, next: Next) -> Response {
+    let headers = req.headers();
+    let allowed: Vec<&str> = sec.allowed_hosts.iter().map(String::as_str).collect();
+    let host_ok = match single(headers, header::HOST) {
+        Ok(h) => auth::check_host(h, &allowed),
+        Err(()) => false,
+    };
+    if !host_ok {
+        tracing::debug!("request refused: Host not allowed");
+        return reject(StatusCode::FORBIDDEN, "host not allowed");
+    }
+    let origin_ok = match single(headers, header::ORIGIN) {
+        Ok(o) => auth::check_origin(o, &allowed),
+        Err(()) => false,
+    };
+    if !origin_ok {
+        tracing::debug!("request refused: Origin not allowed");
+        return reject(StatusCode::FORBIDDEN, "origin not allowed");
+    }
+    let path = req.uri().path();
+    if path == "/healthz" {
+        return next.run(req).await;
+    }
+    if path == "/admin" || path.starts_with("/admin/") {
+        let peer = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        if !peer.is_some_and(|p| admin::peer_allowed(&p)) {
+            tracing::debug!("admin request refused: peer is not loopback");
+            return reject(StatusCode::FORBIDDEN, "admin API is loopback-only");
+        }
+    }
+    let authorized = match single(headers, header::AUTHORIZATION) {
+        Ok(Some(v)) => auth::verify_bearer(v, &sec.token),
+        _ => false,
+    };
+    if !authorized {
+        tracing::debug!("request refused: missing or invalid bearer token");
+        return reject(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+    }
+    next.run(req).await
 }
 
 /// Binds a listener (callers pass a loopback address such as
@@ -62,18 +163,35 @@ pub async fn bind(addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::bind(addr).await
 }
 
-/// Serves `router` on `listener` until `shutdown` resolves, then stops
+/// Serves the broker on `listener` until `shutdown` resolves, then stops
 /// every backend.
 pub async fn serve(
     listener: tokio::net::TcpListener,
-    router: Arc<Router>,
+    control: Arc<Control>,
+    security: Security,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
-    let res = axum::serve(listener, app(router.clone()))
-        .with_graceful_shutdown(shutdown)
-        .await;
-    router.shutdown().await;
+    let app = app(control.clone(), Arc::new(security));
+    let res = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await;
+    control.shutdown().await;
     res
+}
+
+/// [`serve`] for a router whose servers are registered directly (no config;
+/// the admin API manages them in memory).
+pub async fn serve_router(
+    listener: tokio::net::TcpListener,
+    router: Arc<Router>,
+    security: Security,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
+    let control = Control::new(router, Config::default(), None);
+    serve(listener, control, security, shutdown).await
 }
 
 fn json_response(status: StatusCode, body: &Value) -> Response {

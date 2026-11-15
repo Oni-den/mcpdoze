@@ -26,7 +26,7 @@ use tokio::time::Instant;
 
 use super::jsonrpc::{self, Kind};
 use super::{BackendEvents, BackendSpec};
-use crate::proctree::{resolve_command, ProcessTree};
+use crate::proctree::{resolve_command, ProcessTree, TreeMemory};
 
 /// Largest stdout line accepted from a backend.
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
@@ -215,6 +215,24 @@ impl StdioConn {
     /// The backend's `initialize` result (`Null` before the handshake).
     pub fn init_result(&self) -> Value {
         lock(&self.init).clone()
+    }
+
+    /// Memory summed over the process tree (zero once stopped). May scan the
+    /// process table; call from a blocking context.
+    pub fn memory(&self) -> TreeMemory {
+        lock(&self.tree)
+            .as_ref()
+            .map(ProcessTree::memory)
+            .unwrap_or_default()
+    }
+
+    /// Pids of the live processes of the tree (empty once stopped). May scan
+    /// the process table; call from a blocking context.
+    pub fn pids(&self) -> Vec<u32> {
+        lock(&self.tree)
+            .as_ref()
+            .map(ProcessTree::pids)
+            .unwrap_or_default()
     }
 
     /// Number of calls awaiting a response.

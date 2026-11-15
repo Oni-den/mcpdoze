@@ -20,6 +20,13 @@ use tokio::time::{sleep, timeout, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_mock-mcp-stdio");
 const TEST_TIMEOUT: Duration = Duration::from_secs(90);
 const VERSION: &str = "2025-11-25";
+/// Bearer token of the test brokers (not a real secret).
+const TOKEN: &str = "test-token-for-broker-integration";
+
+fn security() -> mcpdoze_core::http::Security {
+    let token = mcpdoze_core::auth::Token::from_string(TOKEN.into()).unwrap();
+    mcpdoze_core::http::Security::new(token, Vec::new())
+}
 
 fn tuning() -> Tuning {
     Tuning {
@@ -52,7 +59,7 @@ impl Broker {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let r = router.clone();
         let task = tokio::spawn(async move {
-            let _ = mcpdoze_core::http::serve(listener, r, async {
+            let _ = mcpdoze_core::http::serve_router(listener, r, security(), async {
                 let _ = rx.await;
             })
             .await;
@@ -101,7 +108,7 @@ fn http_request(method: &str, session: Option<&str>, body: &str) -> String {
     let mut req = format!(
         "{method} /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
          Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: {VERSION}\r\n\
-         Connection: close\r\nContent-Length: {}\r\n",
+         Authorization: Bearer {TOKEN}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
     if let Some(s) = session {
@@ -660,7 +667,7 @@ async fn stateless_requests_and_http_basics() {
         // Missing protocol header without a session is rejected.
         let raw = format!(
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
-             Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+             Authorization: Bearer {TOKEN}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         let mut s = TcpStream::connect(b.addr).await.unwrap();

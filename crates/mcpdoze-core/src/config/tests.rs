@@ -381,3 +381,47 @@ fn prefixes_table() {
     assert_eq!(p["example"], "example");
     assert_eq!(p["remote"], "remote");
 }
+
+#[test]
+fn server_config_round_trips_through_toml_and_json() {
+    let c = cfg(GOOD);
+    let s = &c.servers["example"];
+    let text = toml::to_string(s).expect("toml");
+    assert!(text.contains("idle_ttl = \"5m\""), "{text}");
+    assert!(!text.contains("enabled"), "defaults are omitted: {text}");
+    let back: ServerConfig = toml::from_str(&text).expect("re-parse");
+    assert_eq!(&back, s);
+    let json = serde_json::to_string(s).expect("json");
+    let back: ServerConfig = serde_json::from_str(&json).expect("json re-parse");
+    assert_eq!(&back, s);
+}
+
+#[test]
+fn durations_format_and_reparse() {
+    for (d, s) in [
+        (Duration::from_millis(250), "250ms"),
+        (Duration::from_secs(30), "30s"),
+        (Duration::from_secs(300), "5m"),
+        (Duration::from_secs(7200), "2h"),
+        (Duration::from_secs(90), "90s"),
+        (Duration::ZERO, "0s"),
+    ] {
+        assert_eq!(format_duration(d), s);
+        assert_eq!(parse_duration(s).unwrap(), d);
+    }
+}
+
+#[test]
+fn allowed_hosts_are_validated() {
+    let ok = cfg("[broker]\nallowed_hosts = [\"broker.example.com\", \"[fd00::1]\"]\n");
+    assert!(ok.validate().is_ok());
+    for bad in [
+        "\"\"",
+        "\"a.example.com:80\"",
+        "\"*.example.com\"",
+        "\"a b\"",
+    ] {
+        let e = errs(&format!("[broker]\nallowed_hosts = [{bad}]\n"));
+        assert!(has(&e, "broker.allowed_hosts[0]"), "{bad}: {e:?}");
+    }
+}

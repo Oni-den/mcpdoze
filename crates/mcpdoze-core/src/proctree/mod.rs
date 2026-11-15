@@ -161,6 +161,12 @@ impl ProcessTree {
         self.os.memory()
     }
 
+    /// Pids of the live processes of the tree (root first when alive on
+    /// Unix; job order on Windows). Same cost notes as [`memory`](ProcessTree::memory).
+    pub fn pids(&self) -> Vec<u32> {
+        self.os.pids()
+    }
+
     /// True while any process of the tree is alive. On Unix an exited but
     /// not yet reaped root still counts until [`wait`](ProcessTree::wait).
     pub fn is_alive(&self) -> bool {
