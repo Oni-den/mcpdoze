@@ -5,5 +5,6 @@ pub mod backend;
 pub mod config;
 pub mod daemon;
 pub mod http;
+pub mod import;
 pub mod proctree;
 pub mod router;

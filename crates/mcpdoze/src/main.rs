@@ -6,8 +6,14 @@
 //! Log level: `MCPDOZE_LOG` (`error`..`trace`, default `info`), written to
 //! stderr. Logs never contain the bearer token or backend environment values.
 
+mod autostart;
 mod cli;
+mod client;
+mod commands;
+mod hook;
+mod import_cmd;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -97,6 +103,16 @@ fn main() -> ExitCode {
     rt.block_on(async move {
         match cli.command {
             Command::Serve(args) => serve(args).await,
+            other => {
+                let tty = std::io::stdout().is_terminal();
+                match commands::run(other, &mut std::io::stdout(), tty).await {
+                    Ok(code) => ExitCode::from(code),
+                    Err(e) => {
+                        eprintln!("mcpdoze: {e:#}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
         }
     })
 }
