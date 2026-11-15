@@ -7,7 +7,10 @@
 //!   `application/json`, notifications and responses get `202 Accepted`.
 //!   `initialize` creates a session and returns `Mcp-Session-Id`.
 //!   Requests without a session id are served on an ephemeral session after
-//!   checking `MCP-Protocol-Version` (stateless clients).
+//!   checking `MCP-Protocol-Version` (stateless clients). A message whose
+//!   `params._meta` carries the 2026-07-28 version key takes the modern
+//!   lane instead (see `modern.rs`);`MCP-Protocol-Version: 2026-07-28`
+//!   without that key is a `400 -32020`.
 //! * `GET /mcp` with `Mcp-Session-Id` and `Accept: text/event-stream`: the
 //!   session's notification stream (server-sent events: list changes,
 //!   progress, backend log messages; keep-alive comments every
@@ -43,7 +46,10 @@
 //! If the agent disconnects mid-request the handler future is dropped, which
 //! cancels the backend call (see the router).
 
+mod modern;
 mod sse;
+
+pub use modern::{decode_header_value, HEADER_MISMATCH, UNSUPPORTED_VERSION};
 
 use std::future::Future;
 use std::io;
@@ -62,6 +68,7 @@ use crate::admin::{self, Control};
 use crate::auth::{self, Token};
 use crate::backend::jsonrpc::{self, Kind};
 use crate::config::Config;
+use crate::router::modern::{META_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
 use crate::router::{is_supported_version, Router};
 
 /// Session header.
@@ -273,6 +280,26 @@ async fn post_mcp(
         );
     }
     let version = header_str(&headers, VERSION_HEADER);
+    // 2026-07-28 lane: classified by the body's _meta version key.
+    if modern::is_modern(&msg) {
+        return modern::post(router, &uri, &headers, msg).await;
+    }
+    if version == Some(MODERN_PROTOCOL_VERSION) {
+        if kind != Kind::Request {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &jsonrpc::error(
+                msg["id"].clone(),
+                HEADER_MISMATCH,
+                format!(
+                    "Header mismatch: MCP-Protocol-Version {MODERN_PROTOCOL_VERSION} needs \
+                     params._meta[\"{META_PROTOCOL_VERSION}\"]"
+                ),
+            ),
+        );
+    }
     if version.is_some_and(|v| !is_supported_version(v)) {
         return rpc_error(
             StatusCode::BAD_REQUEST,
@@ -338,7 +365,15 @@ async fn post_mcp(
     }
 }
 
+/// `GET` / `DELETE` answer of the 2026-07-28 lane (no streams, no sessions).
+fn not_allowed() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response()
+}
+
 async fn get_mcp(State(router): State<Arc<Router>>, headers: HeaderMap) -> Response {
+    if header_str(&headers, VERSION_HEADER) == Some(MODERN_PROTOCOL_VERSION) {
+        return not_allowed();
+    }
     let Some(id) = header_str(&headers, SESSION_HEADER) else {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -384,9 +419,12 @@ async fn get_mcp(State(router): State<Arc<Router>>, headers: HeaderMap) -> Respo
 }
 
 async fn delete_mcp(State(router): State<Arc<Router>>, headers: HeaderMap) -> Response {
+    if header_str(&headers, VERSION_HEADER) == Some(MODERN_PROTOCOL_VERSION) {
+        return not_allowed();
+    }
     match header_str(&headers, SESSION_HEADER) {
         Some(id) if router.end_session(id) => StatusCode::OK.into_response(),
         Some(_) => StatusCode::NOT_FOUND.into_response(),
-        None => StatusCode::BAD_REQUEST.into_response(),
+        None => not_allowed(),
     }
 }

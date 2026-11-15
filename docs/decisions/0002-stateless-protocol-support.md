@@ -1,6 +1,6 @@
 # 0002: Accepting MCP 2026-07-28 (stateless) clients
 
-Status: proposed. Recommendation: defer to v0.2; v0.1 stays on 2025-11-25 and fails modern probes in a way that makes dual-era clients fall back.
+Status: implemented in v0.2 (dual-era broker). v0.1 stayed on 2025-11-25 and failed modern probes so that dual-era clients fell back; see [Implementation (v0.2)](#implementation-v02) for what was built and where it differs from the design below.
 
 ## Verified facts
 
@@ -60,3 +60,56 @@ Defer to v0.2. Reasons: v0.1 scope is fixed around 2025-11-25 and the M7 server-
 8. Progress token round trip against a 2025-11-25 stdio fixture.
 9. Backend elicitation during a modern call: declined, no hang.
 10. Legacy regression: full 2025-11-25 suite (sessions, GET stream, DELETE) unchanged; mixed legacy and modern clients on one backend share one instance.
+
+## Implementation (v0.2)
+
+Re-checked against the 2026-07-28 Streamable HTTP, subscriptions and
+discover pages before coding. Code: `http/modern.rs`, `router/modern.rs`;
+tests: `crates/mcpdoze-testkit/tests/modern.rs` (the ten cases above plus a
+listen-drop case) and `protocol_fallback.rs` (now a dual-era run).
+
+- Classification: a POST is modern when `params._meta` has
+  `io.modelcontextprotocol/protocolVersion`. A request with
+  `MCP-Protocol-Version: 2026-07-28` but no such key gets `400` `-32020`
+  (a notification gets `202`). Anything else takes the legacy path
+  unchanged; an unknown version header there still gets the v0.1 `400`
+  `-32600` body, which is not a modern error, so dual-era clients fall back.
+- Validation order: `MCP-Protocol-Version` (present, equal to `_meta`),
+  `Mcp-Method`, `Mcp-Name` for `tools/call` / `resources/read` /
+  `prompts/get` (Base64 sentinel decoded) -> `400 -32020`; then the version
+  (only `2026-07-28` on this lane) -> `400 -32022` with
+  `data.supported` (`2026-07-28` plus the 2025 versions served via
+  `initialize`) and `data.requested`; then the method -> `404 -32601`.
+  Served: `server/discover`, the four lists, `tools/call`, `prompts/get`,
+  `resources/read`, `subscriptions/listen`. `ping`, `initialize`,
+  `resources/subscribe`, `logging/setLevel` are 404 here.
+- Each modern request runs on an ephemeral `Era::Modern` session that is
+  never stored and never emits `Mcp-Session-Id`. GET and DELETE carrying
+  `MCP-Protocol-Version: 2026-07-28` get `405`, as does DELETE without a
+  session id; legacy sessions keep both.
+- Results gain `resultType: "complete"` and `_meta` serverInfo; lists,
+  `resources/read` and `server/discover` also `ttlMs` (60 s) and
+  `cacheScope: "private"` (answers depend on the client's directory).
+  Modern `_meta` keys (everything under `io.modelcontextprotocol/`) are
+  stripped before forwarding; backends stay on 2025-11-25.
+- `progressToken` or `logLevel` in `_meta` switches the response to a
+  per-request SSE stream (progress, `notifications/message` at or above the
+  requested level, then the result). Dropping it cancels the call
+  (`cancel_all` drop guard, `notifications/cancelled` to the backend).
+- `subscriptions/listen`: an ephemeral modern session for the stream's
+  lifetime; first event `notifications/subscriptions/acknowledged` with the
+  honoured filter; every message tagged
+  `_meta["io.modelcontextprotocol/subscriptionId"]` = the listen request
+  id; `toolsListChanged` / `promptsListChanged` / `resourcesListChanged`
+  filter catalog changes; `resourceSubscriptions` go through the shared
+  subscription registry (see [../SUBSCRIPTIONS.md](../SUBSCRIPTIONS.md)) and
+  are released when the stream closes. A broker-side end (shutdown) sends
+  the final `{resultType: "complete"}` response.
+- Backend sampling / elicitation during a modern call is declined at once
+  with a JSON-RPC error (MRTR mapping not implemented, as planned).
+
+Not done: MRTR (`input_required`), `x-mcp-header` / `Mcp-Param-*`
+validation (the broker does not inspect tool schemas for it), the stdio
+transport of 2026-07-28 (the broker only listens on HTTP), and modern
+`roots` (the directory of a modern client comes from `X-Mcpdoze-Cwd` or
+`?cwd=` only).

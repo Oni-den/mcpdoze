@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! ADR 0002 (v0.1): a modern (2026-07-28, stateless) probe is refused with a
-//! plain `-32600` 400 so dual-era clients fall back to `initialize`; the
-//! broker keeps serving 2025-11-25 clients afterwards. Hard timeout; the
-//! broker shuts its backend down at the end.
+//! ADR 0002 (implemented in v0.2): a modern (2026-07-28, stateless) probe is
+//! served directly, so dual-era clients need no fallback; 2025-11-25 clients
+//! that `initialize` keep working; a request that fits neither era keeps the
+//! v0.1 plain `-32600` 400 body (not a modern error), so a dual-era client
+//! still falls back. Hard timeout; the broker shuts its backend down at the
+//! end.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -74,7 +76,7 @@ async fn raw(addr: SocketAddr, method: &str, extra: &[(&str, &str)], body: &str)
 }
 
 async fn run(addr: SocketAddr) {
-    // (a) modern probe: 400, -32600, no session header.
+    // (a) modern probe: served, modern result, no session header.
     let probe = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
         "io.modelcontextprotocol/protocolVersion": MODERN,
         "io.modelcontextprotocol/clientCapabilities": {},
@@ -87,6 +89,21 @@ async fn run(addr: SocketAddr) {
             ("Mcp-Method", "tools/list"),
         ],
         &probe.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.json()["result"]["resultType"], "complete", "{r:?}");
+    assert!(r.json()["result"]["tools"].is_array(), "{r:?}");
+    assert!(r.header("mcp-session-id").is_none(), "{r:?}");
+
+    // (a2) unclassifiable (an unknown version header, no modern _meta): the
+    // v0.1 body, which is not a recognised modern error.
+    let odd = json!({"jsonrpc":"2.0","id":9,"method":"tools/list"});
+    let r = raw(
+        addr,
+        "POST",
+        &[("MCP-Protocol-Version", "1999-01-01")],
+        &odd.to_string(),
     )
     .await;
     assert_eq!(r.status, 400, "{r:?}");
@@ -132,7 +149,7 @@ async fn run(addr: SocketAddr) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn modern_probe_falls_back_to_initialize() {
+async fn modern_probe_is_served_and_legacy_still_works() {
     let tuning = Tuning {
         stop_grace: Duration::from_millis(300),
         backoff_base: Duration::from_millis(200),

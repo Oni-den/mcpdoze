@@ -21,10 +21,11 @@ use crate::backend::stdio::lock;
 /// Protocol generation a session speaks with the broker.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Era {
-    /// Today's session model (the only one served so far).
+    /// 2025-11-25 and earlier: `initialize`, sessions, `GET` stream.
     #[default]
     Legacy,
-    /// The newer session model (planned for v0.2).
+    /// 2026-07-28: stateless per-request metadata; ephemeral broker
+    /// sessions live for one request or one `subscriptions/listen` stream.
     Modern,
 }
 
@@ -86,6 +87,18 @@ pub struct Session {
     end_hooks: Mutex<Vec<EndHook>>,
     /// The subscription release hook is registered.
     pub(super) subs_hooked: AtomicBool,
+    /// Change notifications a `subscriptions/listen` stream opted in to.
+    listen: Mutex<Option<ListenFilter>>,
+    /// `notifications/message` threshold of a 2026-07-28 request.
+    log_level: Mutex<Option<u8>>,
+}
+
+/// Opt-in list-change notifications of a `subscriptions/listen` stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ListenFilter {
+    pub(super) tools: bool,
+    pub(super) prompts: bool,
+    pub(super) resources: bool,
 }
 
 impl std::fmt::Debug for Session {
@@ -118,13 +131,43 @@ impl Session {
             client_pending: Mutex::new(HashMap::new()),
             cwd_fallback_logged: AtomicBool::new(false),
             subs_hooked: AtomicBool::new(false),
+            listen: Mutex::new(None),
+            log_level: Mutex::new(None),
         }
     }
 
     /// True if a notification with `method` may be queued for this session.
+    /// Legacy sessions take everything; a 2026-07-28 session takes request
+    /// notifications (progress, log) and, on a `subscriptions/listen`
+    /// stream, only the change notifications it opted in to.
     pub fn wants_notification(&self, method: &str) -> bool {
-        let _ = method;
-        true
+        if self.era() != Era::Modern {
+            return true;
+        }
+        let filter = *lock(&self.listen);
+        match method {
+            "notifications/progress" | "notifications/message" => true,
+            "notifications/tools/list_changed" => filter.is_some_and(|f| f.tools),
+            "notifications/prompts/list_changed" => filter.is_some_and(|f| f.prompts),
+            "notifications/resources/list_changed" => filter.is_some_and(|f| f.resources),
+            "notifications/resources/updated" => filter.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Makes this a `subscriptions/listen` session with `filter`.
+    pub(super) fn set_listen(&self, filter: ListenFilter) {
+        *lock(&self.listen) = Some(filter);
+    }
+
+    /// Minimum `notifications/message` level (syslog order, 0 = debug) a
+    /// 2026-07-28 request opted in to with `logLevel`.
+    pub fn log_level(&self) -> Option<u8> {
+        *lock(&self.log_level)
+    }
+
+    pub(super) fn set_log_level(&self, level: Option<u8>) {
+        *lock(&self.log_level) = level;
     }
 
     /// Protocol generation of this session ([`Era::Legacy`] by default).
@@ -337,9 +380,9 @@ impl Session {
         }
     }
 
-    /// Ends the session's streams for good and fails requests pending at
-    /// the agent.
-    pub(super) fn end(&self) {
+    /// Ends the session's streams for good, fails requests pending at the
+    /// agent and runs the end hooks (idempotent).
+    pub(crate) fn end(&self) {
         let waker = {
             let mut o = lock(&self.outbox);
             o.closed = true;

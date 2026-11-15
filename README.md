@@ -14,10 +14,10 @@ MCPDoze is a small Rust broker that sits between your AI agents and your
 > scopes, routing of server-to-client requests (sampling, elicitation,
 > roots), migration skill with rollback and the optional guardrail hook work.
 > CI tests Windows (x64 and ARM64), Linux and macOS, and a release workflow
-> builds the binaries. Deferred to v0.2: the stateless MCP 2026-07-28
-> protocol (clients fall back to 2025-11-25; see
+> builds the binaries. On main for v0.2: the stateless MCP 2026-07-28
+> protocol alongside 2025-11-25 (see
 > [decision 0002](docs/decisions/0002-stateless-protocol-support.md)) and
-> resource subscriptions. See
+> shared resource subscriptions ([SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md)). See
 > [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) and the measured
 > [case study](docs/CASE_STUDY.md): two sessions, 741 MB without MCPDoze
 > versus 394 MB with it, and about 6 MB after the idle unload.

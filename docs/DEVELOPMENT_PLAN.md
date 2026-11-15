@@ -136,7 +136,7 @@ paragraph above is historical.
 | M5 | done | Auth, Host/Origin checks, secret refs, admin API and CLI. |
 | M6 | done | HTTP passthrough. |
 | M7 | done | `per-cwd` / `per-session` scopes and server-to-client routing (sampling, elicitation, roots). |
-| M8 | done | Autostart, migration skill (surgical rollback), hook and case study done; release workflow builds the binaries; Linux/macOS covered by CI; version 0.1.0. Open: the nightly soak run. Deferred to v0.2: the stateless 2026-07-28 protocol (decisions/0002) and resource subscriptions. |
+| M8 | done | Autostart, migration skill (surgical rollback), hook and case study done; release workflow builds the binaries; Linux/macOS covered by CI; version 0.1.0. Open: the nightly soak run. The v0.2 items (the stateless 2026-07-28 protocol, decisions/0002; resource subscriptions, SUBSCRIPTIONS.md) are implemented on main. |
 
 
 ## Hardest problems

@@ -103,6 +103,17 @@ impl Router {
         for s in targets {
             s.push(msg.clone());
         }
+        // 2026-07-28 requests get log messages only on their own SSE
+        // response, and only at or above the level they asked for.
+        let level = msg["params"]["level"]
+            .as_str()
+            .and_then(super::modern::log_level_rank)
+            .unwrap_or(0);
+        for s in sessions.iter().filter_map(|id| self.live_session(id)) {
+            if s.has_stream() && s.log_level().is_some_and(|min| level >= min) {
+                s.push(msg.clone());
+            }
+        }
     }
 
     /// Routes a backend's server-to-client request to the owning agent
@@ -114,6 +125,23 @@ impl Router {
             (None, [one]) => Some(one.clone()),
             _ => None,
         };
+        if req.owner.is_none()
+            && req
+                .sessions
+                .iter()
+                .any(|id| self.live_session(id).is_some())
+        {
+            // 2026-07-28 forbids server-to-client requests on any stream;
+            // mapping them to MRTR input requests is not implemented.
+            tracing::debug!(server = %req.server, %method, "server request during a 2026-07-28 call declined");
+            return req.reply.error(
+                jsonrpc::METHOD_NOT_FOUND,
+                format!(
+                    "{method} declined: the calling agent uses MCP 2026-07-28, which the \
+                     mcpdoze broker cannot forward server-to-client requests to"
+                ),
+            );
+        }
         let Some(session) = target.as_deref().and_then(|id| self.session(id)) else {
             tracing::debug!(server = %req.server, %method, sessions = req.sessions.len(), "server request not routable");
             return req.reply.error(

@@ -67,6 +67,7 @@ pub mod catalog;
 mod events;
 mod forward;
 mod lists;
+pub mod modern;
 pub mod naming;
 mod session;
 mod subs;
@@ -396,6 +397,8 @@ pub struct Router {
     reaper: AtomicBool,
     next_client_id: AtomicU64,
     subs: subs::Subscriptions,
+    /// 2026-07-28 sessions of requests and listen streams in progress.
+    live: Mutex<HashMap<String, Weak<Session>>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -435,6 +438,7 @@ impl Router {
             reaper: AtomicBool::new(false),
             next_client_id: AtomicU64::new(1),
             subs: subs::Subscriptions::default(),
+            live: Mutex::new(HashMap::new()),
         })
     }
 
@@ -636,7 +640,8 @@ impl Router {
     /// not hold up a graceful HTTP shutdown.
     pub fn close_streams(&self) {
         self.closing.store(true, Ordering::SeqCst);
-        let all: Vec<_> = lock(&self.sessions).values().cloned().collect();
+        let mut all: Vec<_> = lock(&self.sessions).values().cloned().collect();
+        all.extend(self.live_sessions());
         for s in all {
             s.end();
         }
@@ -650,11 +655,7 @@ impl Router {
             .to_owned();
         let result = json!({
             "protocolVersion": version,
-            "capabilities": {
-                "tools": {"listChanged": true},
-                "prompts": {"listChanged": true},
-                "resources": {"listChanged": true, "subscribe": self.any_subscribe()},
-            },
+            "capabilities": self.capabilities(),
             "serverInfo": {"name": "mcpdoze", "version": env!("CARGO_PKG_VERSION")},
         });
         (version, result)
@@ -787,18 +788,24 @@ impl Router {
 
     /// Queues `msg` for every stored session with an open stream.
     pub fn broadcast(&self, msg: &Value) {
+        let method = msg["method"].as_str().unwrap_or_default();
         for s in self.streaming_sessions() {
-            s.push(msg.clone());
+            if s.wants_notification(method) {
+                s.push(msg.clone());
+            }
         }
     }
 
-    /// Stored sessions with an open notification stream.
+    /// Sessions with an open notification stream: stored ones and live
+    /// 2026-07-28 ones (each filters by [Session::wants_notification]).
     fn streaming_sessions(&self) -> Vec<Arc<Session>> {
-        lock(&self.sessions)
+        let mut out: Vec<Arc<Session>> = lock(&self.sessions)
             .values()
             .filter(|s| s.has_stream())
             .cloned()
-            .collect()
+            .collect();
+        out.extend(self.live_sessions().into_iter().filter(|s| s.has_stream()));
+        out
     }
 
     /// Stops every backend and probe and closes every stream (broker

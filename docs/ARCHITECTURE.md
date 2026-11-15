@@ -29,7 +29,10 @@ A proxy must forward methods it does not know and remap request ids.
 
 1. An agent sends JSON-RPC over `POST /mcp` (JSON response mode), carrying an
    `Mcp-Session-Id` after `initialize`. `GET /mcp` opens an optional SSE stream
-   for notifications; `DELETE /mcp` ends the session.
+   for notifications; `DELETE /mcp` ends the session. MCP 2026-07-28
+   clients are served statelessly on the same endpoint (per-request
+   `_meta`, `server/discover`, `subscriptions/listen`); see
+   [decisions/0002](decisions/0002-stateless-protocol-support.md).
 2. The broker checks the bearer token, `Host` and `Origin`, then resolves the
    tool name `<prefix>__<tool>` to a backend and the original tool name.
 3. Request ids are rewritten so many agents can share one backend and are
