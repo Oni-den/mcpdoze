@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/mcpdoze-core", "crates/mcpdoze", "crates/mcpdoze-testkit"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Oni-den/mcpdoze"
+rust-version = "1.80"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
