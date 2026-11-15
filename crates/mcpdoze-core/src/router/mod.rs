@@ -36,14 +36,34 @@
 //! Each session has one bounded queue ([`SESSION_OUTBOX`], oldest dropped and
 //! counted). Progress goes to the session owning the token; backend
 //! `notifications/message` goes to the sessions with a call in flight on that
-//! backend; list changes go to sessions with an open stream. The HTTP layer
-//! drains the queue into the session's `GET /mcp` event stream.
+//! backend connection; list changes go to sessions with an open stream. The
+//! HTTP layer drains the queue into the session's `GET /mcp` event stream.
+//!
+//! # Scopes
+//!
+//! Backend instances are keyed by `(server, scope_key)` (see
+//! `docs/SCOPES.md`): `shared` uses the one [`Server::instance`];
+//! `per-session` keys by agent session id; `per-cwd` keys by the agent's
+//! working directory (its first `file://` root, else `X-Mcpdoze-Cwd` /
+//! `?cwd=`), falling back to the shared instance when unknown. Each instance
+//! has its own lifecycle; the catalog stays one entry per server. At most
+//! `max_instances` scoped instances exist per server.
+//!
+//! # Server-to-client requests
+//!
+//! A backend request (sampling, elicitation, ...) goes to the instance's
+//! owning session (per-session) or to the only session with calls in flight
+//! on that connection, over the session's event stream with a broker id; the
+//! agent's POSTed response is forwarded back. Ambiguous, stream-less or
+//! timed-out requests get a JSON-RPC error. `ping` and `roots/list` are
+//! answered by the backend layer itself.
 
 pub mod catalog;
 pub mod naming;
 pub mod uri;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::Waker;
@@ -56,8 +76,10 @@ use tokio::time::Instant;
 use crate::backend::jsonrpc::{self, Kind};
 use crate::backend::stdio::lock;
 use crate::backend::{
-    BackendEvents, BackendSpec, CallError, CallMeta, Conn, Instance, NoEvents, Tuning,
+    BackendEvents, BackendSpec, CallError, CallMeta, ClientSide, Conn, Instance, NoEvents,
+    ServerRequest, StateKind, Tuning,
 };
+use crate::config::Scope;
 pub use catalog::{
     fingerprint, Catalog, CatalogEntry, DiskCatalog, ListChanges, MemoryCatalog, CATALOG_VERSION,
 };
@@ -70,6 +92,16 @@ pub const MAX_SESSIONS: usize = 1024;
 pub const SESSION_OUTBOX: usize = 256;
 /// Interval of keep-alive comments on notification streams.
 pub const SSE_KEEPALIVE: Duration = Duration::from_secs(25);
+/// Default wait for an agent's answer to a forwarded server-to-client request.
+pub const DEFAULT_CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default idle time after which a session without a stream is ended.
+pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Longest wait for an agent's `roots/list` answer.
+pub const ROOTS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most server-to-client requests awaiting an answer per session.
+pub const MAX_CLIENT_PENDING: usize = 32;
+/// Default cap on scoped instances per server.
+pub const DEFAULT_MAX_INSTANCES: usize = crate::config::DEFAULT_MAX_INSTANCES;
 /// Longest wait for one list request to a backend.
 pub const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most pages fetched from one backend per list.
@@ -120,14 +152,47 @@ pub struct RefreshOutcome {
     pub resource_templates: usize,
 }
 
+/// Instance scoping of one registered server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeOptions {
+    /// How instances are keyed.
+    pub scope: Scope,
+    /// Most scoped instances at once (the shared fallback is not counted).
+    pub max_instances: usize,
+}
+
+impl Default for ScopeOptions {
+    fn default() -> Self {
+        Self {
+            scope: Scope::Shared,
+            max_instances: DEFAULT_MAX_INSTANCES,
+        }
+    }
+}
+
+/// Stable name of a scope (`shared`, `per-cwd`, `per-session`).
+pub fn scope_name(s: Scope) -> &'static str {
+    match s {
+        Scope::Shared => "shared",
+        Scope::PerCwd => "per-cwd",
+        Scope::PerSession => "per-session",
+    }
+}
+
 /// A registered backend server.
 pub struct Server {
     /// Unique server name.
     pub name: String,
     /// Unique tool prefix.
     pub prefix: String,
-    /// The single shared instance.
+    /// The shared instance: the only one for `shared` scope, the fallback
+    /// (agent directory unknown, stateless client) for the other scopes.
     pub instance: Arc<Instance>,
+    scope: ScopeOptions,
+    /// Launch spec as registered (`${cwd}` unexpanded).
+    base_spec: BackendSpec,
+    /// Scoped instances by key (session id or normalised directory).
+    scoped: Mutex<BTreeMap<String, Arc<Instance>>>,
     fingerprint: String,
     options: CatalogOptions,
     /// Serialises listing and catalog updates of this server.
@@ -136,8 +201,6 @@ pub struct Server {
     listed_gen: AtomicU64,
     /// A deduplicated background refresh is queued or running.
     bg_refresh: AtomicBool,
-    /// Sessions with calls in flight here: id -> (session, count).
-    active: Mutex<HashMap<String, (Weak<Session>, usize)>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -159,6 +222,98 @@ impl Server {
     /// Catalog options.
     pub fn catalog_options(&self) -> CatalogOptions {
         self.options
+    }
+
+    /// Scope options.
+    pub fn scope_options(&self) -> ScopeOptions {
+        self.scope
+    }
+
+    /// The instance scope.
+    pub fn scope(&self) -> Scope {
+        self.scope.scope
+    }
+
+    /// Every instance: the shared one first (key `""`), then the scoped
+    /// ones by key (stopped, unreferenced ones are dropped first). For
+    /// scoped servers the shared fallback is listed only once it has been
+    /// used.
+    pub fn instances(&self) -> Vec<(String, Arc<Instance>)> {
+        let mut out = Vec::new();
+        if self.scope.scope == Scope::Shared || self.instance.spawn_count() > 0 {
+            out.push((String::new(), self.instance.clone()));
+        }
+        let mut map = lock(&self.scoped);
+        Server::prune(&mut map, false);
+        for (k, i) in map.iter() {
+            out.push((display_key(self.scope.scope, k), i.clone()));
+        }
+        out
+    }
+
+    /// Every instance including an unused shared fallback (stop, unload).
+    pub fn all_instances(&self) -> Vec<Arc<Instance>> {
+        let mut out = vec![self.instance.clone()];
+        out.extend(lock(&self.scoped).values().cloned());
+        out
+    }
+
+    /// Scoped instances currently tracked (the shared fallback excluded).
+    pub fn scoped_count(&self) -> usize {
+        lock(&self.scoped).len()
+    }
+
+    /// The scoped instance with raw key `key` (session id or normalised
+    /// directory), if any.
+    pub fn scoped_instance(&self, key: &str) -> Option<Arc<Instance>> {
+        lock(&self.scoped).get(key).cloned()
+    }
+
+    /// A running connection of any instance (catalog re-lists).
+    pub fn any_running_conn(&self) -> Option<Arc<Conn>> {
+        self.all_instances().iter().find_map(|i| i.running_conn())
+    }
+
+    /// The most active state over all instances.
+    pub fn state(&self) -> StateKind {
+        fn rank(s: StateKind) -> u8 {
+            match s {
+                StateKind::Running => 5,
+                StateKind::Starting => 4,
+                StateKind::Draining => 3,
+                StateKind::Stopping => 2,
+                StateKind::Failed => 1,
+                StateKind::Stopped => 0,
+            }
+        }
+        self.all_instances()
+            .iter()
+            .map(|i| i.state())
+            .max_by_key(|s| rank(*s))
+            .unwrap_or(StateKind::Stopped)
+    }
+
+    /// Drops scoped instances nothing else references and that hold no
+    /// process (`Stopped`; with `failed`, also `Failed`). Caller holds the
+    /// map lock.
+    fn prune(map: &mut BTreeMap<String, Arc<Instance>>, failed: bool) {
+        map.retain(|_, i| {
+            let idle = match i.state() {
+                StateKind::Stopped => true,
+                StateKind::Failed => failed,
+                _ => false,
+            };
+            !(idle && Arc::strong_count(i) == 1 && i.in_flight() == 0)
+        });
+    }
+}
+
+/// Status form of a raw scope key: the directory for `per-cwd`, a short
+/// `session:<prefix>` for `per-session` (session ids are not shown whole).
+fn display_key(scope: Scope, key: &str) -> String {
+    match scope {
+        Scope::PerSession => format!("session:{}", key.get(..8).unwrap_or(key)),
+        _ => key.to_owned(),
     }
 }
 
@@ -190,6 +345,15 @@ pub enum StreamPoll {
     Closed,
 }
 
+/// What the broker learnt from the agent's `roots/list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootsState {
+    /// Not asked yet (or the agent said its roots changed).
+    NotAsked,
+    /// Asked; the answer (first `file://` root) or `None`.
+    Known(Option<PathBuf>),
+}
+
 /// One agent session.
 pub struct Session {
     id: String,
@@ -199,6 +363,16 @@ pub struct Session {
     outbox: Mutex<Outbox>,
     next_stream: AtomicU64,
     last_used: Mutex<Instant>,
+    /// Directory from `X-Mcpdoze-Cwd` / `?cwd=`.
+    declared_cwd: Mutex<Option<PathBuf>>,
+    /// The agent advertised the `roots` client capability.
+    roots_capable: AtomicBool,
+    roots: Mutex<RootsState>,
+    roots_lock: tokio::sync::Mutex<()>,
+    /// Server-to-client requests sent to this agent, by broker id key.
+    client_pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    /// Logged that the directory is unknown (once per session).
+    cwd_fallback_logged: AtomicBool,
 }
 
 impl std::fmt::Debug for Session {
@@ -221,6 +395,104 @@ impl Session {
             outbox: Mutex::new(Outbox::default()),
             next_stream: AtomicU64::new(1),
             last_used: Mutex::new(Instant::now()),
+            declared_cwd: Mutex::new(None),
+            roots_capable: AtomicBool::new(false),
+            roots: Mutex::new(RootsState::NotAsked),
+            roots_lock: tokio::sync::Mutex::new(()),
+            client_pending: Mutex::new(HashMap::new()),
+            cwd_fallback_logged: AtomicBool::new(false),
+        }
+    }
+
+    /// Records the working directory the client declared
+    /// (`X-Mcpdoze-Cwd` header or `?cwd=` query). Relative paths are ignored.
+    pub fn set_declared_cwd(&self, cwd: PathBuf) {
+        if cwd.is_absolute() {
+            *lock(&self.declared_cwd) = Some(cwd);
+        } else {
+            tracing::info!("relative client directory ignored");
+        }
+    }
+
+    /// The directory declared by header or query, if any.
+    pub fn declared_cwd(&self) -> Option<PathBuf> {
+        lock(&self.declared_cwd).clone()
+    }
+
+    /// Records whether the agent advertised the `roots` capability.
+    pub fn set_roots_capable(&self, on: bool) {
+        self.roots_capable.store(on, Ordering::SeqCst);
+    }
+
+    /// True if the agent advertised the `roots` capability.
+    pub fn roots_capable(&self) -> bool {
+        self.roots_capable.load(Ordering::SeqCst)
+    }
+
+    /// The directory from the agent's roots, once asked and known.
+    pub fn roots_cwd(&self) -> Option<PathBuf> {
+        match &*lock(&self.roots) {
+            RootsState::Known(p) => p.clone(),
+            RootsState::NotAsked => None,
+        }
+    }
+
+    /// True once the session ended (`DELETE`, eviction, idle timeout).
+    pub fn is_ended(&self) -> bool {
+        lock(&self.outbox).closed
+    }
+
+    /// Server-to-client requests awaiting this agent's answer.
+    pub fn pending_client_requests(&self) -> usize {
+        lock(&self.client_pending).len()
+    }
+
+    /// Sends a request to the agent over its event stream and waits for the
+    /// answer (the whole JSON-RPC response) for at most `limit`.
+    pub async fn client_request(
+        &self,
+        id: String,
+        method: &str,
+        params: Value,
+        limit: Duration,
+    ) -> Result<Value, String> {
+        let key = jsonrpc::id_key(&Value::String(id.clone()));
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut p = lock(&self.client_pending);
+            if p.len() >= MAX_CLIENT_PENDING {
+                return Err("too many requests pending at the agent".into());
+            }
+            p.insert(key.clone(), tx);
+        }
+        struct Remove<'a>(&'a Session, String);
+        impl Drop for Remove<'_> {
+            fn drop(&mut self) {
+                lock(&self.0.client_pending).remove(&self.1);
+            }
+        }
+        let _remove = Remove(self, key);
+        if self.is_ended() {
+            return Err("agent session ended".into());
+        }
+        self.push(jsonrpc::request(id, method, params));
+        match tokio::time::timeout(limit, rx).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Err("agent session ended".into()),
+            Err(_) => Err(format!(
+                "agent did not answer {method} within {} s",
+                limit.as_secs()
+            )),
+        }
+    }
+
+    /// Delivers an agent's response to a pending server-to-client request.
+    /// False if no request has that id.
+    fn answer(&self, msg: Value) -> bool {
+        let key = jsonrpc::id_key(&msg["id"]);
+        match lock(&self.client_pending).remove(&key) {
+            Some(tx) => tx.send(msg).is_ok(),
+            None => false,
         }
     }
 
@@ -298,16 +570,20 @@ impl Session {
         }
     }
 
-    /// Stream `id` went away (client disconnected).
+    /// Stream `id` went away (client disconnected). The idle timeout counts
+    /// from here.
     pub fn close_stream(&self, id: u64) {
         let mut o = lock(&self.outbox);
         if o.stream == Some(id) {
             o.stream = None;
             o.waker = None;
+            drop(o);
+            self.touch();
         }
     }
 
-    /// Ends the session's streams for good.
+    /// Ends the session's streams for good and fails requests pending at
+    /// the agent.
     fn end(&self) {
         let waker = {
             let mut o = lock(&self.outbox);
@@ -318,6 +594,7 @@ impl Session {
         if let Some(w) = waker {
             w.wake();
         }
+        lock(&self.client_pending).clear();
     }
 
     /// Cancels every in-flight request of this session.
@@ -404,12 +681,27 @@ impl BackendEvents for RouterEvents {
                     r.on_list_changed(server);
                 }
             }
-            "notifications/message" => {
-                if let Some(r) = self.router.upgrade() {
-                    r.deliver_to_active(server, msg);
-                }
-            }
             method => tracing::debug!(server, method, "backend notification dropped"),
+        }
+    }
+
+    fn notification_from(&self, server: &str, msg: Value, sessions: Vec<String>) {
+        if msg["method"] == "notifications/message" {
+            if let Some(r) = self.router.upgrade() {
+                r.deliver_to(&sessions, msg);
+            }
+            return;
+        }
+        self.notification(server, msg);
+    }
+
+    fn server_request(&self, req: ServerRequest) {
+        match self.router.upgrade() {
+            Some(r) => r.route_server_request(req),
+            None => req.reply.error(
+                jsonrpc::METHOD_NOT_FOUND,
+                "method not supported by the mcpdoze broker",
+            ),
         }
     }
 }
@@ -435,37 +727,6 @@ struct InflightEntry<'a> {
 impl Drop for InflightEntry<'_> {
     fn drop(&mut self) {
         lock(&self.session.inflight).remove(&self.key);
-    }
-}
-
-/// Counts a session as active on a server while a call is in flight.
-struct ActiveEntry<'a> {
-    server: &'a Server,
-    session: String,
-}
-
-impl<'a> ActiveEntry<'a> {
-    fn new(server: &'a Server, session: &Arc<Session>) -> Self {
-        lock(&server.active)
-            .entry(session.id.clone())
-            .or_insert_with(|| (Arc::downgrade(session), 0))
-            .1 += 1;
-        Self {
-            server,
-            session: session.id.clone(),
-        }
-    }
-}
-
-impl Drop for ActiveEntry<'_> {
-    fn drop(&mut self) {
-        let mut a = lock(&self.server.active);
-        if let Some(e) = a.get_mut(&self.session) {
-            e.1 = e.1.saturating_sub(1);
-            if e.1 == 0 {
-                a.remove(&self.session);
-            }
-        }
     }
 }
 
@@ -613,6 +874,10 @@ pub struct Router {
     refresh_count: AtomicU64,
     closing: AtomicBool,
     sse_keepalive: Mutex<Duration>,
+    client_timeout: Mutex<Duration>,
+    session_idle: Mutex<Duration>,
+    reaper: AtomicBool,
+    next_client_id: AtomicU64,
 }
 
 impl std::fmt::Debug for Router {
@@ -647,6 +912,10 @@ impl Router {
             refresh_count: AtomicU64::new(0),
             closing: AtomicBool::new(false),
             sse_keepalive: Mutex::new(SSE_KEEPALIVE),
+            client_timeout: Mutex::new(DEFAULT_CLIENT_REQUEST_TIMEOUT),
+            session_idle: Mutex::new(DEFAULT_SESSION_IDLE_TIMEOUT),
+            reaper: AtomicBool::new(false),
+            next_client_id: AtomicU64::new(1),
         })
     }
 
@@ -671,6 +940,18 @@ impl Router {
         spec: BackendSpec,
         options: CatalogOptions,
     ) -> Result<(), RegisterError> {
+        self.register_scoped(name, prefix, spec, options, ScopeOptions::default())
+    }
+
+    /// Registers a backend with catalog and scope options.
+    pub fn register_scoped(
+        &self,
+        name: &str,
+        prefix: &str,
+        spec: BackendSpec,
+        options: CatalogOptions,
+        scope: ScopeOptions,
+    ) -> Result<(), RegisterError> {
         if !naming::valid_prefix(prefix) {
             return Err(RegisterError::InvalidPrefix(prefix.to_owned()));
         }
@@ -682,16 +963,32 @@ impl Router {
             if reg.by_prefix.contains_key(prefix) {
                 return Err(RegisterError::DuplicatePrefix(prefix.to_owned()));
             }
+            let shared_spec = match scope.scope {
+                Scope::Shared => spec.clone(),
+                // The fallback instance of a scoped server: `${cwd}` is the
+                // broker's own directory.
+                _ => spec.expand_cwd(&broker_cwd(), false),
+            };
             let server = Arc::new(Server {
                 name: name.to_owned(),
                 prefix: prefix.to_owned(),
                 fingerprint: fingerprint(&spec),
-                instance: Instance::with_tuning(name, spec, self.events.clone(), self.tuning),
+                instance: Instance::with_tuning(
+                    name,
+                    shared_spec,
+                    self.events.clone(),
+                    self.tuning,
+                ),
+                scope: ScopeOptions {
+                    scope: scope.scope,
+                    max_instances: scope.max_instances.max(1),
+                },
+                base_spec: spec,
+                scoped: Mutex::new(BTreeMap::new()),
                 options,
                 refresh_lock: tokio::sync::Mutex::new(()),
                 listed_gen: AtomicU64::new(0),
                 bg_refresh: AtomicBool::new(false),
-                active: Mutex::new(HashMap::new()),
             });
             reg.by_name.insert(name.to_owned(), server.clone());
             reg.by_prefix.insert(prefix.to_owned(), server.clone());
@@ -790,6 +1087,26 @@ impl Router {
         *lock(&self.sse_keepalive) = d.max(Duration::from_millis(10));
     }
 
+    /// How long a forwarded server-to-client request waits for the agent.
+    pub fn client_request_timeout(&self) -> Duration {
+        *lock(&self.client_timeout)
+    }
+
+    /// Sets the server-to-client request timeout.
+    pub fn set_client_request_timeout(&self, d: Duration) {
+        *lock(&self.client_timeout) = d.max(Duration::from_millis(10));
+    }
+
+    /// Idle time (no request, no open stream) after which a session ends.
+    pub fn session_idle_timeout(&self) -> Duration {
+        *lock(&self.session_idle)
+    }
+
+    /// Sets the session idle timeout.
+    pub fn set_session_idle_timeout(&self, d: Duration) {
+        *lock(&self.session_idle) = d.max(Duration::from_millis(50));
+    }
+
     /// True once [`close_streams`](Router::close_streams) ran (shutdown).
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
@@ -844,8 +1161,78 @@ impl Router {
         if let Some(old) = evicted {
             old.end();
             old.cancel_all();
+            self.drop_session_instances(&old.id);
         }
+        self.start_reaper();
         session
+    }
+
+    /// Starts the idle-session reaper once (needs a runtime).
+    fn start_reaper(&self) {
+        if self.reaper.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.reaper.store(false, Ordering::SeqCst);
+            return;
+        };
+        let me = self.me.clone();
+        rt.spawn(async move {
+            loop {
+                let tick = match me.upgrade() {
+                    Some(r) => (r.session_idle_timeout() / 4)
+                        .clamp(Duration::from_millis(25), Duration::from_secs(30)),
+                    None => return,
+                };
+                tokio::time::sleep(tick).await;
+                let Some(r) = me.upgrade() else { return };
+                r.reap_idle_sessions();
+            }
+        });
+    }
+
+    /// Ends sessions with no open stream, nothing in flight and no request
+    /// for longer than the idle timeout.
+    fn reap_idle_sessions(&self) {
+        let idle = self.session_idle_timeout();
+        let expired: Vec<String> = lock(&self.sessions)
+            .values()
+            .filter(|s| {
+                !s.has_stream()
+                    && s.in_flight() == 0
+                    && s.pending_client_requests() == 0
+                    && lock(&s.last_used).elapsed() >= idle
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in expired {
+            tracing::info!("agent session idle; ended");
+            self.end_session(&id);
+        }
+    }
+
+    /// Unloads the per-session instances of session `id`.
+    fn drop_session_instances(&self, id: &str) {
+        let mut gone = Vec::new();
+        for server in self.servers() {
+            if server.scope.scope != Scope::PerSession {
+                continue;
+            }
+            if let Some(inst) = lock(&server.scoped).remove(id) {
+                gone.push(inst);
+            }
+        }
+        if gone.is_empty() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        rt.spawn(async move {
+            for inst in gone {
+                inst.shutdown().await;
+            }
+        });
     }
 
     /// A session for one request of a stateless client; not stored.
@@ -871,6 +1258,7 @@ impl Router {
             Some(s) => {
                 s.end();
                 s.cancel_all();
+                self.drop_session_instances(id);
                 true
             }
             None => false,
@@ -889,17 +1277,62 @@ impl Router {
         }
     }
 
-    fn deliver_to_active(&self, server: &str, msg: Value) {
-        let Some(server) = self.server(server) else {
-            return;
+    fn deliver_to(&self, sessions: &[String], msg: Value) {
+        let targets: Vec<Arc<Session>> = {
+            let map = lock(&self.sessions);
+            sessions
+                .iter()
+                .filter_map(|id| map.get(id).cloned())
+                .collect()
         };
-        let targets: Vec<Arc<Session>> = lock(&server.active)
-            .values()
-            .filter_map(|(w, _)| w.upgrade())
-            .collect();
         for s in targets {
             s.push(msg.clone());
         }
+    }
+
+    /// Routes a backend's server-to-client request to the owning agent
+    /// session (see the module docs) or answers it with an error.
+    fn route_server_request(&self, req: ServerRequest) {
+        let method = req.msg["method"].as_str().unwrap_or_default().to_owned();
+        let target = match (&req.owner, req.sessions.as_slice()) {
+            (Some(owner), _) => Some(owner.clone()),
+            (None, [one]) => Some(one.clone()),
+            _ => None,
+        };
+        let Some(session) = target.as_deref().and_then(|id| self.session(id)) else {
+            tracing::debug!(server = %req.server, %method, sessions = req.sessions.len(), "server request not routable");
+            return req.reply.error(
+                jsonrpc::METHOD_NOT_FOUND,
+                format!(
+                    "{method} is not supported here: the mcpdoze broker cannot tell which \
+                     agent session it is for"
+                ),
+            );
+        };
+        if !session.has_stream() {
+            return req.reply.error(
+                jsonrpc::METHOD_NOT_FOUND,
+                format!(
+                    "{method} is not supported here: the agent session has no open event stream"
+                ),
+            );
+        }
+        let n = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        let id = format!("mcpdoze-s2c-{n}");
+        let params = req.msg.get("params").cloned().unwrap_or_else(|| json!({}));
+        let limit = self.client_request_timeout();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return req
+                .reply
+                .error(jsonrpc::INTERNAL_ERROR, "broker is shutting down");
+        };
+        let reply = req.reply;
+        rt.spawn(async move {
+            match session.client_request(id, &method, params, limit).await {
+                Ok(resp) => reply.forward(resp),
+                Err(e) => reply.error(jsonrpc::INTERNAL_ERROR, e),
+            }
+        });
     }
 
     /// Stops every backend and probe and closes every stream (broker
@@ -911,7 +1344,9 @@ impl Router {
             p.shutdown().await;
         }
         for s in self.servers() {
-            s.instance.shutdown().await;
+            for inst in s.all_instances() {
+                inst.shutdown().await;
+            }
         }
     }
 
@@ -973,7 +1408,7 @@ impl Router {
         if !self.is_current(server) {
             return Err("server is no longer registered".into());
         }
-        let conn = conn.or_else(|| server.instance.running_conn());
+        let conn = conn.or_else(|| server.any_running_conn());
         let listed = match conn {
             Some(c) => {
                 server.listed_gen.store(c.generation(), Ordering::SeqCst);
@@ -1082,7 +1517,7 @@ impl Router {
         let Some(server) = self.server(server) else {
             return;
         };
-        if let Some(conn) = server.instance.running_conn() {
+        if let Some(conn) = server.any_running_conn() {
             self.spawn_refresh(&server, Some(conn), false, "list_changed");
         }
     }
@@ -1224,8 +1659,9 @@ impl Router {
                 None
             }
             Kind::Response => {
-                // No server-to-client requests are forwarded yet (M7).
-                tracing::debug!("agent response without a pending request dropped");
+                if !session.answer(msg) {
+                    tracing::debug!("agent response without a pending request dropped");
+                }
                 None
             }
             Kind::Invalid => Some(jsonrpc::error(
@@ -1244,6 +1680,9 @@ impl Router {
                 }
             }
             "notifications/initialized" => {}
+            "notifications/roots/list_changed" => {
+                *lock(&session.roots) = RootsState::NotAsked;
+            }
             method => tracing::debug!(method, "agent notification ignored"),
         }
     }
@@ -1253,6 +1692,7 @@ impl Router {
         let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
         match msg["method"].as_str().unwrap_or("") {
             "initialize" => {
+                session.set_roots_capable(params["capabilities"].get("roots").is_some());
                 let requested = params["protocolVersion"].as_str();
                 jsonrpc::result(id, self.initialize_result(requested).1)
             }
@@ -1305,7 +1745,7 @@ impl Router {
                 Some(jsonrpc::INVALID_PARAMS | jsonrpc::METHOD_NOT_FOUND)
             );
             if rejected || !entry.has_tool(&tool) {
-                if let Some(conn) = server.instance.running_conn() {
+                if let Some(conn) = server.any_running_conn() {
                     self.spawn_dedup_refresh(&server, Some(conn), false, "stale catalog");
                 }
             }
@@ -1390,16 +1830,20 @@ impl Router {
         params: Value,
         progress_token: Option<Value>,
     ) -> Value {
-        let guard = match server.instance.acquire().await {
+        let inst = match self.instance_for(session, server).await {
+            Ok(i) => i,
+            Err((code, msg)) => return jsonrpc::error(id, code, msg),
+        };
+        let guard = match inst.acquire().await {
             Ok(g) => g,
             Err(e) => return jsonrpc::error(id, jsonrpc::BACKEND_UNAVAILABLE, e.to_string()),
         };
+        drop(inst);
         self.note_conn(server, guard.conn());
         let key = jsonrpc::id_key(&id);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         lock(&session.inflight).insert(key.clone(), cancel_tx);
         let _entry = InflightEntry { session, key };
-        let _active = ActiveEntry::new(server, session);
         let meta = CallMeta {
             session: Some(session.id.clone()),
             orig_id: id.clone(),
@@ -1436,6 +1880,256 @@ impl Router {
     }
 }
 
+// ------------------------------------------------------------- scopes
+
+/// The broker's own working directory (`${cwd}` of shared fallbacks).
+fn broker_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Normalised map key of a directory: trailing separators removed; on
+/// Windows `/` becomes `\` and case is folded.
+pub fn cwd_key(path: &Path) -> String {
+    let mut s = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        s = s.replace('/', "\\").to_lowercase();
+        while s.len() > 3 && s.ends_with('\\') {
+            s.pop();
+        }
+    } else {
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// `file://` URI of an absolute directory.
+pub fn file_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::from("file://");
+    if !raw.starts_with('/') {
+        out.push('/');
+    }
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~:".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Decodes `%XX` escapes (invalid escapes are kept); `plus` also maps `+`
+/// to a space (query strings).
+pub fn percent_decode(s: &str, plus: bool) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(v) => {
+                        out.push(v);
+                        i += 3;
+                        continue;
+                    }
+                    None => out.push(b'%'),
+                }
+            }
+            b'+' if plus => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The local path of a `file://` URI (`localhost` or empty host only).
+pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri
+        .strip_prefix("file://")
+        .or_else(|| uri.strip_prefix("FILE://"))?;
+    let i = rest.find('/')?;
+    let (host, path) = (&rest[..i], &rest[i..]);
+    if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let mut p = percent_decode(path, false);
+    // `/C:/x` -> `C:/x`
+    let b = p.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        p.remove(0);
+    }
+    let p = PathBuf::from(p);
+    p.is_absolute().then_some(p)
+}
+
+/// A usable agent directory: absolute and an existing directory.
+fn usable_dir(p: PathBuf) -> Option<PathBuf> {
+    if p.is_absolute() && p.is_dir() {
+        Some(p)
+    } else {
+        tracing::info!("agent directory is not an existing absolute directory; ignored");
+        None
+    }
+}
+
+impl Router {
+    /// Applies a client-declared directory (`X-Mcpdoze-Cwd` header value or
+    /// raw `?cwd=` query value, percent-decoded here when `query`).
+    pub fn note_client_cwd(&self, session: &Session, raw: &str, query: bool) {
+        let v = if query {
+            percent_decode(raw, true)
+        } else {
+            raw.to_owned()
+        };
+        let v = v.trim();
+        if v.is_empty() {
+            return;
+        }
+        let p = match v.strip_prefix("file:") {
+            Some(_) => path_from_file_uri(v),
+            None => Some(PathBuf::from(v)),
+        };
+        if let Some(p) = p {
+            session.set_declared_cwd(p);
+        }
+    }
+
+    /// The agent's working directory: its first `file://` root (asked once
+    /// over its event stream when it advertised `roots`), else the declared
+    /// header / query directory.
+    pub async fn session_cwd(&self, session: &Session) -> Option<PathBuf> {
+        let ask = session.roots_capable()
+            && session.has_stream()
+            && *lock(&session.roots) == RootsState::NotAsked;
+        if ask {
+            let _g = session.roots_lock.lock().await;
+            if *lock(&session.roots) == RootsState::NotAsked && session.has_stream() {
+                let n = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+                let id = format!("mcpdoze-s2c-{n}");
+                let answer = session
+                    .client_request(id, "roots/list", json!({}), ROOTS_TIMEOUT)
+                    .await;
+                let root = match answer {
+                    Ok(resp) => resp["result"]["roots"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|r| r["uri"].as_str())
+                        .find_map(path_from_file_uri)
+                        .and_then(usable_dir),
+                    Err(e) => {
+                        tracing::info!(error = %e, "roots/list to agent failed");
+                        None
+                    }
+                };
+                *lock(&session.roots) = RootsState::Known(root);
+            }
+        }
+        if let Some(p) = session.roots_cwd() {
+            return Some(p);
+        }
+        session.declared_cwd().and_then(usable_dir)
+    }
+
+    /// The instance that serves `session`'s calls to `server`. Errors are
+    /// `(JSON-RPC code, message)`.
+    async fn instance_for(
+        &self,
+        session: &Arc<Session>,
+        server: &Arc<Server>,
+    ) -> Result<Arc<Instance>, (i64, String)> {
+        match server.scope.scope {
+            Scope::Shared => Ok(server.instance.clone()),
+            Scope::PerSession => {
+                if session.is_ephemeral() {
+                    if !session.cwd_fallback_logged.swap(true, Ordering::Relaxed) {
+                        tracing::info!(server = %server.name, "stateless client; per-session server served by its shared instance");
+                    }
+                    return Ok(server.instance.clone());
+                }
+                if session.is_ended() {
+                    return Err((jsonrpc::BACKEND_UNAVAILABLE, "agent session ended".into()));
+                }
+                let cwd = self.session_cwd(session).await;
+                let key = session.id.clone();
+                self.scoped_instance(server, key, || {
+                    let mut spec = match &cwd {
+                        Some(c) => server.base_spec.expand_cwd(c, true),
+                        None => server.base_spec.expand_cwd(&broker_cwd(), false),
+                    };
+                    spec.client = ClientSide {
+                        sampling: true,
+                        elicitation: true,
+                        root: cwd.as_deref().map(file_uri),
+                        owner: Some(session.id.clone()),
+                    };
+                    spec
+                })
+            }
+            Scope::PerCwd => {
+                let Some(cwd) = self.session_cwd(session).await else {
+                    if !session.cwd_fallback_logged.swap(true, Ordering::Relaxed) {
+                        tracing::info!(server = %server.name, "agent directory unknown; per-cwd server served by its shared instance");
+                    }
+                    return Ok(server.instance.clone());
+                };
+                self.scoped_instance(server, cwd_key(&cwd), || {
+                    let mut spec = server.base_spec.expand_cwd(&cwd, true);
+                    spec.client = ClientSide {
+                        root: Some(file_uri(&cwd)),
+                        ..ClientSide::default()
+                    };
+                    spec
+                })
+            }
+        }
+    }
+
+    /// The scoped instance `key` of `server`, created with `make` when new,
+    /// within the server's `max_instances`.
+    fn scoped_instance(
+        &self,
+        server: &Arc<Server>,
+        key: String,
+        make: impl FnOnce() -> BackendSpec,
+    ) -> Result<Arc<Instance>, (i64, String)> {
+        let mut map = lock(&server.scoped);
+        if let Some(i) = map.get(&key) {
+            return Ok(i.clone());
+        }
+        let max = server.scope.max_instances;
+        if map.len() >= max {
+            Server::prune(&mut map, false);
+        }
+        if map.len() >= max {
+            Server::prune(&mut map, true);
+        }
+        if map.len() >= max {
+            tracing::warn!(server = %server.name, max, "instance limit reached");
+            return Err((
+                jsonrpc::INSTANCE_LIMIT,
+                format!(
+                    "server {:?} already runs its maximum of {max} {} instances \
+                     (max_instances); try again when one is unloaded",
+                    server.name,
+                    scope_name(server.scope.scope)
+                ),
+            ));
+        }
+        let inst = Instance::with_tuning(&server.name, make(), self.events.clone(), self.tuning);
+        tracing::info!(server = %server.name, scope = scope_name(server.scope.scope), "new scoped instance");
+        map.insert(key, inst.clone());
+        Ok(inst)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1468,6 +2162,58 @@ mod tests {
             r.register("c", "Bad", spec()),
             Err(RegisterError::InvalidPrefix(_))
         ));
+    }
+
+    #[test]
+    fn cwd_helpers() {
+        assert_eq!(percent_decode("a%20b+c%zz%4", true), "a b c%zz%4");
+        assert_eq!(percent_decode("a+b", false), "a+b");
+        assert!(path_from_file_uri("file://example.com/x").is_none());
+        assert!(path_from_file_uri("http://localhost/x").is_none());
+        if cfg!(windows) {
+            assert_eq!(
+                path_from_file_uri("file:///C:/Example%20Dir").unwrap(),
+                PathBuf::from("C:/Example Dir")
+            );
+            assert_eq!(
+                cwd_key(Path::new("C:/Example/Dir/")),
+                cwd_key(Path::new(r"c:\example\dir"))
+            );
+            assert_eq!(cwd_key(Path::new("C:\\")), "c:\\");
+        } else {
+            assert_eq!(
+                path_from_file_uri("file://localhost/srv/example%20dir").unwrap(),
+                PathBuf::from("/srv/example dir")
+            );
+            assert_eq!(cwd_key(Path::new("/srv/x/")), "/srv/x");
+            assert_eq!(cwd_key(Path::new("/")), "/");
+            assert_eq!(file_uri(Path::new("/srv/a b")), "file:///srv/a%20b");
+        }
+    }
+
+    #[test]
+    fn expand_cwd_skips_from_env_values() {
+        let mut spec = BackendSpec::new("prog", ["--dir", "${cwd}/x"]);
+        spec.env.insert("LIT".into(), "${cwd}".into());
+        spec.env.insert("REF".into(), "${cwd}".into());
+        spec.ref_env.insert("REF".into());
+        let dir = std::env::temp_dir();
+        let e = spec.expand_cwd(&dir, true);
+        let d = dir.to_string_lossy();
+        assert_eq!(e.args[1], format!("{d}/x"));
+        assert_eq!(e.env["LIT"], d);
+        assert_eq!(e.env["REF"], "${cwd}");
+        assert_eq!(e.cwd.as_deref(), Some(dir.as_path()));
+        assert_eq!(
+            fingerprint(&spec),
+            fingerprint(&BackendSpec {
+                client: ClientSide {
+                    sampling: true,
+                    ..ClientSide::default()
+                },
+                ..spec.clone()
+            })
+        );
     }
 
     #[test]

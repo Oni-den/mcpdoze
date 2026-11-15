@@ -44,6 +44,45 @@ pub struct ServerStatus {
     pub failures: u32,
     /// Most recent start failure or crash.
     pub last_error: Option<String>,
+    /// Instance scope: `shared`, `per-cwd` or `per-session`. For scoped
+    /// servers the fields above aggregate every instance.
+    #[serde(default = "default_scope")]
+    pub scope: String,
+    /// One entry per backend instance `(server, scope_key)`.
+    #[serde(default)]
+    pub instances: Vec<InstanceStatus>,
+}
+
+fn default_scope() -> String {
+    "shared".into()
+}
+
+/// One backend instance in [`ServerStatus::instances`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstanceStatus {
+    /// `""` for the shared instance (or the fallback of a scoped server),
+    /// the directory for `per-cwd`, `session:<id prefix>` for `per-session`.
+    pub scope_key: String,
+    /// Lifecycle state (as [`ServerStatus::state`]).
+    pub state: String,
+    /// Pids of the live process tree.
+    pub pids: Vec<u32>,
+    /// Resident memory summed over the tree, in bytes.
+    pub rss_bytes: u64,
+    /// Private memory summed over the tree, in bytes.
+    pub private_bytes: u64,
+    /// Calls currently in flight.
+    pub in_flight: usize,
+    /// Seconds until the idle unload (running and idle only).
+    pub idle_remaining_secs: Option<u64>,
+    /// Calls served by this instance.
+    pub calls: u64,
+    /// Processes started after the first one.
+    pub restarts: u64,
+    /// Consecutive failures counted for the crash backoff.
+    pub failures: u32,
+    /// Most recent start failure or crash.
+    pub last_error: Option<String>,
 }
 
 /// `GET /status` response.

@@ -425,3 +425,54 @@ fn allowed_hosts_are_validated() {
         assert!(has(&e, "broker.allowed_hosts[0]"), "{bad}: {e:?}");
     }
 }
+
+#[test]
+fn max_instances_is_validated() {
+    for (n, ok) in [(0, false), (1, true), (8, true), (257, false)] {
+        let c = Config::parse(&format!(
+            "[servers.a]
+transport = \"stdio\"
+command = \"prog\"
+scope = \"per-session\"
+max_instances = {n}
+"
+        ))
+        .unwrap();
+        assert_eq!(c.validate().is_ok(), ok, "{n}");
+        assert_eq!(c.servers["a"].max_instances_or_default(), n);
+    }
+    let c = Config::parse(
+        "[servers.a]
+transport = \"stdio\"
+command = \"prog\"
+",
+    )
+    .unwrap();
+    assert_eq!(
+        c.servers["a"].max_instances_or_default(),
+        DEFAULT_MAX_INSTANCES
+    );
+    assert_eq!(
+        c.broker.client_request_timeout,
+        std::time::Duration::from_secs(120)
+    );
+    assert_eq!(
+        c.broker.session_idle_timeout,
+        std::time::Duration::from_secs(1800)
+    );
+    let c = Config::parse(
+        "[broker]
+client_request_timeout = \"5s\"
+session_idle_timeout = \"1m\"
+",
+    )
+    .unwrap();
+    assert_eq!(
+        c.broker.client_request_timeout,
+        std::time::Duration::from_secs(5)
+    );
+    assert_eq!(
+        c.broker.session_idle_timeout,
+        std::time::Duration::from_secs(60)
+    );
+}

@@ -16,7 +16,12 @@
 //!   (stateless clients have no stream), unknown session `404`, wrong
 //!   `Accept` `406`. No resumption (`Last-Event-ID` is ignored).
 //! * `DELETE /mcp`: ends the session, closes its stream and cancels its
-//!   in-flight calls.
+//!   in-flight calls (and unloads its per-session backends).
+//! * Agent directory for `per-cwd` scopes: the `X-Mcpdoze-Cwd` header or a
+//!   `cwd` query parameter on the `/mcp` URL (percent-encoded), read on every
+//!   POST; the agent's `roots` take precedence (see `docs/SCOPES.md`).
+//! * A POSTed JSON-RPC response answers a server-to-client request the
+//!   broker sent over the session's stream.
 //! * `/admin/v1/...`: see [`crate::admin`].
 //! * `GET /healthz`: liveness (`ok`), no token required.
 //!
@@ -47,7 +52,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -63,6 +68,23 @@ use crate::router::{is_supported_version, Router};
 pub const SESSION_HEADER: &str = "mcp-session-id";
 /// Protocol version header.
 pub const VERSION_HEADER: &str = "mcp-protocol-version";
+/// Header naming the agent's working directory (per-cwd scope).
+pub const CWD_HEADER: &str = "x-mcpdoze-cwd";
+
+/// The client-declared directory: header first, then `?cwd=`
+/// (`(raw value, from query)`).
+fn declared_cwd<'a>(
+    headers: &'a HeaderMap,
+    uri: &'a Uri,
+) -> Option<(std::borrow::Cow<'a, str>, bool)> {
+    if let Some(v) = headers.get(CWD_HEADER) {
+        return Some((String::from_utf8_lossy(v.as_bytes()), false));
+    }
+    uri.query()?
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("cwd="))
+        .map(|v| (std::borrow::Cow::Borrowed(v), true))
+}
 /// Largest accepted request body.
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
 
@@ -225,7 +247,12 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-async fn post_mcp(State(router): State<Arc<Router>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn post_mcp(
+    State(router): State<Arc<Router>>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return rpc_error(StatusCode::BAD_REQUEST, jsonrpc::PARSE_ERROR, "parse error"),
@@ -266,6 +293,10 @@ async fn post_mcp(State(router): State<Arc<Router>>, headers: HeaderMap, body: B
         let (negotiated, result) =
             router.initialize_result(msg["params"]["protocolVersion"].as_str());
         let session = router.create_session(&negotiated);
+        session.set_roots_capable(msg["params"]["capabilities"].get("roots").is_some());
+        if let Some((cwd, query)) = declared_cwd(&headers, &uri) {
+            router.note_client_cwd(&session, &cwd, query);
+        }
         let mut resp = json_response(StatusCode::OK, &jsonrpc::result(msg["id"].clone(), result));
         if let Ok(v) = HeaderValue::from_str(session.id()) {
             resp.headers_mut().insert(SESSION_HEADER, v);
@@ -296,6 +327,11 @@ async fn post_mcp(State(router): State<Arc<Router>>, headers: HeaderMap, body: B
             }
         },
     };
+    if let Some((cwd, query)) = declared_cwd(&headers, &uri) {
+        if session.declared_cwd().is_none() || session.is_ephemeral() {
+            router.note_client_cwd(&session, &cwd, query);
+        }
+    }
     match router.handle(&session, msg).await {
         Some(resp) => json_response(StatusCode::OK, &resp),
         None => StatusCode::ACCEPTED.into_response(),

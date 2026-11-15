@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Shared, lazy, idle-unloading HTTP broker for MCP servers"
+readme = "../../README.md"
+keywords = ["mcp", "model-context-protocol", "broker", "agents", "proxy"]
+categories = ["command-line-utilities", "development-tools"]
+homepage = "https://github.com/Oni-den/mcpdoze"
 
 [lints]
 workspace = true

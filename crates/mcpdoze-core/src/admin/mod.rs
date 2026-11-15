@@ -31,7 +31,7 @@ use axum::Json;
 use crate::backend::stdio::STDERR_LINES;
 use crate::backend::{BackendSpec, Conn, Instance, StateKind};
 use crate::config::{self, Config, ServerConfig, Transport};
-use crate::router::{CatalogOptions, Router};
+use crate::router::{scope_name, CatalogOptions, Router, ScopeOptions, Server};
 use api::*;
 
 /// Longest wait for in-flight calls on `stop` before the backend is killed.
@@ -107,6 +107,7 @@ struct Applied {
     prefix: String,
     spec: BackendSpec,
     catalog: CatalogOptions,
+    scope: ScopeOptions,
 }
 
 #[derive(Default)]
@@ -146,6 +147,12 @@ fn build_spec(server: &ServerConfig, broker: &config::BrokerConfig) -> Result<Ba
                 .ok_or("stdio transport requires `command`")?;
             let mut spec = BackendSpec::new(command, server.args.clone());
             spec.env = config::resolve_env(server).map_err(|e| e.to_string())?;
+            spec.ref_env = server
+                .env
+                .iter()
+                .filter(|(_, v)| matches!(v, config::EnvValue::Ref { .. }))
+                .map(|(k, _)| k.clone())
+                .collect();
             spec.cwd = server.cwd.clone();
             spec
         }
@@ -239,6 +246,77 @@ fn refresh_result(name: &str, res: Result<crate::router::RefreshOutcome, String>
     }
 }
 
+/// Status of one instance (memory scanned in a blocking task).
+async fn instance_status(key: String, inst: Arc<Instance>) -> InstanceStatus {
+    let (pids, mem) = match inst.running_conn() {
+        Some(conn) => tokio::task::spawn_blocking(move || match &*conn {
+            Conn::Stdio(c) => (c.pids(), c.memory()),
+            _ => (Vec::new(), Default::default()),
+        })
+        .await
+        .unwrap_or_default(),
+        None => (Vec::new(), Default::default()),
+    };
+    InstanceStatus {
+        scope_key: key,
+        state: state_name(inst.state()),
+        pids,
+        rss_bytes: mem.rss_bytes,
+        private_bytes: mem.private_bytes,
+        in_flight: inst.in_flight(),
+        idle_remaining_secs: inst.idle_remaining().map(|d| d.as_secs()),
+        calls: inst.calls(),
+        restarts: inst.spawn_count().saturating_sub(1),
+        failures: inst.failures(),
+        last_error: inst.last_error(),
+    }
+}
+
+/// Status of one server: its instances plus the aggregate.
+async fn server_status(server: &Server) -> ServerStatus {
+    let mut instances = Vec::new();
+    for (key, inst) in server.instances() {
+        instances.push(instance_status(key, inst).await);
+    }
+    let transport = if server.instance.spec().http.is_some() {
+        Transport::Http
+    } else {
+        Transport::Stdio
+    };
+    let mut st = ServerStatus {
+        name: server.name.clone(),
+        prefix: server.prefix.clone(),
+        transport,
+        state: state_name(server.state()),
+        pids: Vec::new(),
+        rss_bytes: 0,
+        private_bytes: 0,
+        in_flight: 0,
+        idle_remaining_secs: None,
+        calls: 0,
+        restarts: 0,
+        failures: 0,
+        last_error: None,
+        scope: scope_name(server.scope()).to_owned(),
+        instances: Vec::new(),
+    };
+    for i in &instances {
+        st.pids.extend(&i.pids);
+        st.rss_bytes += i.rss_bytes;
+        st.private_bytes += i.private_bytes;
+        st.in_flight += i.in_flight;
+        st.idle_remaining_secs = st.idle_remaining_secs.max(i.idle_remaining_secs);
+        st.calls += i.calls;
+        st.restarts += i.restarts;
+        st.failures = st.failures.max(i.failures);
+        if st.last_error.is_none() {
+            st.last_error = i.last_error.clone();
+        }
+    }
+    st.instances = instances;
+    st
+}
+
 /// Unloads `instances` concurrently, each draining for at most `timeout`.
 async fn unload_all(instances: Vec<Arc<Instance>>, timeout: Duration) {
     let mut set = tokio::task::JoinSet::new();
@@ -310,6 +388,10 @@ impl Control {
                                 probe: s.probe,
                                 max_age: s.catalog_max_age_or(&new.broker),
                             },
+                            scope: ScopeOptions {
+                                scope: s.scope,
+                                max_instances: s.max_instances_or_default(),
+                            },
                         },
                     );
                 }
@@ -333,7 +415,7 @@ impl Control {
                 Some(_) => continue,
             };
             if let Some(server) = self.router.unregister(name) {
-                unload.push(server.instance.clone());
+                unload.extend(server.all_instances());
             }
             // A changed server keeps its catalog; registration checks the
             // fingerprint and re-probes if the launch spec differs.
@@ -346,10 +428,13 @@ impl Control {
         for (name, d) in desired {
             let unchanged = st.applied.get(&name) == Some(&d);
             if !unchanged {
-                if let Err(e) =
-                    self.router
-                        .register_with(&name, &d.prefix, d.spec.clone(), d.catalog)
-                {
+                if let Err(e) = self.router.register_scoped(
+                    &name,
+                    &d.prefix,
+                    d.spec.clone(),
+                    d.catalog,
+                    d.scope,
+                ) {
                     resp.errors.push(format!("{name}: {e}"));
                     skipped.insert(name, e.to_string());
                     continue;
@@ -374,6 +459,10 @@ impl Control {
         for e in &resp.errors {
             tracing::warn!(error = %e, "server skipped");
         }
+        self.router
+            .set_client_request_timeout(new.broker.client_request_timeout);
+        self.router
+            .set_session_idle_timeout(new.broker.session_idle_timeout);
         st.applied = applied;
         st.skipped = skipped;
         st.config = new;
@@ -499,7 +588,7 @@ impl Control {
         match self.router.unregister(name) {
             Some(server) => {
                 self.router.forget_catalog(name);
-                unload_all(vec![server.instance.clone()], STOP_DRAIN_TIMEOUT).await;
+                unload_all(server.all_instances(), STOP_DRAIN_TIMEOUT).await;
                 Ok(RemoveResponse {
                     name: name.to_owned(),
                     persisted: false,
@@ -512,18 +601,21 @@ impl Control {
     /// Stops a server's backend: drains it (or kills it with `force`). The
     /// server stays registered; the next call starts it again.
     pub async fn stop(&self, name: &str, force: bool) -> Result<StopResponse, ControlError> {
-        let inst = self
+        let server = self
             .router
-            .instance(name)
+            .server(name)
             .ok_or_else(|| ControlError::NotFound(name.to_owned()))?;
+        let all = server.all_instances();
         if force {
-            inst.shutdown().await;
+            for inst in &all {
+                inst.shutdown().await;
+            }
         } else {
-            inst.drain(STOP_DRAIN_TIMEOUT).await;
+            unload_all(all, STOP_DRAIN_TIMEOUT).await;
         }
         Ok(StopResponse {
             name: name.to_owned(),
-            state: state_name(inst.state()),
+            state: state_name(server.state()),
         })
     }
 
@@ -564,12 +656,23 @@ impl Control {
 
     /// The last `lines` stderr lines of a server.
     pub fn logs(&self, name: &str, lines: Option<usize>) -> Result<LogsResponse, ControlError> {
-        let inst = self
+        let server = self
             .router
-            .instance(name)
+            .server(name)
             .ok_or_else(|| ControlError::NotFound(name.to_owned()))?;
         let n = lines.unwrap_or(DEFAULT_LOG_LINES).clamp(1, STDERR_LINES);
-        let all = inst.stderr_tail();
+        let mut all = Vec::new();
+        for (key, inst) in server.instances() {
+            if key.is_empty() {
+                all.extend(inst.stderr_tail());
+            } else {
+                all.extend(
+                    inst.stderr_tail()
+                        .into_iter()
+                        .map(|l| format!("[{key}] {l}")),
+                );
+            }
+        }
         let skip = all.len().saturating_sub(n);
         Ok(LogsResponse {
             name: name.to_owned(),
@@ -581,35 +684,7 @@ impl Control {
     pub async fn status(&self) -> StatusResponse {
         let mut servers = Vec::new();
         for server in self.router.servers() {
-            let inst = server.instance.clone();
-            let (pids, mem) = match inst.running_conn() {
-                Some(conn) => tokio::task::spawn_blocking(move || match &*conn {
-                    Conn::Stdio(c) => (c.pids(), c.memory()),
-                    _ => (Vec::new(), Default::default()),
-                })
-                .await
-                .unwrap_or_default(),
-                None => (Vec::new(), Default::default()),
-            };
-            servers.push(ServerStatus {
-                name: server.name.clone(),
-                prefix: server.prefix.clone(),
-                transport: if inst.spec().http.is_some() {
-                    Transport::Http
-                } else {
-                    Transport::Stdio
-                },
-                state: state_name(inst.state()),
-                pids,
-                rss_bytes: mem.rss_bytes,
-                private_bytes: mem.private_bytes,
-                in_flight: inst.in_flight(),
-                idle_remaining_secs: inst.idle_remaining().map(|d| d.as_secs()),
-                calls: inst.calls(),
-                restarts: inst.spawn_count().saturating_sub(1),
-                failures: inst.failures(),
-                last_error: inst.last_error(),
-            });
+            servers.push(server_status(&server).await);
         }
         StatusResponse {
             version: env!("CARGO_PKG_VERSION").to_owned(),

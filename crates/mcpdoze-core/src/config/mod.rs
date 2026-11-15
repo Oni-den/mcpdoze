@@ -114,6 +114,20 @@ pub struct BrokerConfig {
     /// unset); a server's own `catalog_max_age` wins.
     #[serde(default, deserialize_with = "de_opt_duration")]
     pub catalog_max_age: Option<Duration>,
+    /// How long a backend's server-to-client request (sampling,
+    /// elicitation) waits for the agent's answer.
+    #[serde(
+        default = "default_client_request_timeout",
+        deserialize_with = "de_duration"
+    )]
+    pub client_request_timeout: Duration,
+    /// An agent session with no request and no open event stream for this
+    /// long is ended (its per-session backends are unloaded).
+    #[serde(
+        default = "default_session_idle_timeout",
+        deserialize_with = "de_duration"
+    )]
+    pub session_idle_timeout: Duration,
 }
 
 impl Default for BrokerConfig {
@@ -129,6 +143,8 @@ impl Default for BrokerConfig {
             allowed_hosts: Vec::new(),
             catalog_dir: None,
             catalog_max_age: None,
+            client_request_timeout: default_client_request_timeout(),
+            session_idle_timeout: default_session_idle_timeout(),
         }
     }
 }
@@ -142,6 +158,16 @@ fn default_idle_ttl() -> Duration {
 fn default_start_timeout() -> Duration {
     Duration::from_secs(60)
 }
+fn default_client_request_timeout() -> Duration {
+    Duration::from_secs(120)
+}
+fn default_session_idle_timeout() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+/// Default cap on backend instances per scoped server.
+pub const DEFAULT_MAX_INSTANCES: usize = 8;
+/// Largest accepted `max_instances`.
+pub const MAX_MAX_INSTANCES: usize = 256;
 fn default_true() -> bool {
     true
 }
@@ -242,6 +268,10 @@ pub struct ServerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub catalog_max_age: Option<Duration>,
+    /// Most backend instances of this server at once (per-cwd and
+    /// per-session scopes); [`DEFAULT_MAX_INSTANCES`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<usize>,
 }
 
 fn is_default_scope(s: &Scope) -> bool {
@@ -267,6 +297,11 @@ impl ServerConfig {
     /// Idle TTL, falling back to the broker default.
     pub fn idle_ttl_or(&self, broker: &BrokerConfig) -> Duration {
         self.idle_ttl.unwrap_or(broker.default_idle_ttl)
+    }
+
+    /// Instance cap, falling back to [`DEFAULT_MAX_INSTANCES`].
+    pub fn max_instances_or_default(&self) -> usize {
+        self.max_instances.unwrap_or(DEFAULT_MAX_INSTANCES)
     }
 
     /// Catalog maximum age, falling back to the broker default.
@@ -365,6 +400,14 @@ impl Config {
                 errs.push(ValidationError::new(
                     f("idle_ttl"),
                     "must be greater than 0",
+                ));
+            }
+            if s.max_instances
+                .is_some_and(|n| n == 0 || n > MAX_MAX_INSTANCES)
+            {
+                errs.push(ValidationError::new(
+                    f("max_instances"),
+                    format!("must be between 1 and {MAX_MAX_INSTANCES}"),
                 ));
             }
             if s.catalog_max_age == Some(Duration::ZERO) {

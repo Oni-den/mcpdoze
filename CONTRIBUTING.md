@@ -41,6 +41,12 @@ fail CI.
    cargo clippy --workspace --all-targets -- -D warnings
    ```
 
+On Linux the TLS backend (`native-tls`, used by the HTTP passthrough and
+the admin client) links OpenSSL, so building needs `pkg-config` and the OpenSSL
+development headers (Debian/Ubuntu: `sudo apt-get install pkg-config libssl-dev`;
+Fedora: `openssl-devel`). CI and the release workflow install them. Windows and
+macOS use the system TLS stack and need nothing extra.
+
 Supported platforms are Windows (x64 and ARM64), Linux and macOS. Changes that
 touch process management must be tested on Windows and on a Unix system; say in
 the pull request what you ran.

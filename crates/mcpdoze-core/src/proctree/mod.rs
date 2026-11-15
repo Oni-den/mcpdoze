@@ -23,7 +23,8 @@ use std::io;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::watch;
 
 #[cfg(unix)]
 mod unix;
@@ -65,9 +66,13 @@ pub struct TreeStdio {
 /// A spawned root process plus all of its descendants.
 ///
 /// Dropping a `ProcessTree` kills the entire tree.
+///
+/// The root process is reaped by a background task as soon as it exits, so
+/// its exit can be observed ([`exited`](ProcessTree::exited)) while the
+/// tree is still being measured or killed through `&self`.
 #[derive(Debug)]
 pub struct ProcessTree {
-    child: Child,
+    exit: watch::Receiver<Option<Result<ExitStatus, String>>>,
     pid: u32,
     os: imp::Tree,
     stdio: Option<TreeStdio>,
@@ -104,8 +109,13 @@ impl ProcessTree {
             }),
             _ => None,
         };
+        let (exit_tx, exit) = watch::channel(None);
+        tokio::spawn(async move {
+            let res = child.wait().await.map_err(|e| e.to_string());
+            let _ = exit_tx.send(Some(res));
+        });
         Ok(Self {
-            child,
+            exit,
             pid,
             os,
             stdio,
@@ -130,11 +140,11 @@ impl ProcessTree {
     /// sent SIGTERM before the grace period starts.
     pub async fn terminate(&mut self, grace: Duration) -> io::Result<()> {
         self.os.soft_stop();
-        let _ = tokio::time::timeout(grace, self.child.wait()).await;
+        let _ = tokio::time::timeout(grace, self.wait()).await;
         self.os.kill();
         // Reap the root so it is not left as a zombie (Unix) and its handle
         // state is final (Windows).
-        let _ = tokio::time::timeout(KILL_SETTLE, self.child.wait()).await;
+        let _ = tokio::time::timeout(KILL_SETTLE, self.wait()).await;
         let deadline = tokio::time::Instant::now() + KILL_SETTLE;
         while self.os.is_alive() {
             if tokio::time::Instant::now() >= deadline {
@@ -176,7 +186,27 @@ impl ProcessTree {
     /// Waits for the root process to exit. Descendants may still be running;
     /// use [`terminate`](ProcessTree::terminate) or drop the tree to end them.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
+        let mut rx = self.exit.clone();
+        let res = rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| io::Error::other("process reaper ended"))?
+            .clone();
+        match res {
+            Some(Ok(status)) => Ok(status),
+            Some(Err(e)) => Err(io::Error::other(e)),
+            None => Err(io::Error::other("process reaper ended")),
+        }
+    }
+
+    /// A future that resolves once the root process has exited (or its
+    /// reaper task ended with the runtime). Independent of `self`, so it can
+    /// be awaited in a task while the tree stays usable for status and kill.
+    pub fn exited(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.exit.clone();
+        async move {
+            let _ = rx.wait_for(Option::is_some).await;
+        }
     }
 }
 

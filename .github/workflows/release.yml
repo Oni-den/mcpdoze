@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, ext: zip }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm, ext: zip }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, ext: tar.gz }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, ext: tar.gz }
+          # Both macOS targets build on the Apple-silicon runner; the x86_64
+          # one is a cross-compile (native-tls uses the system Security
+          # framework, so no extra libraries are needed).
+          - { target: aarch64-apple-darwin, os: macos-latest, ext: tar.gz }
+          - { target: x86_64-apple-darwin, os: macos-latest, ext: tar.gz }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Linux build dependencies (native-tls needs OpenSSL headers)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Build
+        run: cargo build --release -p mcpdoze --locked --target ${{ matrix.target }}
+
+      - name: Package (zip)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          $name = "mcpdoze-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mcpdoze.exe" $name
+          Copy-Item LICENSE, README.md $name
+          New-Item -ItemType Directory -Path "$name/skills" | Out-Null
+          Copy-Item -Recurse skills/mcpdoze-migrate "$name/skills/"
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Move-Item "$name.zip" dist/
+
+      - name: Package (tar.gz)
+        if: matrix.ext == 'tar.gz'
+        shell: bash
+        run: |
+          name="mcpdoze-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$name/skills" dist
+          cp "target/${{ matrix.target }}/release/mcpdoze" LICENSE README.md "$name/"
+          cp -R skills/mcpdoze-migrate "$name/skills/"
+          tar -czf "dist/$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum mcpdoze-* > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=""
+          case "$TAG" in *-*) flags="--prerelease" ;; esac
+          gh release create "$TAG" dist/* --title "$TAG" --generate-notes $flags

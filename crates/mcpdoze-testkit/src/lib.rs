@@ -40,6 +40,8 @@ pub struct MockServerSpec {
     garbage_on_start: bool,
     list_changed_after: Option<u64>,
     sampling_request: bool,
+    elicitation_request: bool,
+    roots_request: bool,
     stderr_noise: bool,
     startup_delay_ms: Option<u64>,
     prompts: Option<Vec<String>>,
@@ -106,8 +108,19 @@ impl MockServerSpec {
         self.list_changed_after = Some(n);
         self
     }
+    /// Tool `ask` sends `sampling/createMessage` and returns the reply.
     pub fn sampling_request(mut self) -> Self {
         self.sampling_request = true;
+        self
+    }
+    /// Tool `elicit` sends `elicitation/create` and returns the reply.
+    pub fn elicitation_request(mut self) -> Self {
+        self.elicitation_request = true;
+        self
+    }
+    /// Tool `roots` sends `roots/list` and returns the reply.
+    pub fn roots_request(mut self) -> Self {
+        self.roots_request = true;
         self
     }
     pub fn stderr_noise(mut self) -> Self {
@@ -174,6 +187,8 @@ impl MockServerSpec {
         for (on, flag) in [
             (self.garbage_on_start, "--garbage-on-start"),
             (self.sampling_request, "--sampling-request"),
+            (self.elicitation_request, "--elicitation-request"),
+            (self.roots_request, "--roots-request"),
             (self.stderr_noise, "--stderr-noise"),
             (self.log_messages, "--log-messages"),
         ] {

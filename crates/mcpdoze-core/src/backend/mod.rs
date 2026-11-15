@@ -12,7 +12,7 @@ pub mod jsonrpc;
 pub mod lifecycle;
 pub mod stdio;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,10 +39,75 @@ pub struct HttpSpec {
     pub request_timeout: Duration,
 }
 
+/// Placeholder expanded to the agent's working directory in scoped specs.
+pub const CWD_VAR: &str = "${cwd}";
+
 /// Default idle time before an unused backend is unloaded.
 pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(600);
 /// Default time a backend gets to spawn and answer `initialize`.
 pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What the broker offers a backend as its (single, synthetic) client, and
+/// how it answers the backend's server-to-client requests. Not part of the
+/// catalog fingerprint.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ClientSide {
+    /// Advertise the `sampling` capability (only where the owning agent
+    /// session is unambiguous: per-session instances).
+    pub sampling: bool,
+    /// Advertise the `elicitation` capability (same rule as `sampling`).
+    pub elicitation: bool,
+    /// The root answered for `roots/list` (`file://` URI); an empty list
+    /// when `None`. The broker answers `roots/list` itself, always.
+    pub root: Option<String>,
+    /// The agent session that owns this instance (per-session scope).
+    /// Server-to-client requests go there even with no call in flight.
+    pub owner: Option<String>,
+}
+
+impl ClientSide {
+    /// The `capabilities` object of the broker's `initialize` request.
+    pub fn capabilities(&self) -> Value {
+        let mut caps = serde_json::Map::new();
+        caps.insert("roots".into(), serde_json::json!({"listChanged": false}));
+        if self.sampling {
+            caps.insert("sampling".into(), serde_json::json!({}));
+        }
+        if self.elicitation {
+            caps.insert("elicitation".into(), serde_json::json!({}));
+        }
+        Value::Object(caps)
+    }
+
+    /// The `roots/list` result.
+    pub fn roots_result(&self) -> Value {
+        let roots: Vec<Value> = self
+            .root
+            .iter()
+            .map(|u| {
+                let name = u
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                serde_json::json!({"uri": u, "name": name})
+            })
+            .collect();
+        serde_json::json!({ "roots": roots })
+    }
+}
+
+impl fmt::Debug for ClientSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientSide")
+            .field("sampling", &self.sampling)
+            .field("elicitation", &self.elicitation)
+            .field("root", &self.root)
+            .field("owned", &self.owner.is_some())
+            .finish()
+    }
+}
 
 /// How to launch one stdio backend.
 ///
@@ -67,6 +132,11 @@ pub struct BackendSpec {
     /// When set, this backend is a remote Streamable HTTP server and
     /// `command`/`args`/`env`/`cwd` are unused.
     pub http: Option<HttpSpec>,
+    /// Names of `env` entries resolved from `{ from_env = ... }` references.
+    /// `${cwd}` is never expanded inside them.
+    pub ref_env: BTreeSet<String>,
+    /// Client capabilities and server-to-client answers for this instance.
+    pub client: ClientSide,
 }
 
 impl BackendSpec {
@@ -84,7 +154,32 @@ impl BackendSpec {
             idle_ttl: DEFAULT_IDLE_TTL,
             start_timeout: DEFAULT_START_TIMEOUT,
             http: None,
+            ref_env: BTreeSet::new(),
+            client: ClientSide::default(),
         }
+    }
+
+    /// This spec with `${cwd}` replaced by `cwd` in the args, the literal
+    /// env values (never in `from_env` values) and the configured working
+    /// directory. With `spawn_in` the process is started in `cwd` unless a
+    /// working directory is configured.
+    pub fn expand_cwd(&self, cwd: &std::path::Path, spawn_in: bool) -> Self {
+        let c = cwd.to_string_lossy();
+        let mut s = self.clone();
+        for a in &mut s.args {
+            *a = a.replace(CWD_VAR, &c);
+        }
+        for (k, v) in &mut s.env {
+            if !self.ref_env.contains(k) {
+                *v = v.replace(CWD_VAR, &c);
+            }
+        }
+        s.cwd = match &self.cwd {
+            Some(p) => Some(PathBuf::from(p.to_string_lossy().replace(CWD_VAR, &c))),
+            None if spawn_in => Some(cwd.to_path_buf()),
+            None => None,
+        };
+        s
     }
 
     /// A remote Streamable HTTP backend at `url` with default TTL, start and
@@ -138,6 +233,7 @@ impl fmt::Debug for BackendSpec {
             .field("idle_ttl", &self.idle_ttl)
             .field("start_timeout", &self.start_timeout)
             .field("http", &self.http)
+            .field("client", &self.client)
             .finish()
     }
 }
@@ -269,6 +365,78 @@ impl Conn {
     }
 }
 
+/// Sends the broker's answer to one server-to-client request back to the
+/// backend that asked.
+pub struct Reply {
+    id: Value,
+    send: Box<dyn FnOnce(Value) + Send>,
+}
+
+impl fmt::Debug for Reply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reply").field("id", &self.id).finish()
+    }
+}
+
+impl Reply {
+    pub(crate) fn new(id: Value, send: impl FnOnce(Value) + Send + 'static) -> Self {
+        Self {
+            id,
+            send: Box::new(send),
+        }
+    }
+
+    /// The backend's request id.
+    pub fn id(&self) -> &Value {
+        &self.id
+    }
+
+    /// Sends a success result.
+    pub fn result(self, result: Value) {
+        let msg = jsonrpc::result(self.id.clone(), result);
+        (self.send)(msg);
+    }
+
+    /// Sends an error.
+    pub fn error(self, code: i64, message: impl Into<String>) {
+        let msg = jsonrpc::error(self.id.clone(), code, message);
+        (self.send)(msg);
+    }
+
+    /// Sends an agent's response (`result` or `error`) under the backend's id.
+    pub fn forward(self, response: Value) {
+        let msg = if let Some(r) = response.get("result") {
+            jsonrpc::result(self.id.clone(), r.clone())
+        } else if let Some(e) = response.get("error").filter(|e| e.is_object()) {
+            serde_json::json!({"jsonrpc": "2.0", "id": self.id.clone(), "error": e})
+        } else {
+            jsonrpc::error(
+                self.id.clone(),
+                jsonrpc::INTERNAL_ERROR,
+                "agent sent an invalid response",
+            )
+        };
+        (self.send)(msg);
+    }
+}
+
+/// A server-to-client request (sampling, elicitation, ...) from a backend
+/// that the broker does not answer itself (`ping` and `roots/list` are
+/// answered locally).
+#[derive(Debug)]
+pub struct ServerRequest {
+    /// Backend server name.
+    pub server: String,
+    /// The request as the backend sent it.
+    pub msg: Value,
+    /// Distinct agent sessions with a call in flight on this connection.
+    pub sessions: Vec<String>,
+    /// The session owning the instance (per-session scope), if any.
+    pub owner: Option<String>,
+    /// Where the answer goes.
+    pub reply: Reply,
+}
+
 /// Hooks the backend reader calls for messages that are not responses to
 /// broker requests. The router implements this.
 pub trait BackendEvents: Send + Sync + 'static {
@@ -277,14 +445,43 @@ pub trait BackendEvents: Send + Sync + 'static {
         let _ = (server, msg);
     }
 
-    /// A server-to-client request (sampling, elicitation, roots) from
-    /// backend `server`. Return the full JSON-RPC response to send back, or
-    /// `None` to answer "method not supported".
-    ///
-    /// Hook for M7: route to the session that owns the in-flight call.
-    fn server_request(&self, server: &str, msg: &Value) -> Option<Value> {
-        let _ = (server, msg);
-        None
+    /// A notification plus the agent sessions with calls in flight on the
+    /// connection it arrived on. Defaults to [`notification`](Self::notification).
+    fn notification_from(&self, server: &str, msg: Value, sessions: Vec<String>) {
+        let _ = sessions;
+        self.notification(server, msg);
+    }
+
+    /// A server-to-client request the broker does not answer itself. The
+    /// default answers "method not supported".
+    fn server_request(&self, req: ServerRequest) {
+        req.reply.error(
+            jsonrpc::METHOD_NOT_FOUND,
+            "method not supported by the mcpdoze broker",
+        );
+    }
+}
+
+/// Answers `ping` and `roots/list` locally and hands everything else to
+/// `events`. Shared by the stdio and HTTP connections.
+pub(crate) fn handle_server_request(
+    events: &dyn BackendEvents,
+    server: &str,
+    client: &ClientSide,
+    msg: Value,
+    sessions: Vec<String>,
+    reply: Reply,
+) {
+    match msg["method"].as_str().unwrap_or("") {
+        "ping" => reply.result(serde_json::json!({})),
+        "roots/list" => reply.result(client.roots_result()),
+        _ => events.server_request(ServerRequest {
+            server: server.to_owned(),
+            msg,
+            sessions,
+            owner: client.owner.clone(),
+            reply,
+        }),
     }
 }
 

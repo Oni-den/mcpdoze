@@ -19,6 +19,8 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 /// The backend is unavailable (crashed, backing off, failed to start).
 pub const BACKEND_UNAVAILABLE: i64 = -32000;
+/// A scoped server reached its `max_instances` cap.
+pub const INSTANCE_LIMIT: i64 = -32001;
 /// The request was cancelled (MCP convention).
 pub const REQUEST_CANCELLED: i64 = -32800;
 

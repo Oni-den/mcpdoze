@@ -128,6 +128,8 @@ fn status_row(name: &str, running: bool) -> ServerStatus {
         restarts: 2,
         failures: 0,
         last_error: None,
+        scope: "shared".into(),
+        instances: Vec::new(),
     }
 }
 

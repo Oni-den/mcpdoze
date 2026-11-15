@@ -313,6 +313,7 @@ pub fn build_register(a: &AddArgs) -> Result<RegisterRequest> {
             allow_literal_env: a.allow_literal_env,
             probe: true,
             catalog_max_age: None,
+            max_instances: None,
         },
     })
 }

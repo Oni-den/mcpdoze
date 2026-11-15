@@ -32,7 +32,9 @@ use tokio::time::Instant;
 
 use super::jsonrpc::{self, Kind};
 use super::stdio::{lock, BACKEND_PROTOCOL_VERSION};
-use super::{BackendEvents, BackendSpec, CallError, CallMeta};
+use super::{
+    handle_server_request, BackendEvents, BackendSpec, CallError, CallMeta, ClientSide, Reply,
+};
 
 /// Largest upstream response body accepted (JSON body or whole SSE stream).
 pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
@@ -62,6 +64,19 @@ struct Pending {
 struct PendingMap {
     calls: HashMap<u64, Pending>,
     closed: bool,
+}
+
+impl PendingMap {
+    fn sessions(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .calls
+            .values()
+            .filter_map(|p| p.meta.session.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 #[derive(Default)]
@@ -113,6 +128,7 @@ pub struct HttpConn {
     closed_tx: watch::Sender<bool>,
     closed: watch::Receiver<bool>,
     init: Mutex<Value>,
+    client: ClientSide,
 }
 
 impl std::fmt::Debug for HttpConn {
@@ -158,6 +174,7 @@ impl HttpConn {
             closed_tx,
             closed,
             init: Mutex::new(Value::Null),
+            client: spec.client.clone(),
         }))
     }
 
@@ -205,7 +222,7 @@ impl HttpConn {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let params = json!({
             "protocolVersion": BACKEND_PROTOCOL_VERSION,
-            "capabilities": {},
+            "capabilities": self.client.capabilities(),
             "clientInfo": {"name": "mcpdoze", "version": env!("CARGO_PKG_VERSION")},
         });
         let body = jsonrpc::request(id, "initialize", params);
@@ -364,26 +381,31 @@ impl HttpConn {
                 (want.is_some() && msg.get("id").and_then(Value::as_u64) == want).then_some(msg)
             }
             Kind::Notification => {
-                self.events.notification(&self.server, msg);
+                let sessions = lock(&self.pending).sessions();
+                self.events.notification_from(&self.server, msg, sessions);
                 None
             }
             Kind::Request => {
-                let reply = self
-                    .events
-                    .server_request(&self.server, &msg)
-                    .unwrap_or_else(|| {
-                        jsonrpc::error(
-                            msg["id"].clone(),
-                            jsonrpc::METHOD_NOT_FOUND,
-                            "method not supported by the mcpdoze broker",
-                        )
-                    });
+                let sessions = lock(&self.pending).sessions();
                 let this = self.clone();
-                tokio::spawn(async move {
-                    let (sid, _) = this.snapshot();
-                    let proto = lock(&this.session).protocol.clone();
-                    let _ = this.exchange(&reply, None, sid, proto).await;
+                let reply = Reply::new(msg["id"].clone(), move |resp: Value| {
+                    let Ok(h) = tokio::runtime::Handle::try_current() else {
+                        return;
+                    };
+                    h.spawn(async move {
+                        let (sid, _) = this.snapshot();
+                        let proto = lock(&this.session).protocol.clone();
+                        let _ = this.exchange(&resp, None, sid, proto).await;
+                    });
                 });
+                handle_server_request(
+                    self.events.as_ref(),
+                    &self.server,
+                    &self.client,
+                    msg,
+                    sessions,
+                    reply,
+                );
                 None
             }
             Kind::Invalid => None,

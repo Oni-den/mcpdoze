@@ -62,7 +62,14 @@ Runtime state of every registered backend.
       "calls": 17,
       "restarts": 1,
       "failures": 0,
-      "last_error": null
+      "last_error": null,
+      "scope": "shared",
+      "instances": [
+        { "scope_key": "", "state": "running", "pids": [4242, 4250],
+          "rss_bytes": 81264640, "private_bytes": 75497472, "in_flight": 0,
+          "idle_remaining_secs": 540, "calls": 17, "restarts": 1,
+          "failures": 0, "last_error": null }
+      ]
     }
   ]
 }
@@ -77,6 +84,21 @@ Runtime state of every registered backend.
   no call in flight.
 - `restarts`: processes (or upstream sessions) started after the first one,
   after an idle unload, a stop or a crash.
+- `scope`: `shared`, `per-cwd` or `per-session` (see [SCOPES.md](SCOPES.md)).
+- `instances`: one entry per backend instance `(server, scope_key)`, with the
+  same per-instance fields as above. `scope_key` is `""` for the shared
+  instance (for scoped servers: the fallback used when the agent directory
+  is unknown, listed once it has been used), the normalised directory for
+  `per-cwd`, and `session:<first 8 characters of the session id>` for
+  `per-session`. Stopped scoped instances are dropped from the list.
+- For `shared` servers the top-level fields describe the one instance, as
+  before. For scoped servers they aggregate every instance: `state` is the
+  most active state, `pids` and memory are summed over all trees,
+  `in_flight`, `calls` and `restarts` are sums, `failures` is the maximum.
+- A backend whose root process exits (crash or external kill) is noticed
+  at once, even when a grandchild keeps its output pipe open: calls in
+  flight fail with a JSON-RPC error, the instance shows `failed` with empty
+  `pids` and is restarted by the next call after the backoff.
 
 ### `GET /servers`
 
@@ -145,22 +167,23 @@ Response `201`:
 ### `DELETE /servers/{name}`
 
 Removes a server from the config (file or memory) and the router, then
-drains its backend (in-flight calls may finish for up to 30 s, then the
-process tree is killed). Response: `{ "name": "example", "persisted": true }`.
+drains every instance of it (in-flight calls may finish for up to 30 s, then
+the process trees are killed). Response: `{ "name": "example", "persisted": true }`.
 
 ### `POST /servers/{name}/stop[?force=true]`
 
-Unloads the backend but keeps the server registered; the next call starts it
-again. By default it drains (waits up to 30 s for in-flight calls);
-`force=true` kills the tree at once and fails calls in flight. Response:
-`{ "name": "example", "state": "stopped" }`.
+Unloads the backend, every scoped instance included, but keeps the server
+registered; the next call starts the instance it needs again. By default it
+drains (waits up to 30 s for in-flight calls); `force=true` kills the trees
+at once and fails calls in flight. Response:
+`{ "name": "example", "state": "stopped" }` (the most active state left).
 
 ### `POST /reload`
 
 Re-reads the config file and applies the difference: new servers are
 registered, removed ones unregistered and unloaded, changed ones (command,
-arguments, resolved environment, TTL, prefix, ...) unloaded and registered
-again. Unchanged servers keep running. On a parse or validation error nothing
+arguments, resolved environment, TTL, prefix, scope, `max_instances`, ...)
+unloaded (all instances) and registered again. Unchanged servers keep running. On a parse or validation error nothing
 changes (`400`). `409` if the broker runs without a config file.
 
 ```json
@@ -172,7 +195,8 @@ changes (`400`). `409` if the broker runs without a config file.
 `restart_required` lists `[broker]` settings that changed but only apply
 after a restart (`bind`, `token_file`, `token_env`, `allow_remote`,
 `allowed_hosts`, `log_dir`, `catalog_dir`). `default_idle_ttl`,
-`start_timeout` and `catalog_max_age` apply on reload. A changed server whose
+`start_timeout`, `catalog_max_age`, `client_request_timeout` and
+`session_idle_timeout` apply on reload. A changed server whose
 launch fingerprint changed (command, arguments, working directory, URL,
 environment or header names) is probed again.
 
@@ -204,6 +228,7 @@ name.
 ### `GET /servers/{name}/logs[?lines=N]`
 
 The last `N` lines (default 100, at most 500) of the backend's stderr, kept in
-memory across restarts. Response:
+memory across restarts. For scoped servers the lines of each instance follow
+the shared instance's, prefixed with `[<scope_key>] `. Response:
 `{ "name": "example", "lines": ["...", "..."] }`. Backend output is shown as
 is; it is only reachable with the token from a loopback peer.

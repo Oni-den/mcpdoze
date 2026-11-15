@@ -10,6 +10,10 @@
 //!   and server-to-client requests go to [`BackendEvents`]. Non-JSON lines are
 //!   logged at debug and dropped; lines over [`MAX_LINE`] are dropped.
 //! * stderr: keeps the last [`STDERR_LINES`] lines in a ring buffer.
+//! * exit watch: waits for the root process to exit. Exit is a crash signal
+//!   on its own (a grandchild may keep stdout open): after a short drain
+//!   grace ([`EXIT_DRAIN`]) pending calls fail and the connection reports
+//!   itself closed.
 //!
 //! The reader holds only a weak sender, so it never keeps stdin open.
 
@@ -25,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use super::jsonrpc::{self, Kind};
-use super::{BackendEvents, BackendSpec};
+use super::{handle_server_request, BackendEvents, BackendSpec, ClientSide, Reply};
 use crate::proctree::{resolve_command, ProcessTree, TreeMemory};
 
 /// Largest stdout line accepted from a backend.
@@ -36,6 +40,9 @@ pub const STDERR_LINES: usize = 500;
 const MAX_STDERR_LINE: usize = 8 * 1024;
 /// Outgoing line queue depth per backend.
 const WRITE_QUEUE: usize = 256;
+/// After the root process exits, how long the reader may still drain stdout
+/// before pending calls are failed.
+pub const EXIT_DRAIN: Duration = Duration::from_millis(200);
 /// Protocol version the broker requests from backends.
 pub const BACKEND_PROTOCOL_VERSION: &str = "2025-11-25";
 
@@ -81,6 +88,20 @@ struct PendingMap {
     closed: bool,
 }
 
+impl PendingMap {
+    /// Distinct agent sessions with a call pending.
+    fn sessions(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .calls
+            .values()
+            .filter_map(|p| p.meta.session.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
 /// Ring buffer of the most recent stderr lines of a backend.
 #[derive(Debug, Default)]
 pub struct StderrRing(Mutex<VecDeque<String>>);
@@ -111,6 +132,7 @@ pub struct StdioConn {
     tree: Mutex<Option<ProcessTree>>,
     closed: watch::Receiver<bool>,
     init: Mutex<Value>,
+    client: ClientSide,
 }
 
 impl std::fmt::Debug for StdioConn {
@@ -143,6 +165,7 @@ impl StdioConn {
         let pid = tree.pid();
         let (tx, rx) = mpsc::channel::<String>(WRITE_QUEUE);
         let (closed_tx, closed) = watch::channel(false);
+        let closed_tx = Arc::new(closed_tx);
         let pending = Arc::new(Mutex::new(PendingMap::default()));
 
         tokio::spawn(write_loop(stdio.stdin, rx));
@@ -152,8 +175,16 @@ impl StdioConn {
             pending: pending.clone(),
             tx: tx.downgrade(),
             events,
-            closed: closed_tx,
+            closed: closed_tx.clone(),
+            client: spec.client.clone(),
         }));
+        tokio::spawn(exit_watch(
+            server.to_owned(),
+            pid,
+            tree.exited(),
+            pending.clone(),
+            closed_tx,
+        ));
         tokio::spawn(stderr_loop(BufReader::new(stdio.stderr), stderr));
         tracing::debug!(server, pid, "backend spawned");
         Ok(Self {
@@ -166,6 +197,7 @@ impl StdioConn {
             tree: Mutex::new(Some(tree)),
             closed,
             init: Mutex::new(Value::Null),
+            client: spec.client.clone(),
         })
     }
 
@@ -175,9 +207,8 @@ impl StdioConn {
     pub(crate) async fn initialize(&self) -> Result<Value, String> {
         let params = json!({
             "protocolVersion": BACKEND_PROTOCOL_VERSION,
-            // Conservative: the broker answers server-to-client requests with
-            // "not supported" until M7 routes them to agent sessions.
-            "capabilities": {},
+            // Only what the broker can serve for this instance's scope.
+            "capabilities": self.client.capabilities(),
             "clientInfo": {"name": "mcpdoze", "version": env!("CARGO_PKG_VERSION")},
         });
         let resp = self
@@ -240,7 +271,8 @@ impl StdioConn {
         lock(&self.pending).calls.len()
     }
 
-    /// Resolves once the backend's stdout has closed (exit or crash).
+    /// Resolves once the backend's stdout has closed or its root process
+    /// exited (exit or crash).
     pub(crate) fn closed(&self) -> watch::Receiver<bool> {
         self.closed.clone()
     }
@@ -341,6 +373,32 @@ fn fail_all(pending: &Mutex<PendingMap>) {
     }
 }
 
+/// Fails pending calls and reports the connection closed once the root
+/// process exits, after giving the reader [`EXIT_DRAIN`] to deliver what the
+/// process wrote before exiting.
+async fn exit_watch(
+    server: String,
+    pid: u32,
+    exited: impl std::future::Future<Output = ()>,
+    pending: Arc<Mutex<PendingMap>>,
+    closed: Arc<watch::Sender<bool>>,
+) {
+    let mut rx = closed.subscribe();
+    tokio::select! {
+        _ = exited => {}
+        _ = rx.wait_for(|c| *c) => return,
+    }
+    if tokio::time::timeout(EXIT_DRAIN, rx.wait_for(|c| *c))
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    tracing::debug!(server, pid, "backend root process exited");
+    fail_all(&pending);
+    let _ = closed.send(true);
+}
+
 async fn write_loop(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receiver<String>) {
     while let Some(line) = rx.recv().await {
         let ok = async {
@@ -419,7 +477,8 @@ struct ReadCtx {
     pending: Arc<Mutex<PendingMap>>,
     tx: mpsc::WeakSender<String>,
     events: Arc<dyn BackendEvents>,
-    closed: watch::Sender<bool>,
+    closed: Arc<watch::Sender<bool>>,
+    client: ClientSide,
 }
 
 async fn read_loop(mut ctx: ReadCtx) {
@@ -460,21 +519,32 @@ fn dispatch(ctx: &ReadCtx, mut msg: Value) {
             msg["id"] = call.meta.orig_id;
             let _ = call.tx.send(Ok(msg));
         }
-        Kind::Notification => ctx.events.notification(&ctx.server, msg),
+        Kind::Notification => {
+            let sessions = lock(&ctx.pending).sessions();
+            ctx.events.notification_from(&ctx.server, msg, sessions);
+        }
         Kind::Request => {
-            let reply = ctx
-                .events
-                .server_request(&ctx.server, &msg)
-                .unwrap_or_else(|| {
-                    jsonrpc::error(
-                        msg["id"].clone(),
-                        jsonrpc::METHOD_NOT_FOUND,
-                        "method not supported by the mcpdoze broker",
-                    )
-                });
-            if let Some(tx) = ctx.tx.upgrade() {
-                let _ = tx.try_send(reply.to_string());
-            }
+            let sessions = lock(&ctx.pending).sessions();
+            let tx = ctx.tx.clone();
+            let reply = Reply::new(msg["id"].clone(), move |resp: Value| {
+                let Some(tx) = tx.upgrade() else { return };
+                let line = resp.to_string();
+                if let Err(mpsc::error::TrySendError::Full(line)) = tx.try_send(line) {
+                    if let Ok(h) = tokio::runtime::Handle::try_current() {
+                        h.spawn(async move {
+                            let _ = tx.send(line).await;
+                        });
+                    }
+                }
+            });
+            handle_server_request(
+                ctx.events.as_ref(),
+                &ctx.server,
+                &ctx.client,
+                msg,
+                sessions,
+                reply,
+            );
         }
         Kind::Invalid => tracing::debug!(server = %ctx.server, "invalid JSON-RPC line dropped"),
     }

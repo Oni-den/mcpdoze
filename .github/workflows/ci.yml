@@ -28,6 +28,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Linux build dependencies (native-tls needs OpenSSL headers)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
       - name: Format
         run: cargo fmt --all -- --check
 

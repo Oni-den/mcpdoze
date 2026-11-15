@@ -20,6 +20,8 @@ struct Config {
     garbage: bool,
     list_changed_after: Option<u64>,
     sampling: bool,
+    elicitation: bool,
+    roots: bool,
     noise: bool,
     startup_delay_ms: u64,
     prompts: Vec<String>,
@@ -36,6 +38,8 @@ struct State {
     next_sid: AtomicU64,
     waiters: Mutex<HashMap<String, Sender<Value>>>,
     cancelled: Mutex<HashSet<String>>,
+    /// Client capabilities from `initialize`.
+    client_caps: Mutex<Value>,
 }
 
 impl State {
@@ -67,6 +71,8 @@ fn parse_args() -> Result<Option<Config>, String> {
         garbage: false,
         list_changed_after: None,
         sampling: false,
+        elicitation: false,
+        roots: false,
         noise: false,
         startup_delay_ms: 0,
         prompts: vec!["greet".into()],
@@ -99,6 +105,8 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--startup-delay-ms" => c.startup_delay_ms = num(val()?)?,
             "--garbage-on-start" => c.garbage = true,
             "--sampling-request" => c.sampling = true,
+            "--elicitation-request" => c.elicitation = true,
+            "--roots-request" => c.roots = true,
             "--stderr-noise" => c.noise = true,
             "--prompts" => c.prompts = list(val()?),
             "--resources" => c.resources = list(val()?),
@@ -183,20 +191,49 @@ fn handle_call(st: Arc<State>, id: Value, params: Value) {
                 Err(e) => json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
             }
         }
-        "ask" if st.cfg.sampling => {
-            let sid = format!("s{}", st.next_sid.fetch_add(1, Ordering::SeqCst));
-            let (tx, rx) = channel();
-            st.waiters
-                .lock()
-                .unwrap()
-                .insert(json!(sid).to_string(), tx);
-            st.send(&json!({"jsonrpc":"2.0","id":sid,"method":"sampling/createMessage",
-                "params":{"messages":[{"role":"user","content":{"type":"text","text":"hi"}}],"maxTokens":16}}));
-            match rx.recv_timeout(Duration::from_secs(15)) {
-                Ok(r) => text_result(r.to_string(), json!({"tool":"ask","reply":r})),
-                Err(_) => {
-                    json!({"content":[{"type":"text","text":"sampling timeout"}],"isError":true})
-                }
+        "ask" if st.cfg.sampling => client_request(
+            &st,
+            "ask",
+            "sampling/createMessage",
+            json!({"messages":[{"role":"user","content":{"type":"text","text":"hi"}}],"maxTokens":16}),
+        ),
+        "elicit" if st.cfg.elicitation => client_request(
+            &st,
+            "elicit",
+            "elicitation/create",
+            json!({"message":"pick one","requestedSchema":{"type":"object",
+                "properties":{"choice":{"type":"string"}}}}),
+        ),
+        "roots" if st.cfg.roots => client_request(&st, "roots", "roots/list", json!({})),
+        "info" => {
+            let env: serde_json::Map<String, Value> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("MCPDOZE_TEST_"))
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect();
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let info = json!({"tool":"info","pid":std::process::id(),
+                "args":std::env::args().skip(1).collect::<Vec<_>>(),
+                "cwd":cwd,"env":env,"client_capabilities":st.client_caps.lock().unwrap().clone()});
+            text_result(info.to_string(), info)
+        }
+        "spawn_child_inherit" => {
+            // The grandchild inherits stdout, so the pipe stays open after
+            // this process dies (exercises exit detection by process exit).
+            let exe = std::env::current_exe().unwrap();
+            match Command::new(exe)
+                .arg("--sleep-forever")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(ch) => text_result(
+                    ch.id().to_string(),
+                    json!({"tool":"spawn_child_inherit","pid":ch.id()}),
+                ),
+                Err(e) => json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
             }
         }
         name => text_result(args.to_string(), json!({"tool":name})),
@@ -206,6 +243,23 @@ fn handle_call(st: Arc<State>, id: Value, params: Value) {
         && !st.extra.swap(true, Ordering::SeqCst)
     {
         st.send(&json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}));
+    }
+}
+
+/// Sends a server-to-client request and waits (bounded) for the answer.
+fn client_request(st: &State, tool: &str, method: &str, params: Value) -> Value {
+    let sid = format!("s{}", st.next_sid.fetch_add(1, Ordering::SeqCst));
+    let (tx, rx) = channel();
+    st.waiters
+        .lock()
+        .unwrap()
+        .insert(json!(sid).to_string(), tx);
+    st.send(&json!({"jsonrpc":"2.0","id":sid,"method":method,"params":params}));
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(r) => text_result(r.to_string(), json!({"tool":tool,"reply":r})),
+        Err(_) => {
+            json!({"content":[{"type":"text","text":format!("{method} timeout")}],"isError":true})
+        }
     }
 }
 
@@ -228,7 +282,11 @@ fn handle(st: &Arc<State>, msg: Value) {
         // A response to one of our requests (sampling).
         if let Some(id) = id {
             if let Some(tx) = st.waiters.lock().unwrap().remove(&id_key(&id)) {
-                let _ = tx.send(msg.get("result").cloned().unwrap_or(msg["error"].clone()));
+                let _ = tx.send(
+                    msg.get("result")
+                        .cloned()
+                        .unwrap_or(json!({"error": msg["error"].clone()})),
+                );
             }
         }
         return;
@@ -246,6 +304,7 @@ fn handle(st: &Arc<State>, msg: Value) {
     let reply = |result: Value| st.send(&json!({"jsonrpc":"2.0","id":id,"result":result}));
     match method {
         "initialize" => {
+            *st.client_caps.lock().unwrap() = params["capabilities"].clone();
             let v = params["protocolVersion"]
                 .as_str()
                 .unwrap_or(DEFAULT_VERSION);
@@ -347,6 +406,7 @@ fn main() {
         next_sid: AtomicU64::new(1),
         waiters: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashSet::new()),
+        client_caps: Mutex::new(Value::Null),
     });
     if st.cfg.garbage {
         let mut o = st.out.lock().unwrap();
