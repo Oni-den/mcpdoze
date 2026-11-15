@@ -412,7 +412,10 @@ mod spawn_tests {
         #[cfg(unix)]
         {
             let mut c = Command::new("sh");
-            c.arg("-c").arg(r#"sh -c "sleep 300" & wait"#);
+            // The trailing `; true` stops the inner shell from exec-ing `sleep` itself
+            // (macOS's sh does that for a lone last command), which would shorten the
+            // chain to two processes and defeat the three-deep assertion.
+            c.arg("-c").arg(r#"sh -c "sleep 300; true" & wait"#);
             c
         }
     }
