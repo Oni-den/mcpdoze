@@ -9,7 +9,7 @@
 MCPDoze is a small Rust broker that sits between your AI agents and your
 [Model Context Protocol](https://modelcontextprotocol.io) servers.
 
-> Status: **v0.1.0, early release.** The data path, lifecycle, catalog,
+> Status: **v0.2.0, early release.** The data path, lifecycle, catalog,
 > admin API, CLI, HTTP passthrough, `shared` / `per-cwd` / `per-session`
 > scopes, routing of server-to-client requests (sampling, elicitation,
 > roots), migration skill with rollback and the optional guardrail hook work.
