@@ -141,7 +141,12 @@ pub struct Instance {
     inner: Mutex<Inner>,
     spawns: AtomicU64,
     calls: AtomicU64,
+    spawn_hooks: Mutex<Vec<SpawnHook>>,
 }
+
+/// Callback run each time an instance reaches `Running` on a new process,
+/// with that process's lifecycle generation.
+pub type SpawnHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 impl std::fmt::Debug for Instance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -187,7 +192,16 @@ impl Instance {
             }),
             spawns: AtomicU64::new(0),
             calls: AtomicU64::new(0),
+            spawn_hooks: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Registers `hook`, run (outside the instance lock) every time a new
+    /// process of this instance is up and initialised, with its lifecycle
+    /// generation, before callers waiting on the start resume. Hooks are
+    /// kept for the life of the instance and must not block.
+    pub fn on_spawn(&self, hook: impl Fn(u64) + Send + Sync + 'static) {
+        lock(&self.spawn_hooks).push(Arc::new(hook));
     }
 
     /// Server name.
@@ -422,6 +436,7 @@ impl Instance {
                 self.spec.start_timeout.as_millis()
             )),
         };
+        let mut spawned = None;
         let leftover = {
             let g = &mut *lock(&self.inner);
             let current = g.generation == generation && matches!(g.state, State::Starting { .. });
@@ -440,6 +455,7 @@ impl Instance {
                         idle.notify_one();
                     }
                     tracing::info!(server = %self.name, pid = ?conn.pid(), "backend running");
+                    spawned = Some(generation);
                     None
                 }
                 Ok(conn) => Some(conn),
@@ -460,6 +476,12 @@ impl Instance {
         };
         if let Some(conn) = leftover {
             conn.shutdown(Duration::ZERO).await;
+        }
+        if let Some(generation) = spawned {
+            let hooks = lock(&self.spawn_hooks).clone();
+            for hook in hooks {
+                hook(generation);
+            }
         }
         let _ = done.send(true);
     }

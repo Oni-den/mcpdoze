@@ -526,7 +526,8 @@ fn dispatch(ctx: &ReadCtx, mut msg: Value) {
         }
         Kind::Notification => {
             let sessions = lock(&ctx.pending).sessions();
-            ctx.events.notification_from(&ctx.server, msg, sessions);
+            ctx.events
+                .notification_from(&ctx.server, &ctx.client.scope_key, msg, sessions);
         }
         Kind::Request => {
             let sessions = lock(&ctx.pending).sessions();

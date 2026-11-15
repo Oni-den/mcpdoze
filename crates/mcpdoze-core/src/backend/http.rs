@@ -382,7 +382,8 @@ impl HttpConn {
             }
             Kind::Notification => {
                 let sessions = lock(&self.pending).sessions();
-                self.events.notification_from(&self.server, msg, sessions);
+                self.events
+                    .notification_from(&self.server, &self.client.scope_key, msg, sessions);
                 None
             }
             Kind::Request => {

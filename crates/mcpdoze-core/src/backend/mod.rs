@@ -22,7 +22,7 @@ use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
-pub use lifecycle::{CallGuard, Instance, StateKind, Tuning};
+pub use lifecycle::{CallGuard, Instance, SpawnHook, StateKind, Tuning};
 pub use stdio::{CallError, CallMeta, StdioConn};
 
 /// Default per-request timeout for HTTP backends.
@@ -63,6 +63,10 @@ pub struct ClientSide {
     /// The agent session that owns this instance (per-session scope).
     /// Server-to-client requests go there even with no call in flight.
     pub owner: Option<String>,
+    /// Scope key of the instance (`""` for the shared instance, the session
+    /// id for `per-session`, the normalised directory for `per-cwd`).
+    /// Handed to [`BackendEvents`] with every notification.
+    pub scope_key: String,
 }
 
 impl ClientSide {
@@ -105,6 +109,7 @@ impl fmt::Debug for ClientSide {
             .field("elicitation", &self.elicitation)
             .field("root", &self.root)
             .field("owned", &self.owner.is_some())
+            .field("scoped", &!self.scope_key.is_empty())
             .finish()
     }
 }
@@ -449,16 +454,18 @@ pub struct ServerRequest {
 /// Hooks the backend reader calls for messages that are not responses to
 /// broker requests. The router implements this.
 pub trait BackendEvents: Send + Sync + 'static {
-    /// A notification from backend `server` (progress, list_changed, log).
-    fn notification(&self, server: &str, msg: Value) {
-        let _ = (server, msg);
+    /// A notification from backend `server` (progress, list_changed, log),
+    /// from the instance with scope key `scope_key` (see
+    /// [`ClientSide::scope_key`]).
+    fn notification(&self, server: &str, scope_key: &str, msg: Value) {
+        let _ = (server, scope_key, msg);
     }
 
     /// A notification plus the agent sessions with calls in flight on the
     /// connection it arrived on. Defaults to [`notification`](Self::notification).
-    fn notification_from(&self, server: &str, msg: Value, sessions: Vec<String>) {
+    fn notification_from(&self, server: &str, scope_key: &str, msg: Value, sessions: Vec<String>) {
         let _ = sessions;
-        self.notification(server, msg);
+        self.notification(server, scope_key, msg);
     }
 
     /// A server-to-client request the broker does not answer itself. The
