@@ -5,8 +5,14 @@
 MCPDoze is a small Rust broker that sits between your AI agents and your
 [Model Context Protocol](https://modelcontextprotocol.io) servers.
 
-> Status: **pre-alpha, planning stage.** Nothing here is usable yet. See
-> [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md).
+> Status: **pre-alpha.** The data path, lifecycle, catalog, admin API, CLI,
+> HTTP passthrough, migration skill and optional guardrail hook work and are
+> tested on Windows. Not yet done: `per-cwd` / `per-session` scopes
+> (currently served as `shared`), routing of server-to-client requests such
+> as sampling, release binaries, and Linux/macOS verification. See
+> [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) and the measured
+> [case study](docs/CASE_STUDY.md): two sessions, 741 MB without MCPDoze
+> versus 394 MB with it, and about 6 MB after the idle unload.
 
 ## The problem
 
