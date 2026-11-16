@@ -18,9 +18,10 @@ use tokio::task::JoinHandle;
 use crate::admin::Control;
 use crate::auth::{self, Token};
 use crate::backend::Tuning;
-use crate::config::{self, BrokerConfig, Config, ConfigError};
+use crate::config::{self, BrokerConfig, Config, ConfigError, StatsConfig};
 use crate::http::{self, Security};
 use crate::router::{Catalog, DiskCatalog, MemoryCatalog, Router};
+use crate::stats::Stats;
 
 /// Quiet period after a config-file event before reloading.
 pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -30,6 +31,8 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 pub const DEFAULT_TOKEN_FILE: &str = "token";
 /// Catalog directory name in the data directory when `catalog_dir` is not set.
 pub const DEFAULT_CATALOG_DIR: &str = "catalog";
+/// Longest wait for the statistics log on shutdown.
+const STATS_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How to run the broker.
 #[derive(Clone)]
@@ -258,6 +261,34 @@ fn watch_config(
     Ok((watcher, task))
 }
 
+/// Starts the statistics log when `[stats] enabled`.
+fn start_stats(router: &Arc<Router>, cfg: &StatsConfig) {
+    if !cfg.enabled {
+        tracing::info!("statistics log disabled");
+        return;
+    }
+    let Some(dir) = cfg.resolved_dir() else {
+        tracing::warn!("cannot determine the data directory; statistics log disabled");
+        return;
+    };
+    match Stats::start(cfg, dir.clone()) {
+        Ok(st) => {
+            tracing::info!(path = %dir.display(), "statistics log");
+            router.set_stats(st);
+        }
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "cannot start the statistics log")
+        }
+    }
+}
+
+/// Writes out buffered statistics (bounded wait).
+async fn flush_stats(control: &Control) {
+    if let Some(st) = control.router().stats() {
+        let _ = tokio::task::spawn_blocking(move || st.flush(STATS_FLUSH_TIMEOUT)).await;
+    }
+}
+
 impl Daemon {
     /// Loads the config, binds and starts serving.
     pub async fn start(opts: ServeOptions) -> Result<Daemon, DaemonError> {
@@ -304,6 +335,7 @@ impl Daemon {
             None => default_catalog(&cfg.broker),
         };
         let router = Router::with(catalog, opts.tuning);
+        start_stats(&router, &cfg.stats);
         let security = Security::new(token, cfg.broker.allowed_hosts.clone());
         let control = Control::new(router, cfg, path.clone());
         let applied = control.apply_initial().await;
@@ -360,6 +392,7 @@ impl Daemon {
             res = &mut task => {
                 self.stop_watcher();
                 self.control.shutdown().await;
+                flush_stats(&self.control).await;
                 return res.unwrap_or_else(|e| Err(io::Error::other(e)));
             }
         }
@@ -394,6 +427,7 @@ impl Daemon {
         // `serve` already stopped the backends unless it was aborted; this
         // is idempotent.
         self.control.shutdown().await;
+        flush_stats(&self.control).await;
         tracing::info!("mcpdoze stopped");
         res
     }

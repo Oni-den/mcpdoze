@@ -281,9 +281,10 @@ fn toml_str(s: &str) -> String {
 
 fn broker_toml(dir: &Path) -> String {
     format!(
-        "[broker]\nbind = \"127.0.0.1:0\"\ntoken_file = {}\ncatalog_dir = {}\n",
+        "[broker]\nbind = \"127.0.0.1:0\"\ntoken_file = {}\ncatalog_dir = {}\n\n[stats]\ndir = {}\n\n",
         toml_str(&dir.join("token").to_string_lossy()),
-        toml_str(&dir.join("catalog").to_string_lossy())
+        toml_str(&dir.join("catalog").to_string_lossy()),
+        toml_str(&dir.join("stats").to_string_lossy())
     )
 }
 

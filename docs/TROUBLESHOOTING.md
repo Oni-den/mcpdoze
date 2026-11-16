@@ -2,8 +2,10 @@
 
 Start with `mcpdoze doctor`. It checks the config file, the token file (and its
 permissions), whether the broker answers and accepts the token, whether the
-port is free, whether each server's command is on `PATH`, and whether the
-environment variables it references are set. Each line is `ok`, `warn` or
+port is free, where the background daemon's log and the statistics log are
+(and, on Windows, whether `mcpdozed.exe` is installed next to `mcpdoze.exe`),
+whether each server's command is on `PATH`, and whether the environment
+variables it references are set. Each line is `ok`, `warn` or
 `FAIL`, and failures carry a `hint:`. It exits non-zero when a check failed.
 
 ```text
@@ -30,6 +32,32 @@ Symptoms: `mcpdoze status` or the agent cannot connect.
   task (Windows Task Scheduler), `systemctl --user status mcpdoze.service`
   (Linux) or the LaunchAgent (macOS). Variables the servers need must exist in
   the environment of that autostarted process, not only in your shell.
+
+## Where is the log of the autostarted broker?
+
+`mcpdoze autostart install` registers the console-less daemon `mcpdozed`
+on Windows (no terminal window). It cannot write to a console, so it logs to
+a file:
+
+- `<data dir>/logs/mcpdozed.log`, or `mcpdozed.log` in `broker.log_dir` when
+  set. `mcpdoze doctor` prints the exact path.
+- The data directory is `%APPDATA%\mcpdoze\data` on Windows,
+  `~/.local/share/mcpdoze` on Linux and `~/Library/Application Support/mcpdoze`
+  on macOS.
+- The file is rotated at 5 MB; `mcpdozed.log.1` .. `mcpdozed.log.5` keep the
+  older parts. Panics are written there too, with a backtrace.
+- More detail: set `MCPDOZE_LOG=debug` in the environment the task starts
+  with, or run `mcpdoze serve` in a terminal to watch the log live (stop the
+  task first: `schtasks /End /TN MCPDoze`).
+- If the task still opens a console window, `mcpdozed.exe` was missing when
+  autostart was installed: `install` then falls back to `mcpdoze serve` and
+  says so. Put `mcpdozed.exe` (from the release archive, or
+  `cargo install` builds it) next to `mcpdoze.exe` and run
+  `mcpdoze autostart install` again; it replaces the existing task.
+
+On Linux and macOS autostart keeps running `mcpdoze serve`: its output goes
+to the journal (`journalctl --user -u mcpdoze.service`) or to
+`~/Library/Logs/mcpdoze.log`.
 
 ## 401 or 403
 

@@ -233,6 +233,18 @@ fn resume_threads(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Memory of the calling process alone.
+pub(super) fn self_memory() -> TreeMemory {
+    match process_memory(std::process::id()) {
+        Some((rss, private)) => TreeMemory {
+            rss_bytes: rss,
+            private_bytes: private,
+            process_count: 1,
+        },
+        None => TreeMemory::default(),
+    }
+}
+
 /// Working set and private bytes of one process, if it can be opened.
 fn process_memory(pid: u32) -> Option<(u64, u64)> {
     // SAFETY: plain open by pid; the result is checked before use.

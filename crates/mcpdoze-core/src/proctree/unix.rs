@@ -159,6 +159,32 @@ impl Tree {
     }
 }
 
+/// Memory of the calling process alone.
+pub(super) fn self_memory() -> TreeMemory {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = std::process::id();
+    let Ok(mut sys) = System::new() else {
+        return TreeMemory::default();
+    };
+    let p = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[p]),
+        true,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
+    match sys.process(p) {
+        Some(proc_) => {
+            let rss = proc_.memory();
+            TreeMemory {
+                rss_bytes: rss,
+                private_bytes: private_bytes(pid).unwrap_or(rss),
+                process_count: 1,
+            }
+        }
+        None => TreeMemory::default(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn private_bytes(pid: u32) -> Option<u64> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;

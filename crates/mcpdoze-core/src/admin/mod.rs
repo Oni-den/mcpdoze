@@ -29,7 +29,7 @@ use axum::routing::{get, post};
 use axum::Json;
 
 use crate::backend::stdio::STDERR_LINES;
-use crate::backend::{BackendSpec, Conn, Instance, StateKind};
+use crate::backend::{BackendSpec, Conn, Instance, StateKind, UnloadReason};
 use crate::config::{self, Config, ServerConfig, Transport};
 use crate::router::{scope_name, CatalogOptions, Router, ScopeOptions, Server};
 use api::*;
@@ -326,10 +326,10 @@ async fn server_status(server: &Server) -> ServerStatus {
 }
 
 /// Unloads `instances` concurrently, each draining for at most `timeout`.
-async fn unload_all(instances: Vec<Arc<Instance>>, timeout: Duration) {
+async fn unload_all(instances: Vec<Arc<Instance>>, timeout: Duration, reason: UnloadReason) {
     let mut set = tokio::task::JoinSet::new();
     for inst in instances {
-        set.spawn(async move { inst.drain(timeout).await });
+        set.spawn(async move { inst.drain_for(timeout, reason).await });
     }
     while set.join_next().await.is_some() {}
 }
@@ -348,6 +348,7 @@ impl Control {
                 config: Config {
                     broker: config.broker.clone(),
                     servers: BTreeMap::new(),
+                    stats: config.stats.clone(),
                 },
                 pending: Some(config),
                 ..ControlState::default()
@@ -369,15 +370,23 @@ impl Control {
     pub async fn apply_initial(&self) -> ReloadResponse {
         let mut st = self.state.lock().await;
         let pending = st.pending.take().unwrap_or_default();
-        self.apply(&mut st, pending).await
+        self.apply(&mut st, pending, UnloadReason::Reload).await
     }
 
     /// Diffs `new` against what is registered and applies it.
-    async fn apply(&self, st: &mut ControlState, new: Config) -> ReloadResponse {
+    async fn apply(
+        &self,
+        st: &mut ControlState,
+        new: Config,
+        reason: UnloadReason,
+    ) -> ReloadResponse {
         let mut resp = ReloadResponse {
             restart_required: broker_restart_fields(&st.config.broker, &new.broker),
             ..ReloadResponse::default()
         };
+        if st.config.stats != new.stats {
+            resp.restart_required.push("stats".to_owned());
+        }
         let mut desired = BTreeMap::new();
         let mut skipped = BTreeMap::new();
         for (name, s) in &new.servers {
@@ -431,7 +440,7 @@ impl Control {
                 self.router.forget_catalog(name);
             }
         }
-        unload_all(unload, RELOAD_DRAIN_TIMEOUT).await;
+        unload_all(unload, RELOAD_DRAIN_TIMEOUT, reason).await;
         let mut applied = BTreeMap::new();
         for (name, d) in desired {
             let unchanged = st.applied.get(&name) == Some(&d);
@@ -497,7 +506,7 @@ impl Control {
         text.validate().map_err(|e| {
             ControlError::Invalid("config file is invalid".into(), validation_details(e))
         })?;
-        Ok(self.apply(&mut st, text).await)
+        Ok(self.apply(&mut st, text, UnloadReason::Reload).await)
     }
 
     /// Registers a server (persisted when a config file is set).
@@ -545,7 +554,7 @@ impl Control {
             }
             _ => false,
         };
-        self.apply(&mut st, candidate).await;
+        self.apply(&mut st, candidate, UnloadReason::Reload).await;
         let entry = self.entry(&st, &name);
         if let Some(e) = &entry.error {
             if server.enabled {
@@ -573,7 +582,7 @@ impl Control {
                     .map_err(|e| ControlError::Io(e.to_string()))?
                     .ok_or_else(|| ControlError::NotFound(name.to_owned()))?;
                 write_config_text(p, new_text).await?;
-                self.apply(&mut st, candidate).await;
+                self.apply(&mut st, candidate, UnloadReason::Stop).await;
                 return Ok(RemoveResponse {
                     name: name.to_owned(),
                     persisted: true,
@@ -582,7 +591,7 @@ impl Control {
         } else if st.config.servers.contains_key(name) {
             let mut candidate = st.config.clone();
             candidate.servers.remove(name);
-            self.apply(&mut st, candidate).await;
+            self.apply(&mut st, candidate, UnloadReason::Stop).await;
             return Ok(RemoveResponse {
                 name: name.to_owned(),
                 persisted: false,
@@ -596,7 +605,12 @@ impl Control {
         match self.router.unregister(name) {
             Some(server) => {
                 self.router.forget_catalog(name);
-                unload_all(server.all_instances(), STOP_DRAIN_TIMEOUT).await;
+                unload_all(
+                    server.all_instances(),
+                    STOP_DRAIN_TIMEOUT,
+                    UnloadReason::Stop,
+                )
+                .await;
                 Ok(RemoveResponse {
                     name: name.to_owned(),
                     persisted: false,
@@ -619,7 +633,7 @@ impl Control {
                 inst.shutdown().await;
             }
         } else {
-            unload_all(all, STOP_DRAIN_TIMEOUT).await;
+            unload_all(all, STOP_DRAIN_TIMEOUT, UnloadReason::Stop).await;
         }
         Ok(StopResponse {
             name: name.to_owned(),
@@ -733,6 +747,29 @@ impl Control {
         }
     }
 
+    /// Summary of the statistics log over `since` (a duration such as
+    /// `7d`; [`DEFAULT_STATS_SINCE`] when `None`). Buffered events are
+    /// flushed first.
+    pub async fn stats(&self, since: Option<&str>) -> Result<StatsResponse, ControlError> {
+        let st = self.router.stats().ok_or_else(|| {
+            ControlError::Conflict(
+                "the statistics log is disabled ([stats] enabled = false)".into(),
+            )
+        })?;
+        let since = since.unwrap_or(DEFAULT_STATS_SINCE);
+        let period = config::parse_duration(since)
+            .map_err(|e| ControlError::Invalid("invalid `since`".into(), vec![e]))?;
+        tokio::task::spawn_blocking(move || {
+            st.flush(Duration::from_secs(1));
+            let until = crate::stats::now_ms();
+            let from = until.saturating_sub(period.as_millis() as u64);
+            crate::stats::summarize_dir(st.dir(), from, until)
+        })
+        .await
+        .map_err(|e| ControlError::Io(e.to_string()))?
+        .map_err(|e| ControlError::Io(format!("cannot read the statistics log: {e}")))
+    }
+
     /// Stops every backend (broker shutdown).
     pub async fn shutdown(&self) {
         self.router.shutdown().await;
@@ -753,6 +790,7 @@ pub fn routes(control: Arc<Control>) -> axum::Router {
         .route("/servers/{name}/refresh", post(post_refresh_one))
         .route("/reload", post(post_reload))
         .route("/refresh", post(post_refresh_all))
+        .route("/stats", get(get_stats))
         .with_state(control)
 }
 
@@ -765,6 +803,13 @@ async fn post_refresh_one(
 
 async fn post_refresh_all(State(c): State<Arc<Control>>) -> Json<RefreshResponse> {
     Json(c.refresh_all().await)
+}
+
+async fn get_stats(
+    State(c): State<Arc<Control>>,
+    Query(q): Query<StatsQuery>,
+) -> Result<Json<StatsResponse>, ControlError> {
+    c.stats(q.since.as_deref()).await.map(Json)
 }
 
 async fn get_status(State(c): State<Arc<Control>>) -> Json<StatusResponse> {

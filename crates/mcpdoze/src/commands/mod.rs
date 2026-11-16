@@ -13,14 +13,16 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use anyhow::{anyhow, bail, Result};
-use mcpdoze_core::admin::api::{RegisterRequest, ServerEntry, ServerStatus, StatusResponse};
+use mcpdoze_core::admin::api::{
+    RegisterRequest, ServerEntry, ServerStatus, StatsResponse, StatusResponse,
+};
 use mcpdoze_core::config::{
     parse_duration, EnvValue, Scope, ServerConfig, Transport, ValidationError,
 };
 
 use crate::cli::{
-    AddArgs, Command, ConnArgs, ListArgs, LogsArgs, NameArgs, RefreshArgs, ScopeArg, StatusArgs,
-    StopArgs, TokenArgs, TransportArg,
+    AddArgs, Command, ConnArgs, ListArgs, LogsArgs, NameArgs, RefreshArgs, ScopeArg, StatsArgs,
+    StatusArgs, StopArgs, TokenArgs, TransportArg,
 };
 use crate::client::{Client, Conn, TokenSource};
 use table::Table;
@@ -43,6 +45,7 @@ pub async fn run(cmd: Command, out: &mut dyn Write, stdout_is_tty: bool) -> Resu
         Command::Logs(a) => logs(a, out).await.map(|()| OK),
         Command::Token(a) => token(a, out, stdout_is_tty).map(|()| OK),
         Command::Doctor(c) => doctor::run(c, out).await,
+        Command::Stats(a) => stats(a, out).await.map(|()| OK),
         Command::Autostart { action } => {
             let msg = match action {
                 crate::cli::AutostartCmd::Install { config, bind } => {
@@ -180,7 +183,106 @@ pub fn render_list(servers: &[ServerEntry]) -> String {
     t.render()
 }
 
+fn fmt_rate(r: f64) -> String {
+    format!("{:.1}", r * 100.0)
+}
+
+/// Renders the `stats` summary (`period` as typed, e.g. `7d`).
+pub fn render_stats(s: &StatsResponse, period: &str) -> String {
+    let mut o = format!("statistics for the last {period} ({} events)\n", s.events);
+    if s.servers.is_empty() {
+        o.push_str("no calls logged\n");
+    } else {
+        let mut t = Table::new(&[
+            "SERVER", "CALLS", "ERR%", "P50_MS", "P95_MS", "COLD", "COLD%", "SPAWNS", "UNLOADS",
+        ]);
+        for v in &s.servers {
+            let unloads = if v.unloads.is_empty() {
+                "-".to_owned()
+            } else {
+                v.unloads
+                    .iter()
+                    .map(|(k, n)| format!("{k}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            t.row(vec![
+                v.server.clone(),
+                v.calls.to_string(),
+                fmt_rate(v.error_rate),
+                v.p50_ms.to_string(),
+                v.p95_ms.to_string(),
+                v.cold_starts.to_string(),
+                fmt_rate(v.cold_start_rate),
+                v.spawns.to_string(),
+                unloads,
+            ]);
+        }
+        o.push_str(&t.render());
+    }
+    let m = &s.memory;
+    if m.samples == 0 {
+        o.push_str("memory: no samples yet\n");
+    } else {
+        o.push_str(&format!(
+            "memory ({} samples): broker-side avg {:.1} MB, peak {:.1} MB; \
+             estimated direct avg {:.1} MB, peak {:.1} MB\n",
+            m.samples, m.avg_actual_mb, m.peak_actual_mb, m.avg_est_direct_mb, m.peak_est_direct_mb
+        ));
+        o.push_str(&format!(
+            "saved: avg {:.1} MB, {:.1} MB-hours in total (estimate; see docs/STATS.md)\n",
+            m.avg_saved_mb, m.mb_hours_saved
+        ));
+    }
+    o.push_str(&format!(
+        "sessions: {} opened, peak {} at once",
+        s.sessions_opened, s.peak_sessions
+    ));
+    if s.dropped > 0 {
+        o.push_str(&format!("; {} events dropped (queue full)", s.dropped));
+    }
+    o.push('\n');
+    o
+}
+
 // --------------------------------------------------------------- commands
+
+async fn stats(a: StatsArgs, out: &mut dyn Write) -> Result<()> {
+    let period = parse_duration(&a.since).map_err(|e| anyhow!("--since: {e}"))?;
+    let conn = Conn::resolve(&a.conn);
+    let from_broker = match Client::new(&conn) {
+        Ok(c) => c.stats(&a.since).await,
+        Err(e) => Err(e),
+    };
+    let (summary, note) = match from_broker {
+        Ok(s) => (s, None),
+        Err(e) => {
+            let cfg = conn.config.as_ref().and_then(|c| c.as_ref().ok());
+            let dir = cfg
+                .map(|c| c.stats.clone())
+                .unwrap_or_default()
+                .resolved_dir()
+                .filter(|d| d.is_dir());
+            let Some(dir) = dir else { return Err(e) };
+            let until = mcpdoze_core::stats::now_ms();
+            let from = until.saturating_sub(period.as_millis() as u64);
+            let s = mcpdoze_core::stats::summarize_dir(&dir, from, until)?;
+            (
+                s,
+                Some(format!("(broker not available; read {})", dir.display())),
+            )
+        }
+    };
+    if a.json {
+        writeln!(out, "{}", serde_json::to_string_pretty(&summary)?)?;
+    } else {
+        if let Some(n) = note {
+            writeln!(out, "{n}")?;
+        }
+        write!(out, "{}", render_stats(&summary, &a.since))?;
+    }
+    Ok(())
+}
 
 async fn status(a: StatusArgs, out: &mut dyn Write) -> Result<()> {
     let st: StatusResponse = client(&a.conn)?.status().await?;

@@ -24,7 +24,9 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 pub use crate::config::SubscriptionPolicy;
-pub use lifecycle::{CallGuard, Instance, SpawnHook, StateKind, Tuning};
+pub use lifecycle::{
+    CallGuard, Instance, LifecycleEvent, LifecycleHook, SpawnHook, StateKind, Tuning, UnloadReason,
+};
 pub use stdio::{CallError, CallMeta, StdioConn};
 
 /// Default per-request timeout for HTTP backends.

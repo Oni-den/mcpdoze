@@ -42,6 +42,9 @@ pub enum Command {
     Token(TokenArgs),
     /// Check the installation and explain how to fix problems.
     Doctor(ConnArgs),
+    /// Summarise the statistics log (calls, latency, cold starts, memory
+    /// saved versus per-session servers).
+    Stats(StatsArgs),
     /// Start the broker automatically at login.
     Autostart {
         /// Install or remove.
@@ -58,19 +61,8 @@ pub enum Command {
     },
 }
 
-/// `mcpdoze serve`.
-#[derive(Debug, Args)]
-pub struct ServeArgs {
-    /// Config file [default: $MCPDOZE_CONFIG, else <config dir>/mcpdoze/config.toml].
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-    /// Listen address, overriding `broker.bind` (e.g. 127.0.0.1:7878).
-    #[arg(long, value_name = "ADDR")]
-    pub bind: Option<String>,
-    /// Do not watch the config file for changes.
-    #[arg(long)]
-    pub no_watch: bool,
-}
+/// `mcpdoze serve` (shared with `mcpdozed`).
+pub use mcpdoze::run::ServeArgs;
 
 /// How a client command finds the broker.
 #[derive(Debug, Clone, Default, Args)]
@@ -94,6 +86,21 @@ pub struct StatusArgs {
     #[command(flatten)]
     pub conn: ConnArgs,
     /// Print the raw JSON response.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `mcpdoze stats`.
+#[derive(Debug, Args)]
+pub struct StatsArgs {
+    /// Connection options (the log files are read directly when the broker
+    /// is not reachable).
+    #[command(flatten)]
+    pub conn: ConnArgs,
+    /// Period to summarise (e.g. 7d, 12h, 90m).
+    #[arg(long, value_name = "DURATION", default_value = "7d")]
+    pub since: String,
+    /// Print the raw JSON summary.
     #[arg(long)]
     pub json: bool,
 }
@@ -472,6 +479,12 @@ mod tests {
         assert!(matches!(parse(&["status", "--json"]), Command::Status(s) if s.json));
         assert!(matches!(parse(&["doctor"]), Command::Doctor(_)));
         assert!(matches!(parse(&["reload"]), Command::Reload(_)));
+        let Command::Stats(a) = parse(&["stats", "--since", "30d", "--json"]) else {
+            panic!()
+        };
+        assert_eq!(a.since, "30d");
+        assert!(a.json);
+        assert!(matches!(parse(&["stats"]), Command::Stats(s) if s.since == "7d" && !s.json));
     }
 
     #[test]

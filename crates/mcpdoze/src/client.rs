@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use mcpdoze_core::admin::api::{
     ErrorResponse, LogsResponse, RegisterRequest, RegisterResponse, ReloadResponse, RemoveResponse,
-    ServersResponse, StatusResponse, StopResponse, BASE,
+    ServersResponse, StatsResponse, StatusResponse, StopResponse, BASE,
 };
 use mcpdoze_core::config::{self, Config};
 use mcpdoze_core::daemon::DEFAULT_TOKEN_FILE;
@@ -274,6 +274,12 @@ impl Client {
             req = req.query(&[("force", "true")]);
         }
         self.json(req).await
+    }
+
+    /// `GET /stats?since=...`.
+    pub async fn stats(&self, since: &str) -> Result<StatsResponse> {
+        self.json(self.http.get(self.url("/stats")).query(&[("since", since)]))
+            .await
     }
 
     /// `POST /reload`.

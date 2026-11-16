@@ -170,6 +170,68 @@ pub async fn run(args: ConnArgs, out: &mut dyn Write) -> Result<u8> {
         }
     }
 
+    // Background daemon, its log and the statistics log.
+    match mcpdoze::run::daemon_log_path(config) {
+        Some(p) => match std::fs::metadata(&p) {
+            Ok(m) => r.add(
+                Level::Ok,
+                format!(
+                    "daemon log (mcpdozed): {} ({} KB)",
+                    p.display(),
+                    m.len().div_ceil(1024)
+                ),
+                None,
+            ),
+            Err(_) => r.add(
+                Level::Ok,
+                format!("daemon log (mcpdozed): {} (not created yet)", p.display()),
+                None,
+            ),
+        },
+        None => r.add(
+            Level::Warn,
+            "cannot determine the daemon log directory",
+            Some("set `broker.log_dir` in the config"),
+        ),
+    }
+    if cfg!(windows) {
+        if let Ok(exe) = std::env::current_exe() {
+            match crate::autostart::daemon_next_to(&exe) {
+                Some(d) => r.add(
+                    Level::Ok,
+                    format!("background daemon {} found", d.display()),
+                    None,
+                ),
+                None => r.add(
+                    Level::Warn,
+                    format!("{} not found next to mcpdoze.exe", crate::autostart::DAEMON_EXE),
+                    Some("`mcpdoze autostart install` then runs `mcpdoze serve`, which keeps a console window open; copy it from the release archive"),
+                ),
+            }
+        }
+    }
+    let stats = config.map(|c| c.stats.clone()).unwrap_or_default();
+    if !stats.enabled {
+        r.add(
+            Level::Ok,
+            "statistics log disabled ([stats] enabled = false)",
+            None,
+        );
+    } else {
+        match stats.resolved_dir() {
+            Some(d) => r.add(
+                Level::Ok,
+                format!("statistics log: {} (`mcpdoze stats`)", d.display()),
+                None,
+            ),
+            None => r.add(
+                Level::Warn,
+                "cannot determine the statistics directory",
+                Some("set `[stats] dir` in the config"),
+            ),
+        }
+    }
+
     // Servers.
     if let Some(cfg) = config {
         for (name, s) in &cfg.servers {

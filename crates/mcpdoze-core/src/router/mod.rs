@@ -72,6 +72,7 @@ pub mod naming;
 mod session;
 mod subs;
 pub mod uri;
+mod usage;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -399,6 +400,8 @@ pub struct Router {
     subs: subs::Subscriptions,
     /// 2026-07-28 sessions of requests and listen streams in progress.
     live: Mutex<HashMap<String, Weak<Session>>>,
+    /// Statistics log, when enabled.
+    stats: RwLock<Option<Arc<crate::stats::Stats>>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -439,6 +442,7 @@ impl Router {
             next_client_id: AtomicU64::new(1),
             subs: subs::Subscriptions::default(),
             live: Mutex::new(HashMap::new()),
+            stats: RwLock::new(None),
         })
     }
 
@@ -683,7 +687,9 @@ impl Router {
             old.end();
             old.cancel_all();
             self.drop_session_instances(&old.id);
+            self.record_session(false);
         }
+        self.record_session(true);
         self.start_reaper();
         session
     }
@@ -780,6 +786,7 @@ impl Router {
                 s.end();
                 s.cancel_all();
                 self.drop_session_instances(id);
+                self.record_session(false);
                 true
             }
             None => false,

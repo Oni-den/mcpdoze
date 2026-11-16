@@ -8,3 +8,4 @@ pub mod http;
 pub mod import;
 pub mod proctree;
 pub mod router;
+pub mod stats;

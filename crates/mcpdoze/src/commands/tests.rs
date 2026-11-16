@@ -262,8 +262,9 @@ async fn start(extra: &str) -> Env {
     let token_file = dir.path().join("token");
     let config = dir.path().join("config.toml");
     let text = format!(
-        "[broker]\nbind = \"127.0.0.1:0\"\ntoken_file = '{}'\n{extra}",
-        token_file.display()
+        "[broker]\nbind = \"127.0.0.1:0\"\ntoken_file = '{}'\n{extra}\n[stats]\ndir = '{}'\n",
+        token_file.display(),
+        dir.path().join("stats").display()
     );
     std::fs::write(&config, text).unwrap();
     let daemon = Daemon::start(ServeOptions {
@@ -509,4 +510,91 @@ async fn wrong_token_is_reported_without_printing_it() {
     assert!(e.contains("rejected the token"), "{e}");
     assert!(!e.contains("offline-test-token"));
     env.daemon.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_command_reads_broker_then_files() {
+    let env = start("").await;
+    let (r, out) = exec(with_conn(&env, &["stats"])).await;
+    assert_eq!(r.unwrap(), OK, "{out}");
+    assert!(out.starts_with("statistics for the last 7d"), "{out}");
+    assert!(out.contains("no calls logged"), "{out}");
+    let (r, out) = exec(with_conn(&env, &["stats", "--json", "--since", "1h"])).await;
+    assert_eq!(r.unwrap(), OK, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["memory"]["samples"].is_u64(), "{v}");
+    let (r, _) = exec(with_conn(&env, &["stats", "--since", "soon"])).await;
+    assert!(r.unwrap_err().to_string().contains("--since"));
+
+    // Broker gone: the files are summarised directly.
+    let addr = env.daemon.local_addr();
+    let Env {
+        _dir,
+        config,
+        token_file,
+        daemon,
+        ..
+    } = env;
+    daemon.shutdown().await.unwrap();
+    let cmd = parse(&[
+        "stats",
+        "--url",
+        &format!("http://{addr}"),
+        "--token-file",
+        &token_file.display().to_string(),
+        "--config",
+        &config.display().to_string(),
+    ]);
+    let (r, out) = exec(cmd).await;
+    assert_eq!(r.unwrap(), OK, "{out}");
+    assert!(out.contains("broker not available; read"), "{out}");
+    assert!(
+        out.contains("1 opened") || out.contains("0 opened"),
+        "{out}"
+    );
+}
+
+#[test]
+fn stats_rendering() {
+    use mcpdoze_core::stats::{MemorySummary, ServerSummary, Summary};
+    let s = Summary {
+        events: 12,
+        sessions_opened: 2,
+        peak_sessions: 2,
+        dropped: 1,
+        servers: vec![ServerSummary {
+            server: "example".into(),
+            calls: 10,
+            errors: 1,
+            error_rate: 0.1,
+            p50_ms: 4,
+            p95_ms: 40,
+            cold_starts: 2,
+            cold_start_rate: 0.2,
+            spawns: 2,
+            unloads: [("idle".to_owned(), 2)].into_iter().collect(),
+        }],
+        memory: MemorySummary {
+            samples: 3,
+            avg_actual_mb: 50.0,
+            peak_actual_mb: 60.0,
+            avg_est_direct_mb: 120.0,
+            peak_est_direct_mb: 150.0,
+            avg_saved_mb: 70.0,
+            mb_hours_saved: 3.5,
+        },
+        ..Summary::default()
+    };
+    let out = render_stats(&s, "7d");
+    assert!(
+        out.contains("statistics for the last 7d (12 events)"),
+        "{out}"
+    );
+    assert!(out.contains("example"), "{out}");
+    assert!(
+        out.contains("10.0") && out.contains("20.0") && out.contains("idle:2"),
+        "{out}"
+    );
+    assert!(out.contains("3.5 MB-hours"), "{out}");
+    assert!(out.contains("1 events dropped"), "{out}");
 }

@@ -215,6 +215,20 @@ pub struct RefreshResponse {
     pub servers: Vec<RefreshResult>,
 }
 
+/// `GET /stats` query.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StatsQuery {
+    /// Period to summarise, a duration such as `7d` or `12h` (default
+    /// [`DEFAULT_STATS_SINCE`]).
+    pub since: Option<String>,
+}
+
+/// Default period of `GET /stats` and `mcpdoze stats`.
+pub const DEFAULT_STATS_SINCE: &str = "7d";
+
+/// `GET /stats` response (see `docs/STATS.md`).
+pub use crate::stats::Summary as StatsResponse;
+
 /// `GET /servers/{name}/logs` query.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LogsQuery {

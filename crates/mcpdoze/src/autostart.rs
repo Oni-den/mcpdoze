@@ -3,7 +3,10 @@
 //! `mcpdoze autostart install|remove`: a per-user, no-admin login service.
 //!
 //! * Windows: Task Scheduler logon task `MCPDoze` (XML imported with
-//!   `schtasks`, hidden, restart on failure, no time limit).
+//!   `schtasks`, hidden, restart on failure, no time limit) running
+//!   `mcpdozed.exe` (no console window) from next to `mcpdoze.exe`; falls
+//!   back to `mcpdoze.exe serve` when it is missing. Re-installing replaces
+//!   the task and restarts it.
 //! * Linux: systemd user unit `mcpdoze.service`.
 //! * macOS: LaunchAgent `dev.mcpdoze.broker`.
 //!
@@ -22,6 +25,12 @@ pub const TASK_NAME: &str = "MCPDoze";
 pub const UNIT_NAME: &str = "mcpdoze.service";
 /// launchd label.
 pub const LAUNCHD_LABEL: &str = "dev.mcpdoze.broker";
+/// File name of the console-less daemon, expected next to the CLI.
+pub const DAEMON_EXE: &str = if cfg!(windows) {
+    "mcpdozed.exe"
+} else {
+    "mcpdozed"
+};
 
 /// Options of `autostart install`.
 #[derive(Debug, Clone, Default)]
@@ -33,10 +42,12 @@ pub struct AutostartOpts {
 /// Registers the broker to start at login. Returns what was done.
 pub fn install(opts: AutostartOpts) -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("cannot determine the mcpdoze executable")?;
-    let args = serve_args(&opts)?;
     if cfg!(windows) {
-        install_windows(&exe, &args)
-    } else if cfg!(target_os = "macos") {
+        let (exe, args, note) = windows_launch(&exe, &opts)?;
+        return install_windows(&exe, &args, note.as_deref());
+    }
+    let args = serve_args(&opts)?;
+    if cfg!(target_os = "macos") {
         install_macos(&exe, &args)
     } else {
         install_linux(&exe, &args)
@@ -57,6 +68,43 @@ pub fn remove() -> anyhow::Result<String> {
 /// Arguments after the executable: `serve [--config P] [--bind A]`.
 fn serve_args(opts: &AutostartOpts) -> anyhow::Result<Vec<String>> {
     let mut a = vec!["serve".to_string()];
+    a.extend(flag_args(opts)?);
+    Ok(a)
+}
+
+/// `mcpdozed` next to `cli_exe`, if it is there.
+pub fn daemon_next_to(cli_exe: &Path) -> Option<PathBuf> {
+    let p = cli_exe.parent()?.join(DAEMON_EXE);
+    p.is_file().then_some(p)
+}
+
+/// What the Windows logon task runs: `mcpdozed.exe [flags]` when it sits
+/// next to `cli_exe`, else `mcpdoze.exe serve [flags]` and a note saying why
+/// a console window will stay open.
+pub fn windows_launch(
+    cli_exe: &Path,
+    opts: &AutostartOpts,
+) -> anyhow::Result<(PathBuf, Vec<String>, Option<String>)> {
+    match daemon_next_to(cli_exe) {
+        Some(d) => Ok((d, flag_args(opts)?, None)),
+        None => {
+            let dir = cli_exe
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let note = format!(
+                "warning: {DAEMON_EXE} was not found in {dir}; the task runs `mcpdoze serve` \
+                 instead, which keeps a console window open. Copy {DAEMON_EXE} from the release \
+                 archive next to mcpdoze.exe and run `mcpdoze autostart install` again."
+            );
+            Ok((cli_exe.to_path_buf(), serve_args(opts)?, Some(note)))
+        }
+    }
+}
+
+/// `[--config P] [--bind A]` (shared by `serve` and `mcpdozed`).
+fn flag_args(opts: &AutostartOpts) -> anyhow::Result<Vec<String>> {
+    let mut a = Vec::new();
     if let Some(c) = &opts.config {
         let abs = std::path::absolute(c).context("cannot resolve --config")?;
         a.push("--config".into());
@@ -300,8 +348,14 @@ fn current_windows_user() -> Option<String> {
     }
 }
 
-fn install_windows(exe: &Path, args: &[String]) -> anyhow::Result<String> {
+fn install_windows(exe: &Path, args: &[String], note: Option<&str>) -> anyhow::Result<String> {
     let xml = windows_task_xml(exe, args, current_windows_user().as_deref());
+    // Re-install: end the running instance first, so the new definition
+    // (possibly another executable) takes over when it is started below.
+    let existed = run_cmd("schtasks", &["/Query", "/TN", TASK_NAME])?.code == Some(0);
+    if existed {
+        let _ = run_cmd("schtasks", &["/End", "/TN", TASK_NAME]);
+    }
     let tmp = std::env::temp_dir().join(format!("mcpdoze-task-{}.xml", std::process::id()));
     std::fs::write(&tmp, utf16le_bom(&xml)).context("cannot write the task XML")?;
     let tmp_s = tmp.to_string_lossy().into_owned();
@@ -312,11 +366,21 @@ fn install_windows(exe: &Path, args: &[String]) -> anyhow::Result<String> {
     let _ = std::fs::remove_file(&tmp);
     must(created?, "schtasks /Create")?;
     let started = run_cmd("schtasks", &["/Run", "/TN", TASK_NAME])?;
-    let mut out = format!(
+    let mut out = String::new();
+    if existed {
+        out.push_str(&format!(
+            "Ran: schtasks /End /TN {TASK_NAME} (replacing the existing task)\n"
+        ));
+    }
+    out.push_str(&format!(
         "Ran: schtasks /Create /TN {TASK_NAME} /XML <generated file> /F\nRegistered logon task `{TASK_NAME}` running: {} {}\n",
         exe.display(),
         args.join(" ")
-    );
+    ));
+    if let Some(n) = note {
+        out.push_str(n);
+        out.push('\n');
+    }
     if started.code == Some(0) {
         out.push_str(&format!(
             "Ran: schtasks /Run /TN {TASK_NAME} (started now)\n"
@@ -534,6 +598,38 @@ mod tests {
     #[test]
     fn utf16_has_bom() {
         assert_eq!(utf16le_bom("a"), vec![0xFF, 0xFE, b'a', 0]);
+    }
+
+    #[test]
+    fn windows_task_runs_the_daemon_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("mcpdoze.exe");
+        std::fs::write(&cli, b"").unwrap();
+        let opts = AutostartOpts {
+            config: None,
+            bind: Some("127.0.0.1:9".into()),
+        };
+        // Missing: falls back to `mcpdoze serve` with a clear note.
+        let (exe, a, note) = windows_launch(&cli, &opts).unwrap();
+        assert_eq!(exe, cli);
+        assert_eq!(a, ["serve", "--bind", "127.0.0.1:9"]);
+        let note = note.unwrap();
+        assert!(
+            note.contains(DAEMON_EXE) && note.contains("console window"),
+            "{note}"
+        );
+        // Present: the task runs it, without the `serve` subcommand.
+        let daemon = dir.path().join(DAEMON_EXE);
+        std::fs::write(&daemon, b"").unwrap();
+        let (exe, a, note) = windows_launch(&cli, &opts).unwrap();
+        assert_eq!(exe, daemon);
+        assert_eq!(a, ["--bind", "127.0.0.1:9"]);
+        assert!(note.is_none());
+        let xml = windows_task_xml(&exe, &a, Some("EXAMPLE\\user"));
+        assert!(xml.contains(&format!("{DAEMON_EXE}</Command>")), "{xml}");
+        assert!(xml.contains("<Arguments>--bind 127.0.0.1:9</Arguments>"));
+        assert!(xml.contains("<Hidden>true</Hidden>"));
+        assert!(xml.contains("<RestartOnFailure>"));
     }
 
     #[test]

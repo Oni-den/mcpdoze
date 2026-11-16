@@ -216,6 +216,13 @@ impl Drop for ProcessTree {
     }
 }
 
+/// Memory of the broker process itself (same measures as
+/// [`ProcessTree::memory`]). Comparatively slow on Unix; call it from a
+/// blocking context.
+pub fn self_memory() -> TreeMemory {
+    imp::self_memory()
+}
+
 /// Why [`resolve_command`] refused to build a command.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ResolveError {

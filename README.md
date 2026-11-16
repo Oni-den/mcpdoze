@@ -9,7 +9,7 @@
 MCPDoze is a small Rust broker that sits between your AI agents and your
 [Model Context Protocol](https://modelcontextprotocol.io) servers.
 
-> Status: **v0.2.0, early release.** The data path, lifecycle, catalog,
+> Status: **v0.2.1, early release.** The data path, lifecycle, catalog,
 > admin API, CLI, HTTP passthrough, `shared` / `per-cwd` / `per-session`
 > scopes, routing of server-to-client requests (sampling, elicitation,
 > roots), migration skill with rollback and the optional guardrail hook work.
@@ -68,9 +68,10 @@ caveats and run the script with your own servers.
 ## Quick start
 
 **1. Install.** Download the archive for your platform from the repository's
-Releases page (it contains the `mcpdoze` binary, `LICENSE` and the migration
-skill) and put the binary on your `PATH`, or build from source (Rust stable;
-on Linux also `pkg-config` and `libssl-dev`):
+Releases page (it contains the `mcpdoze` binary, on Windows also the
+console-less `mcpdozed.exe` used for autostart, `LICENSE` and the migration
+skill) and put the binaries on your `PATH`, or build from source (Rust
+stable; on Linux also `pkg-config` and `libssl-dev`):
 
 ```text
 cargo install --git https://github.com/Oni-den/mcpdoze mcpdoze
@@ -85,7 +86,9 @@ mcpdoze serve
 
 To start it at login instead (Windows logon task, systemd user unit on Linux,
 LaunchAgent on macOS; no administrator rights): `mcpdoze autostart install`.
-Remove it with `mcpdoze autostart remove`.
+On Windows the task runs `mcpdozed.exe`, the same broker without a console
+window, which logs to `<data dir>/logs/mcpdozed.log` (`mcpdoze doctor` shows
+where). Remove it with `mcpdoze autostart remove`.
 
 **3. Register a server.** Everything after `--` is the server's command. Pass
 secrets as the *name* of an environment variable, never the value:
@@ -106,7 +109,13 @@ mcpdoze status       # state, memory and idle countdown per backend
 mcpdoze doctor       # checks config, token, port, commands, env vars
 mcpdoze stop <name>  # unload a backend now (starts again on the next call)
 mcpdoze logs <name>  # last stderr lines of a backend
+mcpdoze stats        # calls, latency, cold starts, memory saved (last 7 days)
 ```
+
+`mcpdoze stats` summarises the broker's statistics log (on by default, no
+arguments or paths recorded): it compares the broker's real memory with an
+estimate of running every server inside each session. See
+[docs/STATS.md](docs/STATS.md).
 
 **5. Point your agent at it.** Agents authenticate with the broker token, read
 from the `MCPDOZE_TOKEN` environment variable. `mcpdoze token` prints the
@@ -134,7 +143,8 @@ the agent at `mcpdoze add`. See [docs/HOOK.md](docs/HOOK.md).
 
 More: [configuration](docs/CONFIGURATION.md),
 [troubleshooting](docs/TROUBLESHOOTING.md),
-[architecture](docs/ARCHITECTURE.md), [admin API](docs/ADMIN_API.md).
+[architecture](docs/ARCHITECTURE.md), [admin API](docs/ADMIN_API.md),
+[statistics](docs/STATS.md).
 
 ## Security model (summary)
 

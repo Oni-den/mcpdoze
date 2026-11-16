@@ -37,7 +37,7 @@ idle_ttl = "5m"
 | `allowed_hosts` | list of strings | `[]` | Extra `Host`/`Origin` host names accepted besides `localhost`, `127.0.0.1`, `[::1]`. Host names or IPs only: no port, wildcard, slash or `@`. |
 | `default_idle_ttl` | duration | `"10m"` | Idle time before a backend is unloaded. Must be above 0. |
 | `start_timeout` | duration | `"60s"` | How long a backend may take to start and initialise before the call fails. Raise it for slow first starts (see TROUBLESHOOTING). |
-| `log_dir` | path | unset | Reserved for log files; backend stderr is currently read with `mcpdoze logs`. |
+| `log_dir` | path | `<data dir>/logs` | Directory of the background daemon's log, `mcpdozed.log` (rotated at 5 MB, 5 old files kept); a relative path is resolved against the data directory. `mcpdoze serve` logs to stderr instead; backend stderr is read with `mcpdoze logs`. Needs a restart. |
 | `catalog_dir` | path | `<data dir>/catalog` | Where per-server tool catalogs are stored (`<server>.json`). Needs a restart. |
 | `catalog_max_age` | duration | unset (off) | Re-list a server's catalog in the background once it is older than this. A server's own value wins. |
 | `client_request_timeout` | duration | `"120s"` | How long the broker waits for an agent to answer a server-to-client request such as sampling or elicitation; then the backend gets `-32603`. See [SCOPES.md](SCOPES.md). |
@@ -52,6 +52,24 @@ bind = "0.0.0.0:7878"
 allow_remote = true
 token_env = "MCPDOZE_BROKER_TOKEN"
 allowed_hosts = ["broker.example.com"]
+```
+
+## `[stats]`
+
+The usage statistics log; see [STATS.md](STATS.md). Changes need a restart.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Write the log. |
+| `retention_days` | integer | `90` | Monthly files whose whole month ended longer ago than this are deleted. At least 1. |
+| `sample_interval_secs` | integer | `60` | Seconds between memory samples (broker, backends, estimated direct memory). At least 1. |
+| `debug` | bool | `false` | Add a request id and timing breakdown (`acquire_ms`, `backend_ms`) to each `call` event. |
+| `dir` | path | `<data dir>/stats` | Log directory; a relative path is resolved against the data directory. |
+
+```toml
+[stats]
+retention_days = 30
+sample_interval_secs = 120
 ```
 
 ## `[servers.<name>]`
@@ -143,5 +161,6 @@ together with `--env-literal NAME=VALUE`).
 - Instance scopes: [SCOPES.md](SCOPES.md)
 - Catalog behaviour: [CATALOG.md](CATALOG.md)
 - Runtime control: [ADMIN_API.md](ADMIN_API.md)
+- Statistics log: [STATS.md](STATS.md)
 - Environment variables read by the CLI: `MCPDOZE_CONFIG`, `MCPDOZE_URL`,
   `MCPDOZE_TOKEN_FILE`. Agents read the broker token from `MCPDOZE_TOKEN`.

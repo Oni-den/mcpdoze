@@ -71,6 +71,55 @@ impl Tuning {
     }
 }
 
+/// Why a backend process went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnloadReason {
+    /// Idle TTL expired.
+    Idle,
+    /// The process exited on its own while running.
+    Crash,
+    /// Stopped on request (admin `stop`, server removed, broker shutdown).
+    Stop,
+    /// Stopped because a config reload changed or removed the server.
+    Reload,
+}
+
+impl UnloadReason {
+    /// Lower-case name (`idle`, `crash`, `stop`, `reload`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnloadReason::Idle => "idle",
+            UnloadReason::Crash => "crash",
+            UnloadReason::Stop => "stop",
+            UnloadReason::Reload => "reload",
+        }
+    }
+}
+
+/// A process-level lifecycle event of one instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleEvent {
+    /// A new process is up and initialised.
+    Spawned {
+        /// Lifecycle generation of the process.
+        generation: u64,
+        /// From the start decision to `Running`.
+        startup: Duration,
+    },
+    /// A process went away.
+    Unloaded {
+        /// Lifecycle generation of the process.
+        generation: u64,
+        /// Why.
+        reason: UnloadReason,
+        /// How long the process ran.
+        uptime: Duration,
+    },
+}
+
+/// Callback run (outside the instance lock) on every [`LifecycleEvent`].
+pub type LifecycleHook = Arc<dyn Fn(&LifecycleEvent) + Send + Sync>;
+
 /// Externally visible lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateKind {
@@ -130,6 +179,8 @@ struct Inner {
     last_error: Option<String>,
     /// Live resource subscriptions held on this instance.
     pins: usize,
+    /// Reported reason of the stop `drain` arms.
+    drain_reason: UnloadReason,
 }
 
 /// One backend instance: at most one process at a time, started lazily and
@@ -144,6 +195,7 @@ pub struct Instance {
     spawns: AtomicU64,
     calls: AtomicU64,
     spawn_hooks: Mutex<Vec<SpawnHook>>,
+    lifecycle_hooks: Mutex<Vec<LifecycleHook>>,
 }
 
 /// Callback run each time an instance reaches `Running` on a new process,
@@ -192,11 +244,26 @@ impl Instance {
                 drain: false,
                 last_error: None,
                 pins: 0,
+                drain_reason: UnloadReason::Stop,
             }),
             spawns: AtomicU64::new(0),
             calls: AtomicU64::new(0),
             spawn_hooks: Mutex::new(Vec::new()),
+            lifecycle_hooks: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Registers `hook`, run (outside the instance lock) on every process
+    /// spawn and unload of this instance. Hooks must not block.
+    pub fn on_lifecycle(&self, hook: impl Fn(&LifecycleEvent) + Send + Sync + 'static) {
+        lock(&self.lifecycle_hooks).push(Arc::new(hook));
+    }
+
+    fn emit(&self, ev: LifecycleEvent) {
+        let hooks = lock(&self.lifecycle_hooks).clone();
+        for h in hooks {
+            h(&ev);
+        }
     }
 
     /// Registers `hook`, run (outside the instance lock) every time a new
@@ -322,16 +389,24 @@ impl Instance {
     /// (which fails the calls still running). Calls arriving meanwhile are
     /// served; a later call starts a fresh process as usual.
     pub async fn drain(self: &Arc<Self>, timeout: Duration) {
+        self.drain_for(timeout, UnloadReason::Stop).await;
+    }
+
+    /// [`drain`](Instance::drain), reporting `reason` for the unload.
+    pub async fn drain_for(self: &Arc<Self>, timeout: Duration, reason: UnloadReason) {
         let graceful = tokio::time::timeout(timeout, async {
             loop {
                 let done = {
                     let g = &mut *lock(&self.inner);
                     match &g.state {
                         State::Stopped | State::Failed { .. } => return,
-                        State::Running { .. } if g.in_flight == 0 => Some(self.begin_stop(g)),
+                        State::Running { .. } if g.in_flight == 0 => {
+                            Some(self.begin_stop(g, reason))
+                        }
                         State::Running { .. } => {
                             // `release` begins the stop when the count hits zero.
                             g.drain = true;
+                            g.drain_reason = reason;
                             None
                         }
                         s => s.done().cloned(),
@@ -350,7 +425,7 @@ impl Instance {
         .await;
         if graceful.is_err() {
             lock(&self.inner).drain = false;
-            self.shutdown().await;
+            self.shutdown_for(reason).await;
         }
     }
 
@@ -399,12 +474,17 @@ impl Instance {
     /// Stops the backend now (fails calls still in flight) and waits until
     /// it is `Stopped` or `Failed`. Used on broker shutdown.
     pub async fn shutdown(self: &Arc<Self>) {
+        self.shutdown_for(UnloadReason::Stop).await;
+    }
+
+    /// [`shutdown`](Instance::shutdown), reporting `reason` for the unload.
+    pub async fn shutdown_for(self: &Arc<Self>, reason: UnloadReason) {
         loop {
             let mut done = {
                 let g = &mut *lock(&self.inner);
                 match &g.state {
                     State::Stopped | State::Failed { .. } => return,
-                    State::Running { .. } => self.begin_stop(g),
+                    State::Running { .. } => self.begin_stop(g, reason),
                     s => s.done().cloned().expect("transitional state"),
                 }
             };
@@ -437,6 +517,7 @@ impl Instance {
     }
 
     async fn run_start(self: Arc<Self>, generation: u64, done: watch::Sender<bool>) {
+        let t0 = Instant::now();
         let start = async {
             let conn = if self.spec.http.is_some() {
                 Conn::Http(HttpConn::new(
@@ -510,6 +591,10 @@ impl Instance {
             conn.shutdown(Duration::ZERO).await;
         }
         if let Some(generation) = spawned {
+            self.emit(LifecycleEvent::Spawned {
+                generation,
+                startup: t0.elapsed(),
+            });
             let hooks = lock(&self.spawn_hooks).clone();
             for hook in hooks {
                 hook(generation);
@@ -519,7 +604,7 @@ impl Instance {
     }
 
     /// `Running -> Draining`; caller holds the lock and has checked the state.
-    fn begin_stop(self: &Arc<Self>, g: &mut Inner) -> watch::Receiver<bool> {
+    fn begin_stop(self: &Arc<Self>, g: &mut Inner, reason: UnloadReason) -> watch::Receiver<bool> {
         let State::Running { conn, idle } = std::mem::replace(&mut g.state, State::Stopped) else {
             unreachable!("begin_stop outside Running");
         };
@@ -528,7 +613,7 @@ impl Instance {
         g.state = State::Draining { done: rx.clone() };
         g.idle_deadline = None;
         g.drain = false;
-        tokio::spawn(self.clone().run_stop(g.generation, conn, tx));
+        tokio::spawn(self.clone().run_stop(g.generation, conn, tx, reason));
         rx
     }
 
@@ -537,7 +622,9 @@ impl Instance {
         generation: u64,
         conn: Arc<Conn>,
         done: watch::Sender<bool>,
+        reason: UnloadReason,
     ) {
+        let uptime = conn.started().elapsed();
         {
             let g = &mut *lock(&self.inner);
             if g.generation == generation {
@@ -557,6 +644,11 @@ impl Instance {
                 }
             }
         }
+        self.emit(LifecycleEvent::Unloaded {
+            generation,
+            reason,
+            uptime,
+        });
         let _ = done.send(true);
     }
 
@@ -577,7 +669,7 @@ impl Instance {
             return false;
         }
         // The atomic step: still Running, nothing in flight, deadline passed.
-        self.begin_stop(g);
+        self.begin_stop(g, UnloadReason::Idle);
         true
     }
 
@@ -617,6 +709,11 @@ impl Instance {
             eager = self.keeps_alive(g);
             conn
         };
+        self.emit(LifecycleEvent::Unloaded {
+            generation,
+            reason: UnloadReason::Crash,
+            uptime: conn.started().elapsed(),
+        });
         // Reap whatever is left of the tree (grandchildren).
         tokio::spawn(async move { conn.shutdown(Duration::ZERO).await });
         if eager {
@@ -631,7 +728,8 @@ impl Instance {
             return;
         }
         if g.drain && matches!(g.state, State::Running { .. }) {
-            self.begin_stop(g);
+            let reason = g.drain_reason;
+            self.begin_stop(g, reason);
             return;
         }
         if let State::Running { idle, .. } = &g.state {

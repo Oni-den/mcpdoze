@@ -194,7 +194,8 @@ changes (`400`). `409` if the broker runs without a config file.
 
 `restart_required` lists `[broker]` settings that changed but only apply
 after a restart (`bind`, `token_file`, `token_env`, `allow_remote`,
-`allowed_hosts`, `log_dir`, `catalog_dir`). `default_idle_ttl`,
+`allowed_hosts`, `log_dir`, `catalog_dir`) and `stats` when the `[stats]`
+table changed. `default_idle_ttl`,
 `start_timeout`, `catalog_max_age`, `client_request_timeout` and
 `session_idle_timeout` apply on reload. A changed server whose
 launch fingerprint changed (command, arguments, working directory, URL,
@@ -232,3 +233,21 @@ memory across restarts. For scoped servers the lines of each instance follow
 the shared instance's, prefixed with `[<scope_key>] `. Response:
 `{ "name": "example", "lines": ["...", "..."] }`. Backend output is shown as
 is; it is only reachable with the token from a loopback peer.
+
+### `GET /stats[?since=7d]`
+
+Summary of the statistics log ([STATS.md](STATS.md)) over the last `since`
+(a duration, default `7d`); buffered events are flushed first. `mcpdoze stats`
+prints the same summary. `409` when `[stats] enabled = false`, `400` for an
+invalid `since`.
+
+```json
+{ "since_ms": 1767225600000, "until_ms": 1767830400000, "events": 5120,
+  "sessions_opened": 14, "peak_sessions": 3, "dropped": 0,
+  "servers": [ { "server": "example", "calls": 412, "errors": 3,
+    "error_rate": 0.007, "p50_ms": 38, "p95_ms": 910, "cold_starts": 21,
+    "cold_start_rate": 0.051, "spawns": 21, "unloads": { "idle": 20, "crash": 1 } } ],
+  "memory": { "samples": 9800, "avg_actual_mb": 182.4, "peak_actual_mb": 610.0,
+    "avg_est_direct_mb": 395.1, "peak_est_direct_mb": 1480.2,
+    "avg_saved_mb": 212.7, "mb_hours_saved": 34742.0 } }
+```

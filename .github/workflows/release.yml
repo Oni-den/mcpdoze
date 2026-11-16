@@ -40,8 +40,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
+      # Both binaries: `mcpdoze` (CLI and foreground broker) and `mcpdozed`
+      # (console-less broker used by the Windows logon task).
       - name: Build
-        run: cargo build --release -p mcpdoze --locked --target ${{ matrix.target }}
+        run: cargo build --release -p mcpdoze --bin mcpdoze --bin mcpdozed --locked --target ${{ matrix.target }}
 
       - name: Package (zip)
         if: matrix.ext == 'zip'
@@ -50,6 +52,7 @@ jobs:
           $name = "mcpdoze-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/mcpdoze.exe" $name
+          Copy-Item "target/${{ matrix.target }}/release/mcpdozed.exe" $name
           Copy-Item LICENSE, README.md $name
           New-Item -ItemType Directory -Path "$name/skills" | Out-Null
           Copy-Item -Recurse skills/mcpdoze-migrate "$name/skills/"

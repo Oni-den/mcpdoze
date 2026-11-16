@@ -86,6 +86,62 @@ pub struct Config {
     pub broker: BrokerConfig,
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
+    /// Usage statistics log (`docs/STATS.md`).
+    #[serde(default)]
+    pub stats: StatsConfig,
+}
+
+/// `[stats]`: the append-only usage log (`docs/STATS.md`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsConfig {
+    /// Write the log.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Monthly files whose whole month is older than this are deleted.
+    #[serde(default = "default_stats_retention_days")]
+    pub retention_days: u32,
+    /// Seconds between memory samples.
+    #[serde(default = "default_stats_sample_interval")]
+    pub sample_interval_secs: u64,
+    /// Add per-request ids and timing breakdowns to `call` events.
+    #[serde(default)]
+    pub debug: bool,
+    /// Log directory; a relative path is resolved against the data
+    /// directory. `<data dir>/stats` when unset.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: default_stats_retention_days(),
+            sample_interval_secs: default_stats_sample_interval(),
+            debug: false,
+            dir: None,
+        }
+    }
+}
+
+impl StatsConfig {
+    /// The log directory (see [`StatsConfig::dir`]); `None` when no data
+    /// directory can be determined and `dir` is relative or unset.
+    pub fn resolved_dir(&self) -> Option<PathBuf> {
+        match &self.dir {
+            Some(p) if p.is_absolute() => Some(p.clone()),
+            Some(p) => default_data_dir().map(|d| d.join(p)),
+            None => default_data_dir().map(|d| d.join("stats")),
+        }
+    }
+}
+
+fn default_stats_retention_days() -> u32 {
+    90
+}
+fn default_stats_sample_interval() -> u64 {
+    60
 }
 
 /// Broker settings.
@@ -358,6 +414,18 @@ impl Config {
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errs = Vec::new();
         self.validate_broker(&mut errs);
+        if self.stats.sample_interval_secs == 0 {
+            errs.push(ValidationError::new(
+                "stats.sample_interval_secs",
+                "must be at least 1",
+            ));
+        }
+        if self.stats.retention_days == 0 {
+            errs.push(ValidationError::new(
+                "stats.retention_days",
+                "must be at least 1",
+            ));
+        }
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for (name, s) in &self.servers {
             let f = |k: &str| format!("servers.{name}.{k}");

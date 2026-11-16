@@ -11,10 +11,11 @@ use tokio::sync::oneshot;
 
 use super::events::ProgressRoute;
 use super::session::RootsState;
+use super::usage::{CallStart, CallTrace};
 use super::{naming, uri, Router, Server, Session};
 use crate::backend::jsonrpc::{self, Kind};
 use crate::backend::stdio::lock;
-use crate::backend::{CallError, CallMeta, Conn};
+use crate::backend::{CallError, CallMeta, Conn, StateKind};
 /// Removes a session's in-flight entry when the call ends.
 pub(super) struct InflightEntry<'a> {
     session: &'a Session,
@@ -234,7 +235,8 @@ impl Router {
     }
 
     /// Forwards one request to `server`, starting it if needed, and maps the
-    /// response back to the agent's id.
+    /// response back to the agent's id. Logged to the statistics log when
+    /// one is set.
     pub(super) async fn forward(
         &self,
         session: &Arc<Session>,
@@ -244,11 +246,48 @@ impl Router {
         params: Value,
         progress_token: Option<Value>,
     ) -> Value {
+        let mut trace = CallTrace::default();
+        let logged = self
+            .stats()
+            .and_then(|st| CallStart::new(method, &params).map(|c| (st, c)));
+        let resp = self
+            .forward_traced(
+                session,
+                server,
+                id,
+                method,
+                params,
+                progress_token,
+                &mut trace,
+            )
+            .await;
+        if let Some((st, start)) = logged {
+            self.record_call(&st, session, server, start, &trace, &resp);
+        }
+        resp
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_traced(
+        &self,
+        session: &Arc<Session>,
+        server: &Arc<Server>,
+        id: Value,
+        method: &str,
+        params: Value,
+        progress_token: Option<Value>,
+        trace: &mut CallTrace,
+    ) -> Value {
         let inst = match self.instance_for(session, server).await {
             Ok(i) => i,
             Err((code, msg)) => return jsonrpc::error(id, code, msg),
         };
-        let guard = match inst.acquire().await {
+        trace.cold_start = inst.state() != StateKind::Running;
+        trace.scope_key = Some(inst.spec().client.scope_key.clone());
+        let acquiring = std::time::Instant::now();
+        let acquired = inst.acquire().await;
+        trace.acquire = acquiring.elapsed();
+        let guard = match acquired {
             Ok(g) => g,
             Err(e) => return jsonrpc::error(id, jsonrpc::BACKEND_UNAVAILABLE, e.to_string()),
         };
@@ -264,6 +303,7 @@ impl Router {
             orig_id: id.clone(),
             progress_token,
         };
+        let sending = std::time::Instant::now();
         let (back_id, rx) = match guard.conn().begin(method, params, meta).await {
             Ok(x) => x,
             Err(e) => return jsonrpc::error(id, jsonrpc::BACKEND_UNAVAILABLE, e.to_string()),
@@ -279,6 +319,7 @@ impl Router {
             r = rx => r.unwrap_or(Err(CallError::Closed)),
             Ok(()) = &mut cancel_rx => Err(CallError::Cancelled),
         };
+        trace.backend = sending.elapsed();
         match outcome {
             Ok(resp) => {
                 cancel.armed = false;

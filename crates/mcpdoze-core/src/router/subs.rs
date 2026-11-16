@@ -118,6 +118,7 @@ impl Router {
     /// Registers the spawn hook that replays subscriptions on a new
     /// process of `inst` (scope key `scope_key` of `server`).
     pub(super) fn hook_instance(&self, server: &str, inst: &Arc<Instance>) {
+        let server_name = server;
         let me = self.me.clone();
         let server = server.to_owned();
         let scope_key = inst.spec().client.scope_key.clone();
@@ -133,6 +134,7 @@ impl Router {
             let (server, scope_key) = (server.clone(), scope_key.clone());
             rt.spawn(async move { r.replay(&server, &scope_key, &inst, generation).await });
         });
+        self.hook_stats(server_name, inst);
     }
 
     /// `resources/subscribe` from a stored session.
