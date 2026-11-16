@@ -70,7 +70,7 @@ jobs:
           cp -R skills/mcpdoze-migrate "$name/skills/"
           tar -czf "dist/$name.tar.gz" "$name"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
