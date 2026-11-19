@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use mcpdoze_core::admin::api::{
-    ErrorResponse, LogsResponse, RegisterRequest, RegisterResponse, ReloadResponse, RemoveResponse,
-    ServersResponse, StatsResponse, StatusResponse, StopResponse, BASE,
+    DebugSetRequest, DebugStatus, ErrorResponse, FailuresQuery, FailuresResponse, LogsResponse,
+    RegisterRequest, RegisterResponse, ReloadResponse, RemoveResponse, ServersResponse,
+    StatsResponse, StatusResponse, StopResponse, BASE,
 };
 use mcpdoze_core::config::{self, Config};
 use mcpdoze_core::daemon::DEFAULT_TOKEN_FILE;
@@ -313,6 +314,37 @@ impl Client {
                 }
             })?;
         Ok(serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// `GET /debug`.
+    pub async fn debug_status(&self) -> Result<DebugStatus> {
+        self.json(self.http.get(self.url("/debug"))).await
+    }
+
+    /// `POST /debug`.
+    pub async fn debug_set(&self, req: &DebugSetRequest) -> Result<DebugStatus> {
+        self.json(self.http.post(self.url("/debug")).json(req))
+            .await
+    }
+
+    /// `GET /debug/failures`. The broker flushes pending records first, so
+    /// a call with `limit: 1` also serves as a flush.
+    pub async fn failures(&self, q: &FailuresQuery) -> Result<FailuresResponse> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = &q.server {
+            params.push(("server", v.clone()));
+        }
+        if let Some(v) = &q.kind {
+            params.push(("kind", v.clone()));
+        }
+        if let Some(v) = &q.since {
+            params.push(("since", v.clone()));
+        }
+        if let Some(v) = q.limit {
+            params.push(("limit", v.to_string()));
+        }
+        self.json(self.http.get(self.url("/debug/failures")).query(&params))
+            .await
     }
 
     /// `GET /healthz` (no token). Returns whether the broker answered `ok`.

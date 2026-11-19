@@ -45,6 +45,12 @@ pub enum Command {
     /// Summarise the statistics log (calls, latency, cold starts, memory
     /// saved versus per-session servers).
     Stats(StatsArgs),
+    /// Record, inspect and export classified failures of brokered servers.
+    Debug {
+        /// What to do.
+        #[command(subcommand)]
+        action: DebugAction,
+    },
     /// Start the broker automatically at login.
     Autostart {
         /// Install or remove.
@@ -88,6 +94,107 @@ pub struct StatusArgs {
     /// Print the raw JSON response.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `mcpdoze debug ...`.
+#[derive(Debug, Subcommand)]
+pub enum DebugAction {
+    /// Turn failure recording on (until restart, or for a while).
+    On(DebugOnArgs),
+    /// Turn failure recording off.
+    Off(DebugOffArgs),
+    /// Show the recording mode of every server.
+    Status(DebugConnArgs),
+    /// Show recent classified failures.
+    Show(DebugShowArgs),
+    /// Write a sanitised, pasteable report of the failures.
+    Export(DebugExportArgs),
+}
+
+/// Connection options only.
+#[derive(Debug, Args)]
+pub struct DebugConnArgs {
+    /// Connection options.
+    #[command(flatten)]
+    pub conn: ConnArgs,
+}
+
+/// `mcpdoze debug on`.
+#[derive(Debug, Args)]
+pub struct DebugOnArgs {
+    /// Servers to record (all servers when omitted).
+    #[arg(value_name = "SERVER")]
+    pub servers: Vec<String>,
+    /// Also record slow and odd-but-successful calls.
+    #[arg(long)]
+    pub trace: bool,
+    /// Raw frame capture (not available in this version).
+    #[arg(long)]
+    pub raw: bool,
+    /// Turn it off again after this long (e.g. 30m); default: until the
+    /// broker restarts.
+    #[arg(long = "for", value_name = "DURATION")]
+    pub duration: Option<String>,
+    /// Connection options.
+    #[command(flatten)]
+    pub conn: ConnArgs,
+}
+
+/// `mcpdoze debug off`.
+#[derive(Debug, Args)]
+pub struct DebugOffArgs {
+    /// Servers to stop recording (all servers when omitted).
+    #[arg(value_name = "SERVER")]
+    pub servers: Vec<String>,
+    /// Connection options.
+    #[command(flatten)]
+    pub conn: ConnArgs,
+}
+
+/// `mcpdoze debug show`.
+#[derive(Debug, Args)]
+pub struct DebugShowArgs {
+    /// Only this server.
+    #[arg(long, value_name = "NAME")]
+    pub server: Option<String>,
+    /// Only this kind (e.g. crash_in_flight).
+    #[arg(long, value_name = "KIND")]
+    pub kind: Option<String>,
+    /// Newest records to show.
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub last: usize,
+    /// Print the raw JSON records.
+    #[arg(long)]
+    pub json: bool,
+    /// Connection options.
+    #[command(flatten)]
+    pub conn: ConnArgs,
+}
+
+/// `mcpdoze debug export`.
+#[derive(Debug, Args)]
+pub struct DebugExportArgs {
+    /// Only this server.
+    #[arg(long, value_name = "NAME")]
+    pub server: Option<String>,
+    /// Period to export (e.g. 24h, 7d).
+    #[arg(long, value_name = "DURATION", default_value = "24h")]
+    pub since: String,
+    /// Write to this file (overwritten).
+    #[arg(long, value_name = "FILE", conflicts_with = "stdout")]
+    pub out: Option<PathBuf>,
+    /// Print instead of writing a file.
+    #[arg(long)]
+    pub stdout: bool,
+    /// Drop all free text (messages, stderr tails, hints).
+    #[arg(long)]
+    pub strict: bool,
+    /// Include the package argument of package launchers (npx, uvx, ...).
+    #[arg(long)]
+    pub identify: bool,
+    /// Connection options.
+    #[command(flatten)]
+    pub conn: ConnArgs,
 }
 
 /// `mcpdoze stats`.
@@ -514,6 +621,78 @@ mod tests {
                 action: AutostartCmd::Remove
             }
         ));
+    }
+
+    #[test]
+    fn parses_debug() {
+        let Command::Debug {
+            action: DebugAction::On(a),
+        } = parse(&["debug", "on", "a", "b", "--trace", "--raw", "--for", "30m"])
+        else {
+            panic!()
+        };
+        assert_eq!(a.servers, vec!["a", "b"]);
+        assert!(a.trace && a.raw);
+        assert_eq!(a.duration.as_deref(), Some("30m"));
+        let Command::Debug {
+            action: DebugAction::On(a),
+        } = parse(&["debug", "on"])
+        else {
+            panic!()
+        };
+        assert!(a.servers.is_empty() && !a.trace && !a.raw && a.duration.is_none());
+        assert!(matches!(
+            parse(&["debug", "off"]),
+            Command::Debug {
+                action: DebugAction::Off(_)
+            }
+        ));
+        assert!(matches!(
+            parse(&["debug", "status", "--url", "http://h:1"]),
+            Command::Debug {
+                action: DebugAction::Status(_)
+            }
+        ));
+        let Command::Debug {
+            action: DebugAction::Show(a),
+        } = parse(&[
+            "debug", "show", "--server", "s", "--kind", "stalled", "--last", "5",
+        ])
+        else {
+            panic!()
+        };
+        assert_eq!(a.server.as_deref(), Some("s"));
+        assert_eq!(a.kind.as_deref(), Some("stalled"));
+        assert_eq!(a.last, 5);
+        let Command::Debug {
+            action: DebugAction::Export(a),
+        } = parse(&[
+            "debug",
+            "export",
+            "--strict",
+            "--identify",
+            "--since",
+            "7d",
+            "--out",
+            "x.md",
+        ])
+        else {
+            panic!()
+        };
+        assert!(a.strict && a.identify && !a.stdout);
+        assert_eq!(a.since, "7d");
+        assert_eq!(a.out, Some(PathBuf::from("x.md")));
+        let Command::Debug {
+            action: DebugAction::Export(a),
+        } = parse(&["debug", "export"])
+        else {
+            panic!()
+        };
+        assert_eq!(a.since, "24h");
+        assert!(
+            Cli::try_parse_from(["mcpdoze", "debug", "export", "--out", "x", "--stdout"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["mcpdoze", "debug"]).is_err());
     }
 
     #[test]

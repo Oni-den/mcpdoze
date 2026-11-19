@@ -1,6 +1,6 @@
 # Failure log and debug mode
 
-**Status: Planned (M9), not implemented.** This document describes the intended design. Details are in `docs/plans/M9-M10-plan.md`.
+**Status: implemented (M9), except raw capture and replay.** Raw frame capture (`--raw`, `[debug] raw`) is not available in this version, and the replay helper that turns an export into a mock-server test is not built yet; the export already contains the replay description. Details are in `docs/plans/M9-M10-plan.md`.
 
 When a brokered MCP server fails, MCPDoze can record why: which request, with what shape, against which backend state, and how the failure unfolded. The records are used to fix MCPDoze's support for specific servers, and are safe to attach to a public issue.
 
@@ -13,7 +13,7 @@ When a brokered MCP server fails, MCPDoze can record why: which request, with wh
 | `trace` | failures plus slow calls and odd-but-successful calls |
 | `raw` (separate flag) | full frames to a local-only file; time-limited |
 
-The default mode is an open owner decision; the proposal is `off`, with `doctor` and `status` hinting to enable debugging when failures occurred.
+The default is `off`. `doctor` hints to enable debugging when failures were counted while it is off. `raw` is described below for completeness but is refused by this version.
 
 ## Enabling
 
@@ -37,7 +37,7 @@ debug = "trace"
 - Environment: `MCPDOZE_DEBUG=failures|trace`, or a comma list of server names.
 - CLI: `serve --debug[=MODE] [--debug-server NAME]...`
 - Runtime (reverts on restart): `GET` and `POST /admin/v1/debug`, `GET /admin/v1/debug/failures`.
-- `mcpdoze debug on [SERVER...] [--trace] [--raw] [--for 30m]`, `debug off`, `debug status`, `debug show`.
+- `mcpdoze debug on [SERVER...] [--trace] [--raw] [--for 30m]`, `debug off [SERVER...]`, `debug status`, `debug show [--server S] [--kind K] [--last N]`. `--raw` prints "raw capture not available in this version".
 - Config changes apply on reload without unloading backends.
 
 ## What is captured
@@ -59,7 +59,7 @@ The record types cannot hold a raw JSON value, so values cannot leak by construc
 - Environment and header values are never recorded, only names; resolved values and the broker token are scrubbed from free text.
 - Free text is scrubbed of home paths, user and host names, arguments of the triggering call, bearer tokens, JWTs, emails, IPs, URL queries and long hex/base64 runs; non-error stderr lines are reduced to a length; text is truncated to 300 characters.
 - URLs keep scheme, host hash and path depth. Resource URIs, session ids and directories are salted hashes; the salt is per install and never exported.
-- Raw capture writes full frames to an owner-only file, turns itself off after 30 minutes by default, is deleted after 24 hours, and is never read by `export`. It still contains no env or header values. `doctor` warns while it is on.
+- Raw capture (**planned, not available in this version**) writes full frames to an owner-only file, turns itself off after 30 minutes by default, is deleted after 24 hours, and is never read by `export`. It still contains no env or header values. `doctor` warns while it is on.
 
 Files are owner-only, rotated at 5 MB with 5 kept, and flood-limited to 20 records per minute per server; identical failures bump a `repeat` counter.
 
@@ -69,7 +69,16 @@ Files are owner-only, rotated at 5 MB with 5 kept, and flood-limited to 20 recor
 mcpdoze debug export [--server S] [--since 24h] [--out FILE|--stdout] [--strict] [--identify]
 ```
 
-Works with the broker down. Produces one text file (JSON in a markdown fence) with a manifest, the server's launch shape (transport, launcher basename, flag names, env and header names), a catalog summary, the failure records, per-kind counts and latency, and a replay section. `--identify` adds the package argument; `--strict` drops all free text. A second scrub runs at export followed by a self-check; any hit fails closed with a request to re-run with `--strict`.
+Works with the broker down (it reads the failure files; a reachable broker is asked to flush first). Produces one markdown text file (default `mcpdoze-debug-<unix time>.md`, or `--out FILE`, or `--stdout`) with:
+
+- a manifest: versions, OS, arch, mode, redaction counts (placeholders in the output, hashes re-keyed, free-text fields re-scrubbed or dropped);
+- the launch shape of the servers with failures: transport, launcher basename, flag names, argument count, env and header names (never values);
+- a catalog summary (protocol, `serverInfo`, capability keys and tool names seen in the failures; the tool catalog itself is not read);
+- the newest 100 failure records, one JSON object per line;
+- per-kind counts, and calls, errors, p50 and p95 from the statistics log;
+- a `replay` section: per kind, the `mock_mcp_stdio --script` steps that reproduce the broker-visible symptom, with the request's method, size and shape.
+
+`--identify` adds the package argument of package launchers (`npx`, `uvx`, ...); `--strict` drops all free text (error messages, stderr tails, cause hints; the classifier's static `guess` stays). The export runs a second scrub over the free-text fields with this machine's home, user and host names, re-keys every salted hash with a fresh random salt, and then self-checks the finished text with the rule set of `scripts/pii-lint.ps1` (profile paths, emails, token prefixes, private IPs) plus JWTs, bearer values, long hex runs and this machine's user, host and home names. Any hit fails closed: nothing is written, the message names the rule and line (never the text) and asks to re-run with `--strict`.
 
 ## What is safe to paste
 
@@ -80,7 +89,7 @@ Works with the broker down. Produces one text file (JSON in a markdown fence) wi
 
 ## Replay
 
-A sanitised bundle can be turned into a scripted mock server in the testkit (`mock_mcp_stdio --script`), with synthetic requests of the same types, lengths and classes, run through an in-process broker, and checked to produce the same `kind`. This reproduces the broker-visible symptom (framing, timing, exit), not the server's internal bug. Bundles become regression fixtures.
+**Planned, not implemented:** the loader that turns an export into a scripted mock server in the testkit (`mock_mcp_stdio --script`), runs synthetic requests of the same types, lengths and classes through an in-process broker, and checks that the same `kind` results. This reproduces the broker-visible symptom (framing, timing, exit), not the server's internal bug. The export's `replay` section already carries the script steps; bundles will become regression fixtures.
 
 ## Related changes
 

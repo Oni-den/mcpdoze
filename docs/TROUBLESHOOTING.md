@@ -91,6 +91,41 @@ may download packages on first use, which can take longer than the default
 - `mcpdoze status` shows `starting`, `running` or `failed` with `last_error`;
   `mcpdoze logs <name>` shows the backend's last stderr lines.
 
+## A server fails behind MCPDoze
+
+When a server works on its own but fails through the broker, record why. The
+failure log is off by default, so turn it on, reproduce, and read it.
+
+1. **Enable.** `mcpdoze debug on` records classified failures for every
+   server until the broker restarts. Narrow it with server names
+   (`mcpdoze debug on example`), add slow and odd calls with `--trace`, and
+   limit the time with `--for 30m`. (`--raw` is not available in this
+   version.) `mcpdoze debug status` shows what is on.
+2. **Reproduce.** Make the call that fails. Use the same agent and the same
+   tool as before.
+3. **Doctor.** `mcpdoze doctor` lists, per server with failures in the last
+   24 hours, the count by kind, a likely cause (`hint:`) and the export
+   command. With debug off but failures counted since the broker started it
+   tells you how to enable it. `mcpdoze debug show` lists the records
+   (`--server`, `--kind`, `--last N`).
+4. **Export.** `mcpdoze debug export --server example` writes one markdown
+   file (or use `--stdout`, `--out FILE`) with the launch shape (names only),
+   the failure records, per-kind counts and latency, and a replay
+   description. It reads the files directly, so it works with the broker
+   down. Add `--since 7d` for a longer period, `--identify` to include the
+   package argument of `npx`/`uvx` launchers, and `--strict` to drop every
+   free-text field (messages, stderr tails, hints). Export scrubs a second
+   time, re-keys the hashes, and checks its own output for home paths, user
+   and host names, emails and token patterns; if anything is found it
+   writes nothing and says `re-run with --strict`.
+5. Turn it off again with `mcpdoze debug off`.
+
+**`logs` versus `debug export`.** `mcpdoze logs <name>` shows the backend's
+raw stderr, unscrubbed: it can hold paths, names and tokens, so read it
+yourself and do not paste it. `mcpdoze debug export` is built to be pasted
+into an issue (skim it first). Argument values are never recorded, only
+their shape.
+
 ## Windows: `.cmd` shims
 
 Tools such as `npx` are `.cmd` files on Windows. MCPDoze resolves commands with

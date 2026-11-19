@@ -73,6 +73,7 @@
 //!   runtime go through [`DiagTap::set_level`] (no unload).
 
 pub mod classify;
+pub mod export;
 pub mod record;
 pub mod redact;
 pub mod ring;

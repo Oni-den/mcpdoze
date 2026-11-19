@@ -68,7 +68,7 @@ Runtime state of every registered backend.
         { "scope_key": "", "state": "running", "pids": [4242, 4250],
           "rss_bytes": 81264640, "private_bytes": 75497472, "in_flight": 0,
           "idle_remaining_secs": 540, "calls": 17, "restarts": 1,
-          "failures": 0, "last_error": null }
+          "failures": 0, "last_error": null, "debug": "off" }
       ]
     }
   ]
@@ -91,6 +91,12 @@ Runtime state of every registered backend.
   is unknown, listed once it has been used), the normalised directory for
   `per-cwd`, and `session:<first 8 characters of the session id>` for
   `per-session`. Stopped scoped instances are dropped from the list.
+- `debug` (per instance): the failure-log mode in effect, `off`, `failures`
+  or `trace` ([DEBUG.md](DEBUG.md)). `last_failure` (`{ "id": "f-000123",
+  "kind": "crash_in_flight", "ts": 1767225600123 }`) is the newest classified
+  failure of that instance in the failure log; it is omitted while the log has
+  none (and always when debug has never been on). Ids match the failure
+  records, so `mcpdoze debug show` finds it.
 - For `shared` servers the top-level fields describe the one instance, as
   before. For scoped servers they aggregate every instance: `state` is the
   most active state, `pids` and memory are summed over all trees,
@@ -226,6 +232,52 @@ Refreshes every registered server concurrently, as above:
 `{ "servers": [ { "name": "example", "changed": false, ... } ] }`, ordered by
 name.
 
+### `GET /debug`, `POST /debug`
+
+The failure log ([DEBUG.md](DEBUG.md)). `GET` returns the effective state:
+
+```json
+{ "mode": "off", "servers": { "example": "failures" },
+  "runtime": { "servers": { "example": "failures" } },
+  "raw": false, "expires_in_secs": 1740, "available": true,
+  "written": 12, "dropped": 0 }
+```
+
+- `mode`: effective mode for servers without a setting of their own;
+  `servers`: effective mode of every registered server (`off`, `failures`,
+  `trace`).
+- `runtime`: the runtime layer set by `POST` (`all` and per-server modes). It
+  has the highest precedence, is not written to the config, and is lost on
+  restart. `expires_in_secs` is present while a `for` timer runs.
+- `available`: false when no debug directory can be determined; everything
+  then stays off.
+- `raw`: raw frame capture; always `false` in this version.
+- `written`, `dropped`: records written / dropped (queue full) by this broker
+  process.
+
+`POST` replaces the runtime layer and applies at once, without unloading any
+backend. Body (unknown fields are rejected):
+
+```json
+{ "mode": "failures", "servers": ["example"], "raw": false, "for": "30m" }
+```
+
+`mode` is `off`, `failures` or `trace`; `servers` limits it to those servers
+(empty: every server); `for` reverts the runtime layer after that duration.
+`raw: true` is refused with `400` ("raw capture is not available"). The
+response is the new `GET /debug` state. `400` for an invalid mode, server name
+or duration, and when no debug directory can be determined.
+`mcpdoze debug on|off|status` use these endpoints.
+
+### `GET /debug/failures[?server=&kind=&since=&limit=]`
+
+Failure records, oldest first, as `{ "records": [ ... ] }` (the schema of
+[DEBUG.md](DEBUG.md)). `since` is a duration ago (`1h`) or unix milliseconds;
+`limit` defaults to 50 and is capped at 500. Pending records are flushed
+before reading, so a `limit=1` request is also how `mcpdoze debug export` asks
+the broker to flush. The records are sanitised by construction; still,
+treat them as local diagnostics (loopback and token only).
+
 ### `GET /servers/{name}/logs[?lines=N]`
 
 The last `N` lines (default 100, at most 500) of the backend's stderr, kept in
@@ -238,7 +290,9 @@ is; it is only reachable with the token from a loopback peer.
 
 Summary of the statistics log ([STATS.md](STATS.md)) over the last `since`
 (a duration, default `7d`); buffered events are flushed first. `mcpdoze stats`
-prints the same summary. `409` when `[stats] enabled = false`, `400` for an
+prints the same summary. Each server has `failures`: classified call
+failures by kind in the period (from the `fail` field of call events;
+empty when none). `409` when `[stats] enabled = false`, `400` for an
 invalid `since`.
 
 ```json
@@ -246,7 +300,8 @@ invalid `since`.
   "sessions_opened": 14, "peak_sessions": 3, "dropped": 0,
   "servers": [ { "server": "example", "calls": 412, "errors": 3,
     "error_rate": 0.007, "p50_ms": 38, "p95_ms": 910, "cold_starts": 21,
-    "cold_start_rate": 0.051, "spawns": 21, "unloads": { "idle": 20, "crash": 1 } } ],
+    "cold_start_rate": 0.051, "spawns": 21, "unloads": { "idle": 20, "crash": 1 },
+    "failures": { "rpc_error": 2, "stalled": 1 } } ],
   "memory": { "samples": 9800, "avg_actual_mb": 182.4, "peak_actual_mb": 610.0,
     "avg_est_direct_mb": 395.1, "peak_est_direct_mb": 1480.2,
     "avg_saved_mb": 212.7, "mb_hours_saved": 34742.0 } }

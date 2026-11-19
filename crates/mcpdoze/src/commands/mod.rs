@@ -4,6 +4,7 @@
 //! inspect the output. Nothing here prints the bearer token (except
 //! `token --show` on a terminal) or backend environment values.
 
+mod debug;
 mod doctor;
 mod table;
 #[cfg(test)]
@@ -45,6 +46,7 @@ pub async fn run(cmd: Command, out: &mut dyn Write, stdout_is_tty: bool) -> Resu
         Command::Logs(a) => logs(a, out).await.map(|()| OK),
         Command::Token(a) => token(a, out, stdout_is_tty).map(|()| OK),
         Command::Doctor(c) => doctor::run(c, out).await,
+        Command::Debug { action } => debug::run(action, out).await,
         Command::Stats(a) => stats(a, out).await.map(|()| OK),
         Command::Autostart { action } => {
             let msg = match action {
@@ -421,6 +423,8 @@ pub fn build_register(a: &AddArgs) -> Result<RegisterRequest> {
             subscriptions: Default::default(),
             debug: None,
             call_timeout: None,
+            optimize: None,
+            tools: Default::default(),
         },
     })
 }

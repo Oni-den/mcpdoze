@@ -36,6 +36,114 @@ fn host_port(base: &str) -> &str {
         .unwrap_or(base)
 }
 
+const WINDOW_24H_MS: u64 = 24 * 3600 * 1000;
+
+/// The debug mode line, the raw-capture warning, and per server with
+/// failures in the last 24 hours: counts by kind, the top cause guess and
+/// the export command. Reads the failure files directly.
+async fn failure_log(
+    r: &mut Report,
+    conn: &Conn,
+    config: Option<&Config>,
+    client: Option<&Client>,
+    reachable: bool,
+    broker_failures: u64,
+) {
+    let mut on_servers: Vec<String> = Vec::new();
+    let mut mode = config.map_or("off", |c| c.debug.mode.as_str()).to_owned();
+    let mut raw = false;
+    if reachable {
+        if let Some(Ok(d)) = match client {
+            Some(c) => Some(c.debug_status().await),
+            None => None,
+        } {
+            raw = d.raw;
+            on_servers = d
+                .servers
+                .iter()
+                .filter(|(_, m)| m.as_str() != "off")
+                .map(|(n, _)| n.clone())
+                .collect();
+            mode = d.mode;
+        }
+    } else if let Some(c) = config {
+        on_servers = c
+            .servers
+            .iter()
+            .filter(|(_, s)| s.debug.is_some_and(|m| m.as_str() != "off"))
+            .map(|(n, _)| n.clone())
+            .collect();
+    }
+    let off = mode == "off" && on_servers.is_empty();
+    if off {
+        if broker_failures > 0 {
+            r.add(
+                Level::Warn,
+                format!(
+                    "{broker_failures} backend failure(s) since the broker started, and the failure log is off"
+                ),
+                Some("run `mcpdoze debug on`, reproduce the problem, then `mcpdoze doctor` or `mcpdoze debug export`"),
+            );
+        } else {
+            r.add(
+                Level::Ok,
+                "failure log: off (`mcpdoze debug on` records classified failures)",
+                None,
+            );
+        }
+    } else if on_servers.is_empty() {
+        r.add(
+            Level::Ok,
+            format!("failure log: {mode} for all servers"),
+            None,
+        );
+    } else {
+        r.add(
+            Level::Ok,
+            format!(
+                "failure log: {mode} globally; on for {}",
+                on_servers.join(", ")
+            ),
+            None,
+        );
+    }
+    if raw {
+        r.add(
+            Level::Warn,
+            "raw frame capture is ON: full request and response frames are written to disk",
+            Some("turn it off with `mcpdoze debug off`; never share the raw file"),
+        );
+    }
+
+    let Some((file, keep)) = super::debug::failure_file(conn) else {
+        return;
+    };
+    let since_ms = mcpdoze_core::stats::now_ms().saturating_sub(WINDOW_24H_MS);
+    let filter = mcpdoze_core::diag::export::Filter {
+        since_ms,
+        ..Default::default()
+    };
+    let recs = mcpdoze_core::diag::export::read_records(&file, keep, &filter, 2000);
+    for (name, f) in super::debug::summarize_failures(&recs) {
+        let total: u64 = f.by_kind.values().sum();
+        let kinds: Vec<String> = f.by_kind.iter().map(|(k, n)| format!("{k}={n}")).collect();
+        let cause = f
+            .top_guess
+            .map(|g| format!("likely cause: {g}. "))
+            .unwrap_or_default();
+        r.add(
+            Level::Warn,
+            format!(
+                "{name}: {total} failure(s) in the last 24h ({})",
+                kinds.join(", ")
+            ),
+            Some(&format!(
+                "{cause}share with `mcpdoze debug export --server {name}`"
+            )),
+        );
+    }
+}
+
 /// Runs every check; returns 1 when any failed.
 pub async fn run(args: ConnArgs, out: &mut dyn Write) -> Result<u8> {
     let conn = Conn::resolve(&args);
@@ -127,19 +235,24 @@ pub async fn run(args: ConnArgs, out: &mut dyn Write) -> Result<u8> {
         Some(c) => c.healthz().await.unwrap_or(false),
         None => false,
     };
+    // Backend failures counted by the broker since it started.
+    let mut broker_failures: u64 = 0;
     if reachable {
         r.add(Level::Ok, format!("broker answers at {}", conn.base), None);
         if let Some(c) = &client {
             match c.status().await {
-                Ok(st) => r.add(
-                    Level::Ok,
-                    format!(
-                        "admin API accepts the token (mcpdoze {}, {} server(s))",
-                        st.version,
-                        st.servers.len()
-                    ),
-                    None,
-                ),
+                Ok(st) => {
+                    r.add(
+                        Level::Ok,
+                        format!(
+                            "admin API accepts the token (mcpdoze {}, {} server(s))",
+                            st.version,
+                            st.servers.len()
+                        ),
+                        None,
+                    );
+                    broker_failures = st.servers.iter().map(|s| u64::from(s.failures)).sum();
+                }
                 Err(e) => r.add(
                     Level::Fail,
                     format!("admin API: {e:#}"),
@@ -169,6 +282,17 @@ pub async fn run(args: ConnArgs, out: &mut dyn Write) -> Result<u8> {
             None => r.add(Level::Warn, format!("cannot resolve {}", conn.base), None),
         }
     }
+
+    // Failure log (debug mode) and recent failures.
+    failure_log(
+        &mut r,
+        &conn,
+        config,
+        client.as_ref(),
+        reachable,
+        broker_failures,
+    )
+    .await;
 
     // Background daemon, its log and the statistics log.
     match mcpdoze::run::daemon_log_path(config) {
