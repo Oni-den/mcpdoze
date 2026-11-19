@@ -215,6 +215,63 @@ impl MetaTool for ResultGet {
     }
 }
 
+/// `mcpdoze__batch`: several tool calls in one request. Listed while any
+/// server has `batch` other than `off`; see `router::batch`.
+pub struct BatchTool {
+    router: std::sync::Weak<crate::router::Router>,
+}
+
+impl BatchTool {
+    /// A tool batching calls through `router`.
+    pub fn new(router: std::sync::Weak<crate::router::Router>) -> Self {
+        Self { router }
+    }
+}
+
+impl MetaTool for BatchTool {
+    fn name(&self) -> &str {
+        "batch"
+    }
+
+    fn definition(&self) -> Value {
+        serde_json::json!({
+            "description": "Run several tool calls in one request (at most 16, four at a time). Each call is {name, arguments} with the tool's full listed name. Returns one text block per call, in order, starting with its index, name and isError flag. Servers decide which tools may be batched; refused calls report an error and the others still run. mcpdoze__ tools cannot be batched.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "calls": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": crate::router::batch::MAX_CALLS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "arguments": {"type": "object"}
+                            },
+                            "required": ["name"]
+                        }
+                    }
+                },
+                "required": ["calls"]
+            }
+        })
+    }
+
+    fn enabled(&self) -> bool {
+        self.router.upgrade().is_some_and(|r| r.batch_enabled())
+    }
+
+    fn call<'a>(&'a self, session: &'a Arc<Session>, arguments: Value) -> MetaFuture<'a> {
+        Box::pin(async move {
+            let Some(router) = self.router.upgrade() else {
+                return tool_error("broker is shutting down");
+            };
+            crate::router::batch::run(router, session, arguments).await
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

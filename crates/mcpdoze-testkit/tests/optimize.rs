@@ -662,3 +662,245 @@ cache = { ttl = \"30s\", tools = [\"big\"], on_hit = \"reference\" }
     })
     .await;
 }
+
+// ---- batch meta-tool (8) ----
+
+fn batch_router(mode: &str, extra: &str) -> Arc<Router> {
+    let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+    router
+        .register(
+            "m",
+            "m",
+            spec(
+                MockServerSpec::new()
+                    .tools(&["counter", "write", "info", "secret"])
+                    .read_only(&["counter", "info", "secret"]),
+            ),
+        )
+        .unwrap();
+    router.set_policy(
+        "m",
+        Some(policy(&format!(
+            "[servers.m.optimize]\nbatch = \"{mode}\"\n{extra}"
+        ))),
+    );
+    router
+}
+
+async fn batch(c: &Client, id: i64, calls: Value) -> Value {
+    c.rpc(
+        id,
+        "tools/call",
+        json!({"name":"mcpdoze__batch","arguments":{"calls":calls}}),
+    )
+    .await
+}
+
+fn block_text(r: &Value, i: usize) -> String {
+    r["result"]["content"][i]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no block {i} in {r}"))
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_of_three_read_only_calls_is_three_events_and_one_process() {
+    with_timeout(LIMIT, async {
+        let logdir = tempfile::tempdir().unwrap();
+        let router = batch_router("read-only", "");
+        let st = mcpdoze_core::stats::Stats::start(
+            &mcpdoze_core::config::StatsConfig::default(),
+            logdir.path().to_path_buf(),
+        )
+        .unwrap();
+        router.set_stats(st.clone());
+        let b = Broker::start(router).await;
+        let c = Client::init(b.addr).await;
+        let list = c.rpc(1, "tools/list", json!({})).await;
+        let defs = list["result"]["tools"].as_array().unwrap();
+        let def = defs
+            .iter()
+            .find(|t| t["name"] == "mcpdoze__batch")
+            .expect("batch listed");
+        assert!(def.get("outputSchema").is_none());
+
+        let r = batch(
+            &c,
+            2,
+            json!([
+                {"name":"m__info"},
+                {"name":"m__counter","arguments":{}},
+                {"name":"m__info","arguments":{}}
+            ]),
+        )
+        .await;
+        assert_eq!(r["result"]["content"].as_array().unwrap().len(), 3, "{r}");
+        let pids: Vec<u64> = [0, 2]
+            .iter()
+            .map(|&i| {
+                let t = block_text(&r, i);
+                assert!(
+                    t.starts_with(&format!("[{i}] m__info isError=false\n")),
+                    "{t}"
+                );
+                let body: Value = serde_json::from_str(t.split_once('\n').unwrap().1).unwrap();
+                body["pid"].as_u64().unwrap()
+            })
+            .collect();
+        assert_eq!(pids[0], pids[1], "one backend process");
+        assert!(block_text(&r, 1).starts_with("[1] m__counter isError=false"));
+
+        assert!(st.flush(Duration::from_secs(5)));
+        let mut text = String::new();
+        for e in std::fs::read_dir(logdir.path()).unwrap() {
+            text.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap_or_default());
+        }
+        let events: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let calls = |server: &str| {
+            events
+                .iter()
+                .filter(|e| e["ev"] == "call" && e["server"] == server)
+                .count()
+        };
+        assert_eq!(calls("m"), 3, "{text}");
+        assert_eq!(calls("mcpdoze"), 1, "batch recorded once: {text}");
+        assert_eq!(
+            events.iter().filter(|e| e["ev"] == "spawn").count(),
+            1,
+            "{text}"
+        );
+        let tagged = events
+            .iter()
+            .filter(|e| {
+                e["opt"]
+                    .as_array()
+                    .is_some_and(|o| o.iter().any(|t| t == "batch"))
+            })
+            .count();
+        assert_eq!(tagged, 1, "{text}");
+        b.finish().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_refuses_writes_under_read_only_and_allows_them_under_all() {
+    with_timeout(LIMIT, async {
+        for (mode, allowed) in [("read-only", false), ("all", true)] {
+            let b = Broker::start(batch_router(mode, "")).await;
+            let c = Client::init(b.addr).await;
+            c.rpc(1, "tools/list", json!({})).await;
+            let r = batch(&c, 2, json!([{"name":"m__write"},{"name":"m__counter"}])).await;
+            let (w, ok) = (block_text(&r, 0), block_text(&r, 1));
+            assert!(ok.contains("isError=false"), "{ok}");
+            if allowed {
+                assert!(w.contains("isError=false"), "{w}");
+            } else {
+                assert!(
+                    w.contains("isError=true") && w.contains("readOnlyHint"),
+                    "{w}"
+                );
+            }
+            b.finish().await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_is_not_listed_when_off_and_rejects_nesting_and_overflow() {
+    with_timeout(LIMIT, async {
+        let off = Broker::start(batch_router("off", "")).await;
+        let c = Client::init(off.addr).await;
+        let names = tool_names(&c.rpc(1, "tools/list", json!({})).await);
+        assert!(!names.contains(&"mcpdoze__batch".to_owned()), "{names:?}");
+        off.finish().await;
+
+        let b = Broker::start(batch_router("all", "")).await;
+        let c = Client::init(b.addr).await;
+        c.rpc(1, "tools/list", json!({})).await;
+        let nested =
+            json!([{"name":"mcpdoze__batch","arguments":{"calls":[{"name":"m__counter"}]}}]);
+        let r = batch(&c, 2, nested).await;
+        let t = block_text(&r, 0);
+        assert!(t.contains("isError=true") && t.contains("nested"), "{t}");
+
+        let many: Vec<Value> = (0..17).map(|_| json!({"name":"m__counter"})).collect();
+        let r = batch(&c, 3, Value::Array(many)).await;
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        assert!(block_text(&r, 0).contains("at most 16"), "{r}");
+        let r = batch(&c, 4, json!([])).await;
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        b.finish().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_refuses_a_denied_tool() {
+    with_timeout(LIMIT, async {
+        let b = Broker::start(batch_router("all", "tools_deny = [\"secret\"]\n")).await;
+        let c = Client::init(b.addr).await;
+        c.rpc(1, "tools/list", json!({})).await;
+        let r = batch(&c, 2, json!([{"name":"m__secret"},{"name":"m__counter"}])).await;
+        let denied = block_text(&r, 0);
+        assert!(
+            denied.contains("isError=true") && denied.contains("unknown tool"),
+            "{denied}"
+        );
+        assert!(block_text(&r, 1).contains("isError=false"));
+        b.finish().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_batch_cancels_its_inner_calls() {
+    with_timeout(LIMIT, async {
+        let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+        router
+            .register(
+                "m",
+                "m",
+                spec(
+                    MockServerSpec::new()
+                        .tools(&["slow"])
+                        .read_only(&["slow"])
+                        .delay_ms(20_000),
+                ),
+            )
+            .unwrap();
+        router.set_policy(
+            "m",
+            Some(policy("[servers.m.optimize]\nbatch = \"read-only\"\n")),
+        );
+        let b = Broker::start(router.clone()).await;
+        let c = Arc::new(Client::init(b.addr).await);
+        c.rpc(1, "tools/list", json!({})).await;
+        let inst = router.server("m").unwrap().instance.clone();
+        let c2 = c.clone();
+        let call = tokio::spawn(async move {
+            batch(&c2, 5, json!([{"name":"m__slow"},{"name":"m__slow"}])).await
+        });
+        harness::wait_until("inner calls pending", Duration::from_secs(10), || {
+            inst.pending_calls() == 2
+        })
+        .await;
+        let n = c
+            .post(json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+                "params":{"requestId":5,"reason":"test"}}))
+            .await;
+        assert_eq!(n.status, 202);
+        let r = call.await.unwrap();
+        assert_eq!(r["error"]["code"], -32800, "{r}");
+        harness::wait_until("inner calls cancelled", Duration::from_secs(10), || {
+            inst.pending_calls() == 0
+        })
+        .await;
+        b.finish().await;
+    })
+    .await;
+}

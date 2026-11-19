@@ -285,7 +285,21 @@ impl Router {
             return match tool {
                 Some(t) => {
                     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                    jsonrpc::result(id, t.call(session, args).await)
+                    // Registered as in flight so `notifications/cancelled`
+                    // drops the tool future (a batch then cancels its
+                    // inner calls).
+                    let key = jsonrpc::id_key(&id);
+                    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+                    lock(&session.inflight).insert(key.clone(), cancel_tx);
+                    let _entry = InflightEntry { session, key };
+                    let call = t.call(session, args);
+                    tokio::pin!(call);
+                    tokio::select! {
+                        r = &mut call => jsonrpc::result(id, r),
+                        Ok(()) = &mut cancel_rx => {
+                            jsonrpc::error(id, jsonrpc::REQUEST_CANCELLED, "request cancelled")
+                        }
+                    }
                 }
                 None => {
                     jsonrpc::error(id, jsonrpc::INVALID_PARAMS, format!("unknown tool: {name}"))
@@ -412,7 +426,12 @@ impl Router {
 
     /// `(readOnlyHint == true, has an outputSchema)` of `tool` in the raw
     /// catalog; `(false, false)` when the catalog does not know it.
-    fn tool_hints(&self, server: &Server, ckey: Option<&str>, tool: &str) -> (bool, bool) {
+    pub(super) fn tool_hints(
+        &self,
+        server: &Server,
+        ckey: Option<&str>,
+        tool: &str,
+    ) -> (bool, bool) {
         let Some((entry, _)) = self.entry_for(server, ckey) else {
             return (false, false);
         };

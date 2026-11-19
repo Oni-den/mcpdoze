@@ -40,6 +40,7 @@ pub struct ServerPolicy {
     encode_toon: bool,
     max_result_bytes: u64,
     cache: Option<cache::CachePolicy>,
+    batch: crate::config::BatchMode,
     filters: HashMap<String, result::FieldFilter>,
     default_args: HashMap<String, Map<String, Value>>,
     /// `tool/key` pairs already warned about (one warning each).
@@ -80,6 +81,7 @@ impl ServerPolicy {
             encode_toon: o.encode == crate::config::Encode::Toon,
             max_result_bytes: o.max_result_bytes,
             cache: o.cache.as_ref().map(cache::CachePolicy::new).transpose()?,
+            batch: o.batch,
             filters,
             default_args,
             warned: Mutex::default(),
@@ -107,6 +109,11 @@ impl ServerPolicy {
                 .cache
                 .as_ref()
                 .is_some_and(|c| c.on_hit() == crate::config::CacheHit::Reference)
+    }
+
+    /// Batch meta-tool availability for this server.
+    pub fn batch(&self) -> crate::config::BatchMode {
+        self.batch
     }
 
     /// The result cache settings, when the cache is on.

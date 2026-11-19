@@ -63,6 +63,7 @@
 //! timed-out requests get a JSON-RPC error. `ping` and `roots/list` are
 //! answered by the backend layer itself.
 
+mod batch;
 pub mod catalog;
 mod events;
 mod forward;
@@ -500,6 +501,7 @@ impl Router {
             }),
             results: Arc::default(),
             cache: Arc::default(),
+                reg.register(Arc::new(optimize::meta::BatchTool::new(me.clone())));
         })
     }
 
