@@ -5,14 +5,29 @@ sharing servers through MCPDoze costs and saves compared with running every
 MCP server directly inside each agent session.
 
 ```text
-mcpdoze stats                 # last 7 days
+mcpdoze stats                 # last 7 days, one row per server
 mcpdoze stats --since 30d     # any duration: 12h, 90m, 30d
-mcpdoze stats --json          # machine-readable summary
+mcpdoze stats --tools         # per tool, ranked by response bytes
+mcpdoze stats --tools --top 5 # the 5 largest tools (default 20)
+mcpdoze stats --json          # the whole summary as JSON (all fields)
 ```
 
 `mcpdoze stats` asks the running broker (`GET /admin/v1/stats`, see
 [ADMIN_API.md](ADMIN_API.md)); when the broker is not reachable it reads the
-files directly.
+files directly and says so. Reading the files gives everything except the
+tool-list sizes, which are not logged: the broker measures them from its live
+catalog, so `--tools` prints "not available" for them without a running
+broker.
+
+`--tools` prints one row per tool: calls, average and 95th-percentile
+response size, total bytes, share of the server's tool-response bytes,
+`est tokens` (total bytes / 4), duplicate calls (`DUP`) and bytes not sent to
+the agent thanks to optimisations (`SAVED_BYTES`). A footer gives the totals
+and, from the broker, each server's tool-list size (`LIST_BYTES`, `est
+tokens`).
+
+Sizes are JSON byte counts. `est tokens` is bytes / 4, a rough estimate for
+comparing tools, not a tokenizer count.
 
 ## Configuration
 
@@ -47,9 +62,9 @@ Every line has `ev` (the event type) and `ts` (Unix time in milliseconds).
 
 | `ev` | Fields |
 |---|---|
-| `call` | `server`, `kind` (`tool`, `prompt`, `resource`), `name`, `duration_ms`, `ok`, `error_code` (JSON-RPC error responses), `cold_start`, `spawn_wait_ms`, `bytes_in`, `bytes_out`, `era` (`legacy` 2025-11-25 or `modern` 2026-07-28), `scope`, `instance` (scoped instances) |
+| `call` | `server`, `kind` (`tool`, `prompt`, `resource`), `name`, `duration_ms`, `ok`, `error_code` (JSON-RPC error responses), `fail` (classified failure, see below), `cold_start`, `spawn_wait_ms`, `bytes_in`, `bytes_out`, `bytes_sent` (only when an optimisation changed the response), `opt` (optimisation tags, see below), `cached` (served from the result cache), `dup` (repeat call, see below), `era` (`legacy` 2025-11-25 or `modern` 2026-07-28), `scope`, `instance` (scoped instances) |
 | `spawn` | `server`, `instance`, `startup_ms` (start decision to initialised), `generation` |
-| `unload` | `server`, `instance`, `reason` (`idle`, `crash`, `stop`, `reload`), `uptime_s`, `rss_mb` (working set at the last sample), `generation` |
+| `unload` | `server`, `instance`, `reason` (`idle`, `crash`, `stop`, `reload`), `uptime_s`, `rss_mb` (working set at the last sample), `exit_code` (backend root process, when it exited normally), `signal` (Unix: the signal that killed the root process), `generation` |
 | `session` | `action` (`open`, `close`), `count` (stored sessions after the change) |
 | `sample` | `interval_s`, `broker_rss_mb`, `broker_private_mb`, `sessions`, `running_instances`, `servers` (per server: `instances`, `pids`, `private_mb`, `working_mb`, `sessions`, `est_direct_mb`), `est_direct_mb`, `actual_mb`, `saved_mb`, `dropped` |
 
@@ -58,7 +73,27 @@ Every line has `ev` (the event type) and `ts` (Unix time in milliseconds).
 - `cold_start` means the backend was not running when the call arrived;
   `spawn_wait_ms` is the time spent waiting for it.
 - `bytes_in` / `bytes_out` are the sizes of the request params and of the
-  response as compact JSON.
+  response as compact JSON. `bytes_out` is the size the backend sent.
+- `bytes_sent` is the size the agent actually received, present only when it
+  differs from `bytes_out` (an optimisation changed the response). The
+  difference is the saving (`bytes_saved` in the summary).
+- `opt` lists the optimisations applied to the call. Today: `args` (default
+  arguments filled in) and `minify` (result trimmed). Other tags may appear as
+  optimisations are added; see [OPTIMIZE.md](OPTIMIZE.md). Absent when none
+  applied.
+- `cached`: the response came from the broker's result cache (strict opt-in,
+  see [OPTIMIZE.md](OPTIMIZE.md)).
+- `fail` is set only for a JSON-RPC error response and names its class:
+  `stalled` (the call timed out at the backend), `crash_in_flight` (the
+  backend connection closed during the call), `backoff_rejected` (the backend
+  is in restart backoff), `backend_unavailable` (other unavailable backend),
+  `agent_cancelled` (the agent cancelled), or `rpc_error` (any other JSON-RPC
+  error). A tool result with `isError: true` has `ok` false but no `fail`.
+- `dup` (tool calls only): the same session already made an identical call
+  (same server, tool and arguments) among its last 32 tool calls. Sessionless
+  (2026-07-28) calls share one session. Only the flag is logged; the hash
+  lives in memory, is never written, and the whole table is cleared once more
+  than 512 sessions are tracked.
 - With `debug = true`, `call` events also carry `req_id` (per broker run),
   `acquire_ms` (obtaining a running backend) and `backend_ms` (send to
   response).
@@ -71,6 +106,29 @@ Example lines:
 {"ev":"call","ts":1767225600123,"server":"example","kind":"tool","name":"search","duration_ms":41,"ok":true,"cold_start":false,"spawn_wait_ms":0,"bytes_in":58,"bytes_out":2211,"era":"legacy","scope":"shared"}
 {"ev":"sample","ts":1767225660000,"interval_s":60,"broker_rss_mb":14.2,"broker_private_mb":9.8,"sessions":3,"running_instances":2,"servers":[{"server":"example","instances":1,"pids":3,"private_mb":182.0,"working_mb":201.5,"sessions":3,"est_direct_mb":546.0}],"est_direct_mb":546.0,"actual_mb":191.8,"saved_mb":354.2,"dropped":0}
 ```
+
+## Summary
+
+`mcpdoze stats --json` (and `GET /admin/v1/stats`) returns the summary of the
+events in the period:
+
+- `since_ms`, `until_ms`, `events`, `sessions_opened`, `peak_sessions`,
+  `dropped` (the highest `dropped` count seen).
+- `servers`: per server `calls`, `errors`, `error_rate`, `p50_ms`, `p95_ms`,
+  `cold_starts`, `cold_start_rate`, `spawns`, `unloads` (count per reason),
+  `failures` (count per `fail` class). `calls` counts tool, prompt and
+  resource calls; `errors` counts calls with `ok` false.
+- `tools`: per tool, tool calls only, largest `total_bytes` first: `calls`,
+  `avg_bytes_out`, `p95_bytes_out` (nearest rank), `total_bytes`, `est_tokens`
+  (`total_bytes / 4`), `share` (of the server's total tool-response bytes,
+  three decimals), `dup_calls`, `bytes_saved` (the sum of `bytes_out -
+  bytes_sent`).
+- `lists`: per server the size of its tool list as served to agents, from the
+  live catalog: `list_bytes` (the prefixed list as JSON) and
+  `est_list_tokens` (`list_bytes / 4`). Filled by the broker only; empty when
+  the summary is read from the files.
+- `memory`: the sample averages and peaks described under
+  [Comparing with direct servers](#comparing-with-direct-servers).
 
 ## Privacy
 

@@ -247,6 +247,73 @@ pub fn render_stats(s: &StatsResponse, period: &str) -> String {
     o
 }
 
+/// Renders the per-tool table of `stats --tools`: the `top` tools by
+/// response bytes, then totals and the per-server tool-list sizes.
+pub fn render_tools(s: &StatsResponse, period: &str, top: usize) -> String {
+    let calls: u64 = s.tools.iter().map(|t| t.calls).sum();
+    let mut o = format!("tool responses for the last {period} ({calls} tool calls)\n");
+    if s.tools.is_empty() {
+        o.push_str("no tool calls logged\n");
+    } else {
+        let mut t = Table::new(&[
+            "SERVER",
+            "TOOL",
+            "CALLS",
+            "AVG_BYTES",
+            "P95_BYTES",
+            "TOTAL_BYTES",
+            "SHARE%",
+            "est tokens",
+            "DUP",
+            "SAVED_BYTES",
+        ]);
+        for v in s.tools.iter().take(top) {
+            t.row(vec![
+                v.server.clone(),
+                v.tool.clone(),
+                v.calls.to_string(),
+                v.avg_bytes_out.to_string(),
+                v.p95_bytes_out.to_string(),
+                v.total_bytes.to_string(),
+                fmt_rate(v.share),
+                v.est_tokens.to_string(),
+                v.dup_calls.to_string(),
+                v.bytes_saved.to_string(),
+            ]);
+        }
+        o.push_str(&t.render());
+        if s.tools.len() > top {
+            o.push_str(&format!(
+                "... {} more tool(s) not shown (--top)\n",
+                s.tools.len() - top
+            ));
+        }
+        let total_bytes: u64 = s.tools.iter().map(|t| t.total_bytes).sum();
+        let total_tokens: u64 = s.tools.iter().map(|t| t.est_tokens).sum();
+        let dups: u64 = s.tools.iter().map(|t| t.dup_calls).sum();
+        let saved: u64 = s.tools.iter().map(|t| t.bytes_saved).sum();
+        o.push_str(&format!(
+            "all tools: {total_bytes} bytes, {total_tokens} est tokens, {dups} dup call(s), \
+             {saved} bytes saved\n"
+        ));
+    }
+    if s.lists.is_empty() {
+        o.push_str("tool list sizes: not available (needs the running broker)\n");
+    } else {
+        let mut t = Table::new(&["SERVER", "LIST_BYTES", "est tokens"]);
+        for l in &s.lists {
+            t.row(vec![
+                l.server.clone(),
+                l.list_bytes.to_string(),
+                l.est_list_tokens.to_string(),
+            ]);
+        }
+        o.push_str("tool list sizes (served to agents, live catalog):\n");
+        o.push_str(&t.render());
+    }
+    o
+}
+
 // --------------------------------------------------------------- commands
 
 async fn stats(a: StatsArgs, out: &mut dyn Write) -> Result<()> {
@@ -281,7 +348,11 @@ async fn stats(a: StatsArgs, out: &mut dyn Write) -> Result<()> {
         if let Some(n) = note {
             writeln!(out, "{n}")?;
         }
-        write!(out, "{}", render_stats(&summary, &a.since))?;
+        if a.tools {
+            write!(out, "{}", render_tools(&summary, &a.since, a.top))?;
+        } else {
+            write!(out, "{}", render_stats(&summary, &a.since))?;
+        }
     }
     Ok(())
 }

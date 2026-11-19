@@ -599,3 +599,70 @@ fn stats_rendering() {
     assert!(out.contains("3.5 MB-hours"), "{out}");
     assert!(out.contains("1 events dropped"), "{out}");
 }
+
+#[test]
+fn stats_tools_rendering() {
+    use mcpdoze_core::stats::{ListSize, Summary, ToolSummary};
+    let tool = |server: &str, name: &str, total: u64, dup: u64, saved: u64| ToolSummary {
+        server: server.into(),
+        tool: name.into(),
+        calls: 4,
+        avg_bytes_out: total / 4,
+        p95_bytes_out: total / 2,
+        total_bytes: total,
+        est_tokens: total / 4,
+        share: 0.5,
+        dup_calls: dup,
+        bytes_saved: saved,
+    };
+    let s = Summary {
+        tools: vec![
+            tool("example", "search", 8000, 2, 1000),
+            tool("example", "fetch", 4000, 0, 0),
+            tool("other", "list", 400, 1, 0),
+        ],
+        lists: vec![ListSize {
+            server: "example".into(),
+            list_bytes: 1200,
+            est_list_tokens: 300,
+        }],
+        ..Summary::default()
+    };
+    let out = render_tools(&s, "7d", 2);
+    assert!(
+        out.starts_with("tool responses for the last 7d (12 tool calls)"),
+        "{out}"
+    );
+    let header = out.lines().nth(1).unwrap();
+    assert!(
+        header.contains("est tokens") && header.contains("DUP"),
+        "{header}"
+    );
+    assert!(header.contains("SAVED_BYTES"), "{header}");
+    // Ranked as given (by total bytes); --top 2 hides the third tool.
+    let search = out.lines().find(|l| l.contains("search")).unwrap();
+    assert!(
+        search.contains("8000") && search.contains("2000"),
+        "{search}"
+    );
+    assert!(out.contains("fetch"), "{out}");
+    assert!(!out.contains("  list  "), "{out}");
+    assert!(out.contains("1 more tool(s) not shown"), "{out}");
+    assert!(
+        out.contains("all tools: 12400 bytes, 3100 est tokens, 3 dup call(s), 1000 bytes saved"),
+        "{out}"
+    );
+    assert!(out.contains("tool list sizes (served to agents"), "{out}");
+    assert!(
+        out.contains("example") && out.contains("1200") && out.contains("300"),
+        "{out}"
+    );
+
+    // From the files (no broker): no list sizes, and an empty log says so.
+    let empty = render_tools(&Summary::default(), "1h", 20);
+    assert!(empty.contains("no tool calls logged"), "{empty}");
+    assert!(
+        empty.contains("not available (needs the running broker)"),
+        "{empty}"
+    );
+}

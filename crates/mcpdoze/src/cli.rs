@@ -210,6 +210,19 @@ pub struct StatsArgs {
     /// Print the raw JSON summary.
     #[arg(long)]
     pub json: bool,
+    /// Show the per-tool table (ranked by response bytes) instead of the
+    /// per-server summary.
+    #[arg(long)]
+    pub tools: bool,
+    /// Rows in the per-tool table (with `--tools`).
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 20,
+        requires = "tools",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub top: usize,
 }
 
 /// `mcpdoze list`.
@@ -592,6 +605,14 @@ mod tests {
         assert_eq!(a.since, "30d");
         assert!(a.json);
         assert!(matches!(parse(&["stats"]), Command::Stats(s) if s.since == "7d" && !s.json));
+        let Command::Stats(a) = parse(&["stats", "--tools", "--top", "5"]) else {
+            panic!()
+        };
+        assert!(a.tools && a.top == 5);
+        assert!(matches!(parse(&["stats", "--tools"]), Command::Stats(s) if s.top == 20));
+        assert!(matches!(parse(&["stats"]), Command::Stats(s) if !s.tools));
+        assert!(Cli::try_parse_from(["mcpdoze", "stats", "--top", "5"]).is_err());
+        assert!(Cli::try_parse_from(["mcpdoze", "stats", "--tools", "--top", "0"]).is_err());
     }
 
     #[test]
