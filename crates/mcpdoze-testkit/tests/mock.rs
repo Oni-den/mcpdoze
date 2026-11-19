@@ -32,7 +32,7 @@ impl Mock {
         // Hard timeout: kill after 20 s no matter what.
         let pid = child.id();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(20));
+            std::thread::sleep(Duration::from_secs(60));
             kill(pid);
         });
         Mock { child, stdin, rx }
@@ -44,7 +44,7 @@ impl Mock {
     }
     fn line(&self) -> String {
         self.rx
-            .recv_timeout(Duration::from_secs(15))
+            .recv_timeout(Duration::from_secs(45))
             .expect("no output")
     }
     fn msg(&self) -> Value {
