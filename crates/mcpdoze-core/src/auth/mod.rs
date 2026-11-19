@@ -111,22 +111,38 @@ fn read_token(path: &Path) -> io::Result<Token> {
     }
 }
 
-#[cfg(unix)]
-fn create_private(path: &Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+/// `OpenOptions` for a new owner-only file: mode 0600 on Unix. On Windows
+/// the file inherits the ACL of its directory (see the module docs). Callers
+/// add `create_new`, `append`, ... themselves.
+pub fn private_options() -> std::fs::OpenOptions {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
 }
 
-#[cfg(not(unix))]
-fn create_private(path: &Path) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+/// Creates `path` (new, owner-only) and fails if it exists.
+pub fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    private_options().create_new(true).open(path)
+}
+
+/// Creates `dir` and its parents; a directory this call creates is mode 0700
+/// on Unix (an existing one is left alone).
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let existed = dir.is_dir();
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    if !existed {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = existed;
+    Ok(())
 }
 
 /// Returns a warning message if `path` is readable by group or others.
