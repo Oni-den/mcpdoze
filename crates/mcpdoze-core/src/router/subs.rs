@@ -135,6 +135,17 @@ impl Router {
             rt.spawn(async move { r.replay(&server, &scope_key, &inst, generation).await });
         });
         self.hook_stats(server_name, inst);
+        // A process that went away (crash, idle unload, stop) took its state
+        // with it: nothing cached from it may be served.
+        let me = self.me.clone();
+        let server = server_name.to_owned();
+        inst.on_lifecycle(move |ev| {
+            if matches!(ev, crate::backend::LifecycleEvent::Unloaded { .. }) {
+                if let Some(r) = me.upgrade() {
+                    r.cache.invalidate_server(&server);
+                }
+            }
+        });
     }
 
     /// `resources/subscribe` from a stored session.
@@ -409,6 +420,7 @@ impl Router {
 
     /// `notifications/resources/updated` from an instance of `server`.
     pub(super) fn on_resource_updated(&self, server: &str, scope_key: &str, msg: Value) {
+        self.cache.invalidate_server(server);
         let Some(u) = msg["params"]["uri"].as_str() else {
             return;
         };

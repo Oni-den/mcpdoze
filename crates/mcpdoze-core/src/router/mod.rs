@@ -447,6 +447,8 @@ pub struct Router {
     meta: RwLock<optimize::meta::MetaRegistry>,
     /// Truncated results for `mcpdoze__result_get`.
     results: Arc<optimize::store::ResultStore>,
+    /// Session result cache (technique 5).
+    cache: Arc<optimize::cache::ResultCache>,
 }
 
 impl std::fmt::Debug for Router {
@@ -497,6 +499,7 @@ impl Router {
                 reg
             }),
             results: Arc::default(),
+            cache: Arc::default(),
         })
     }
 
@@ -504,6 +507,8 @@ impl Router {
     /// Backends are not touched; callers announce a changed tool list with
     /// [`notify_tools_changed`](Router::notify_tools_changed).
     pub fn set_policy(&self, server: &str, policy: Option<optimize::ServerPolicy>) {
+        // A changed policy may change what is cacheable: start clean.
+        self.cache.invalidate_server(server);
         let mut m = self.policies.write().unwrap_or_else(|e| e.into_inner());
         match policy {
             Some(p) => m.insert(server.to_owned(), Arc::new(p)),
@@ -523,6 +528,11 @@ impl Router {
     /// The result store (`mcpdoze__result_get`).
     pub fn result_store(&self) -> &Arc<optimize::store::ResultStore> {
         &self.results
+    }
+
+    /// The session result cache.
+    pub fn result_cache(&self) -> &Arc<optimize::cache::ResultCache> {
+        &self.cache
     }
 
     /// Whether any server keeps results for `mcpdoze__result_get`.

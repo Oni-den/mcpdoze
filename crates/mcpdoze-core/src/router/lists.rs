@@ -447,6 +447,7 @@ impl Router {
     /// A backend instance (scope key `scope_key`) said a list changed:
     /// re-list that instance, into its own catalog key.
     pub(super) fn on_list_changed(&self, server: &str, scope_key: &str) {
+        self.cache.invalidate_server(server);
         let Some(server) = self.server(server) else {
             return;
         };

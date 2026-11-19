@@ -394,3 +394,271 @@ async fn small_results_pass_and_filter_drops_output_schema() {
     })
     .await;
 }
+
+// ---- toon (6b) ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toon_is_smaller_lossless_and_falls_back() {
+    with_timeout(LIMIT, async {
+        let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+        router
+            .register(
+                "m",
+                "m",
+                spec(MockServerSpec::new().tools(&["echo"]).big_items(50)),
+            )
+            .unwrap();
+        let b = Broker::start(router.clone()).await;
+        let c = Client::init(b.addr).await;
+        let raw = c.call(1, "big", json!({})).await;
+        let raw_text = raw["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        router.set_policy(
+            "m",
+            Some(policy("[servers.m.optimize]\nencode = \"toon\"\n")),
+        );
+        let r = c.call(2, "big", json!({})).await;
+        let t = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(t.starts_with("[50]{id,name,active}:"), "{t}");
+        assert!(t.len() * 5 <= raw_text.len() * 4);
+        let back = mcpdoze_core::router::optimize::toon::decode(t).unwrap();
+        assert_eq!(back, serde_json::from_str::<Value>(&raw_text).unwrap());
+        assert_eq!(
+            r["result"]["structuredContent"],
+            raw["result"]["structuredContent"]
+        );
+
+        // Not smaller (quoted numeric strings): the original is kept.
+        let e = c.call(3, "echo", json!({"a":["1","2"]})).await;
+        let text = e["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with('{'), "{text}");
+        b.finish().await;
+    })
+    .await;
+}
+
+// ---- session result cache (5) ----
+
+fn cache_router(on_hit: &str, ttl: &str) -> Arc<Router> {
+    let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+    router
+        .register(
+            "m",
+            "m",
+            spec(
+                MockServerSpec::new()
+                    .tools(&["counter", "write", "info"])
+                    .read_only(&["counter", "info"]),
+            ),
+        )
+        .unwrap();
+    router.set_policy(
+        "m",
+        Some(policy(&format!(
+            "[servers.m.optimize]\ncache = {{ ttl = \"{ttl}\", tools = [\"counter\", \"write\"], on_hit = \"{on_hit}\" }}\n"
+        ))),
+    );
+    router
+}
+
+fn counter_value(r: &Value) -> u64 {
+    r["result"]["structuredContent"]["value"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no counter value in {r}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_serves_within_ttl_and_invalidates_on_write_and_respawn() {
+    with_timeout(LIMIT, async {
+        let router = cache_router("full", "30s");
+        let b = Broker::start(router.clone()).await;
+        let c = Client::init(b.addr).await;
+        c.rpc(1, "tools/list", json!({})).await;
+
+        let first = counter_value(&c.call(2, "counter", json!({})).await);
+        let second = counter_value(&c.call(3, "counter", json!({})).await);
+        assert_eq!(first, second, "same value within the TTL");
+        // Different arguments are a different key.
+        let other = counter_value(&c.call(4, "counter", json!({"x": 1})).await);
+        assert_ne!(other, first);
+
+        // `write` is not read-only (never cached, even though listed) and
+        // invalidates the server.
+        let w1 = c.call(5, "write", json!({})).await;
+        let w2 = c.call(6, "write", json!({})).await;
+        assert_ne!(w1["result"], Value::Null);
+        assert_eq!(router.result_cache().usage().0, 0);
+        let after = counter_value(&c.call(7, "counter", json!({})).await);
+        assert!(after > other, "{after} after write");
+        assert_eq!(counter_value(&c.call(8, "counter", json!({})).await), after);
+        drop((w1, w2));
+
+        // Respawn: kill the backend; the cached value must not come back.
+        let pid = c.call(9, "info", json!({})).await["result"]["structuredContent"]["pid"]
+            .as_u64()
+            .unwrap();
+        harness::kill(u32::try_from(pid).unwrap());
+        harness::wait_until("cache emptied by respawn", Duration::from_secs(20), || {
+            router.result_cache().usage().0 == 0
+        })
+        .await;
+        // The crash puts the backend in a short backoff: retry until served.
+        let mut r = c.call(10, "counter", json!({})).await;
+        for n in 0..50 {
+            if r.get("error").is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            r = c.call(11 + n, "counter", json!({})).await;
+        }
+        assert_eq!(counter_value(&r), 1, "fresh process starts counting again");
+        b.finish().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_expires_after_ttl() {
+    with_timeout(LIMIT, async {
+        let router = cache_router("full", "1s");
+        let b = Broker::start(router).await;
+        let c = Client::init(b.addr).await;
+        c.rpc(1, "tools/list", json!({})).await;
+        let first = counter_value(&c.call(2, "counter", json!({})).await);
+        assert_eq!(counter_value(&c.call(3, "counter", json!({})).await), first);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(counter_value(&c.call(4, "counter", json!({})).await) > first);
+        b.finish().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_ignores_tools_not_listed_or_not_read_only() {
+    with_timeout(LIMIT, async {
+        // `counter` listed in cache.tools but not read-only: never cached.
+        let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+        router
+            .register("m", "m", spec(MockServerSpec::new().tools(&["counter"])))
+            .unwrap();
+        router.set_policy(
+            "m",
+            Some(policy(
+                "[servers.m.optimize]\ncache = { ttl = \"30s\", tools = [\"counter\"] }\n",
+            )),
+        );
+        let b = Broker::start(router.clone()).await;
+        let c = Client::init(b.addr).await;
+        c.rpc(1, "tools/list", json!({})).await;
+        let a = counter_value(&c.call(2, "counter", json!({})).await);
+        let a2 = counter_value(&c.call(3, "counter", json!({})).await);
+        assert!(a2 > a);
+        assert_eq!(router.result_cache().usage().0, 0);
+        b.finish().await;
+
+        // Read-only but not in cache.tools: not cached either.
+        let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+        router
+            .register(
+                "m",
+                "m",
+                spec(
+                    MockServerSpec::new()
+                        .tools(&["counter"])
+                        .read_only(&["counter"]),
+                ),
+            )
+            .unwrap();
+        router.set_policy(
+            "m",
+            Some(policy(
+                "[servers.m.optimize]\ncache = { ttl = \"30s\", tools = [\"other\"] }\n",
+            )),
+        );
+        let b = Broker::start(router).await;
+        let c = Client::init(b.addr).await;
+        c.rpc(1, "tools/list", json!({})).await;
+        let a = counter_value(&c.call(2, "counter", json!({})).await);
+        assert!(counter_value(&c.call(3, "counter", json!({})).await) > a);
+        b.finish().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_is_per_session() {
+    with_timeout(LIMIT, async {
+        let router = cache_router("full", "30s");
+        let b = Broker::start(router).await;
+        let c1 = Client::init(b.addr).await;
+        let c2 = Client::init(b.addr).await;
+        c1.rpc(1, "tools/list", json!({})).await;
+        let a = counter_value(&c1.call(2, "counter", json!({})).await);
+        assert_eq!(counter_value(&c1.call(3, "counter", json!({})).await), a);
+        let other = counter_value(&c2.call(2, "counter", json!({})).await);
+        assert_ne!(other, a, "a second session must not see the first's entry");
+        assert_eq!(
+            counter_value(&c2.call(3, "counter", json!({})).await),
+            other
+        );
+        b.finish().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_reference_mode_returns_a_stub_with_a_working_ref() {
+    with_timeout(LIMIT, async {
+        let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+        router
+            .register(
+                "m",
+                "m",
+                spec(
+                    MockServerSpec::new()
+                        .tools(&["echo"])
+                        .big_items(40)
+                        .read_only(&["big"]),
+                ),
+            )
+            .unwrap();
+        router.set_policy(
+            "m",
+            Some(policy(
+                "[servers.m.optimize]
+cache = { ttl = \"30s\", tools = [\"big\"], on_hit = \"reference\" }
+",
+            )),
+        );
+        let b = Broker::start(router).await;
+        let c = Client::init(b.addr).await;
+        let names = tool_names(&c.rpc(1, "tools/list", json!({})).await);
+        assert!(
+            names.contains(&"mcpdoze__result_get".to_owned()),
+            "{names:?}"
+        );
+        let first = c.call(2, "big", json!({})).await;
+        let full = first["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let hit = c.call(3, "big", json!({})).await;
+        let stub = hit["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(stub.contains("equals an earlier result"), "{stub}");
+        let id = stub
+            .split("ref=")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(&[']', '.'][..])
+            .to_owned();
+        let r = result_get(&c, 4, json!({"ref": id})).await;
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let got = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(full.starts_with(got) && !got.is_empty(), "{r}");
+        b.finish().await;
+    })
+    .await;
+}

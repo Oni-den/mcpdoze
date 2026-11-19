@@ -19,7 +19,24 @@ use crate::backend::stdio::id_type_of;
 use crate::backend::stdio::lock;
 use crate::backend::Instance;
 use crate::backend::{CallError, CallMeta, Conn, StateKind};
+use crate::config::CacheHit;
 use crate::diag::{DiagTap, Era as DEra, ExitView, RequestView};
+/// Page size of `mcpdoze__result_get` for a cached result.
+const CACHE_PAGE: usize = 8 * 1024;
+
+/// What the result cache has to do around one `tools/call`.
+enum CacheCall {
+    /// A tool not known to be read-only: invalidates the server's entries.
+    Writer,
+    /// An eligible read: store the result under `key` if nothing
+    /// invalidated the server since `epoch`.
+    Reader {
+        key: optimize::cache::Key,
+        epoch: u64,
+        ttl: std::time::Duration,
+    },
+}
+
 /// Removes a session's in-flight entry when the call ends.
 pub(super) struct InflightEntry<'a> {
     session: &'a Session,
@@ -293,6 +310,36 @@ impl Router {
                 tags.push(TAG_ARGS.to_owned());
             }
         }
+        // Session result cache (technique 5, strict opt-in; see
+        // `optimize::cache`). A tool that is not known to be read-only
+        // invalidates the server's entries around the call.
+        let mut cache_call = None;
+        if let Some(cp) = policy.as_ref().and_then(|p| p.cache()) {
+            let (read_only, has_output_schema) = self.tool_hints(&server, ckey.as_deref(), &tool);
+            if !read_only {
+                self.cache.invalidate_server(&server.name);
+                cache_call = Some(CacheCall::Writer);
+            } else if cp.matches(&tool) && !session.is_ephemeral() {
+                let key = optimize::cache::Key::new(
+                    &server.name,
+                    ckey.as_deref().unwrap_or(""),
+                    session.id(),
+                    &tool,
+                    params.get("arguments"),
+                );
+                if let Some(hit) = self.cache.lookup(&key, std::time::Instant::now()) {
+                    let reference = cp.on_hit() == CacheHit::Reference && !has_output_schema;
+                    return self.serve_cache_hit(
+                        session, &server, id, &tool, &params, key, hit, reference,
+                    );
+                }
+                cache_call = Some(CacheCall::Reader {
+                    key,
+                    epoch: self.cache.epoch(&server.name),
+                    ttl: cp.ttl(),
+                });
+            }
+        }
         let (mut resp, rec) = self
             .forward_routed_open(session, &server, id, "tools/call", params)
             .await;
@@ -311,6 +358,31 @@ impl Router {
                 raw_bytes = Some(raw);
                 tags.extend(applied);
             }
+        }
+        match cache_call {
+            Some(CacheCall::Writer) => self.cache.invalidate_server(&server.name),
+            Some(CacheCall::Reader { key, epoch, ttl }) => {
+                if optimize::cache::cacheable(&resp) {
+                    let stored = self.cache.store(
+                        key,
+                        resp["result"].clone(),
+                        epoch,
+                        ttl,
+                        std::time::Instant::now(),
+                    );
+                    if let optimize::cache::Stored::Yes {
+                        first_for_session: true,
+                    } = stored
+                    {
+                        let cache = self.cache.clone();
+                        let sid = session.id().to_owned();
+                        session.on_end(move || cache.purge_session(&sid));
+                    }
+                } else {
+                    self.cache.remove(&key);
+                }
+            }
+            None => {}
         }
         if let Some(rec) = rec {
             // `bytes_out` stays the raw backend size, `bytes_sent` is what
@@ -333,6 +405,92 @@ impl Router {
                 if let Some(target) = server.running_for(ckey.as_deref()) {
                     self.spawn_dedup_refresh(&server, Some(target), false, "stale catalog");
                 }
+            }
+        }
+        resp
+    }
+
+    /// `(readOnlyHint == true, has an outputSchema)` of `tool` in the raw
+    /// catalog; `(false, false)` when the catalog does not know it.
+    fn tool_hints(&self, server: &Server, ckey: Option<&str>, tool: &str) -> (bool, bool) {
+        let Some((entry, _)) = self.entry_for(server, ckey) else {
+            return (false, false);
+        };
+        entry
+            .tools
+            .iter()
+            .find(|t| t["name"] == tool)
+            .map_or((false, false), |t| {
+                (
+                    t["annotations"]["readOnlyHint"] == Value::Bool(true),
+                    t.get("outputSchema").is_some_and(|o| !o.is_null()),
+                )
+            })
+    }
+
+    /// Answers a `tools/call` from the result cache and records it.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_cache_hit(
+        &self,
+        session: &Arc<Session>,
+        server: &Arc<Server>,
+        id: Value,
+        tool: &str,
+        params: &Value,
+        key: optimize::cache::Key,
+        hit: optimize::cache::Hit,
+        reference: bool,
+    ) -> Value {
+        let full = crate::stats::json_len(&hit.result);
+        let mut raw_bytes = None;
+        let mut result = (*hit.result).clone();
+        if reference {
+            let store = self.result_store();
+            let live = hit
+                .reference
+                .filter(|r| store.get(session.id(), r).is_some());
+            let id = live.or_else(|| {
+                let put = store.put(
+                    session.id(),
+                    optimize::store::Stored {
+                        tool: tool.to_owned(),
+                        result: (*hit.result).clone(),
+                        page: CACHE_PAGE,
+                    },
+                )?;
+                if put.first_for_session {
+                    let st = store.clone();
+                    let sid = session.id().to_owned();
+                    session.on_end(move || st.purge_session(&sid));
+                }
+                self.cache.set_reference(&key, put.id.clone());
+                Some(put.id)
+            });
+            if let Some(r) = id {
+                let stub = optimize::cache::stub(&r, full);
+                if crate::stats::json_len(&stub) < full {
+                    result = stub;
+                    raw_bytes = Some(full);
+                }
+            }
+        }
+        let resp = jsonrpc::result(id, result);
+        if let Some(st) = self.stats() {
+            if let Some(start) = CallStart::new("tools/call", params) {
+                let rec = CallRecord {
+                    st,
+                    start,
+                    trace: CallTrace {
+                        req: self.next_request_id(),
+                        ..CallTrace::default()
+                    },
+                };
+                let extras = CallExtras {
+                    raw_bytes,
+                    opt: vec![optimize::cache::TAG_CACHE.to_owned()],
+                    cached: true,
+                };
+                rec.finish(self, session, server, &resp, extras);
             }
         }
         resp
