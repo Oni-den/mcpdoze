@@ -188,6 +188,12 @@ pub struct UnloadEvent {
     /// Working set at the last sample, when it was sampled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rss_mb: Option<f64>,
+    /// Exit code of the backend's root process, when it exited normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Terminating signal (Unix), when the root process was killed by one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
     /// Lifecycle generation.
     pub generation: u64,
 }

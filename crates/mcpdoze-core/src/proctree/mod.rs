@@ -52,6 +52,39 @@ pub struct TreeMemory {
     pub process_count: usize,
 }
 
+/// How a root process ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExitInfo {
+    /// Exit code, when the process exited normally.
+    pub code: Option<i32>,
+    /// Terminating signal (Unix only), when the process was killed by one.
+    pub signal: Option<i32>,
+}
+
+impl From<ExitStatus> for ExitInfo {
+    fn from(s: ExitStatus) -> Self {
+        #[cfg(unix)]
+        let signal = std::os::unix::process::ExitStatusExt::signal(&s);
+        #[cfg(not(unix))]
+        let signal = None;
+        Self {
+            code: s.code(),
+            signal,
+        }
+    }
+}
+
+impl ExitInfo {
+    /// Human-readable description for `last_error`.
+    pub fn describe(&self) -> String {
+        match (self.code, self.signal) {
+            (Some(c), _) => format!("backend exited, code {c}"),
+            (None, Some(s)) => format!("backend killed by signal {s}"),
+            (None, None) => "backend exited unexpectedly".to_owned(),
+        }
+    }
+}
+
 /// The piped standard streams of the root process.
 #[derive(Debug)]
 pub struct TreeStdio {
@@ -206,6 +239,30 @@ impl ProcessTree {
         let mut rx = self.exit.clone();
         async move {
             let _ = rx.wait_for(Option::is_some).await;
+        }
+    }
+
+    /// How the root process ended; `None` while it runs (or if it could not
+    /// be waited for).
+    pub fn exit_info(&self) -> Option<ExitInfo> {
+        match &*self.exit.borrow() {
+            Some(Ok(status)) => Some(ExitInfo::from(*status)),
+            _ => None,
+        }
+    }
+
+    /// Like [`exited`](ProcessTree::exited), but yields how the root ended
+    /// (`None` if it could not be waited for).
+    pub fn exited_info(
+        &self,
+    ) -> impl std::future::Future<Output = Option<ExitInfo>> + Send + 'static {
+        let mut rx = self.exit.clone();
+        async move {
+            let res = rx.wait_for(Option::is_some).await.ok()?.clone();
+            match res {
+                Some(Ok(status)) => Some(ExitInfo::from(status)),
+                _ => None,
+            }
         }
     }
 }
@@ -541,6 +598,19 @@ mod spawn_tests {
         .expect("test timed out");
     }
 
+    #[test]
+    fn exit_info_describes_code_and_signal() {
+        let sig = ExitInfo {
+            code: None,
+            signal: Some(9),
+        };
+        assert_eq!(sig.describe(), "backend killed by signal 9");
+        assert_eq!(
+            ExitInfo::default().describe(),
+            "backend exited unexpectedly"
+        );
+    }
+
     #[tokio::test]
     async fn quick_exit_reports_status_and_output() {
         timeout(TEST_TIMEOUT, async {
@@ -568,6 +638,10 @@ mod spawn_tests {
                 .expect("read");
             let status = tree.wait().await.expect("wait");
             assert_eq!(status.code(), Some(3));
+            let info = tree.exit_info().expect("exit info");
+            assert_eq!(info.code, Some(3));
+            assert_eq!(info.describe(), "backend exited, code 3");
+            assert_eq!(tree.exited_info().await, Some(info));
             assert_eq!(String::from_utf8_lossy(&out).trim(), "hello");
             tree.terminate(Duration::from_millis(100))
                 .await

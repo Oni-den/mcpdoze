@@ -147,6 +147,7 @@ impl Router {
                     generation,
                     reason,
                     uptime,
+                    exit,
                 } => Event::Unload(UnloadEvent {
                     ts,
                     server: server.clone(),
@@ -154,6 +155,8 @@ impl Router {
                     reason: reason.as_str().to_owned(),
                     uptime_s: uptime.as_secs(),
                     rss_mb: None,
+                    exit_code: exit.and_then(|e| e.code),
+                    signal: exit.and_then(|e| e.signal),
                     generation: *generation,
                 }),
             });

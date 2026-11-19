@@ -87,6 +87,8 @@ fn other_event_shapes() {
         reason: "idle".into(),
         uptime_s: 5,
         rss_mb: None,
+        exit_code: None,
+        signal: None,
         generation: 2,
     }))
     .unwrap();
@@ -169,6 +171,8 @@ fn sample_estimates_direct_memory() {
         reason: "idle".into(),
         uptime_s: 30,
         rss_mb: None,
+        exit_code: None,
+        signal: None,
         generation: 1,
     });
     agg.on_event(&mut unload);
@@ -215,6 +219,8 @@ fn summary_math() {
             reason: reason.into(),
             uptime_s: 1,
             rss_mb: None,
+            exit_code: None,
+            signal: None,
             generation: 1,
         }));
     }

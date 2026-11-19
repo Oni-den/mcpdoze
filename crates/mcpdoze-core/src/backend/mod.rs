@@ -27,7 +27,7 @@ pub use crate::config::SubscriptionPolicy;
 pub use lifecycle::{
     CallGuard, Instance, LifecycleEvent, LifecycleHook, SpawnHook, StateKind, Tuning, UnloadReason,
 };
-pub use stdio::{CallError, CallMeta, StdioConn};
+pub use stdio::{CallError, CallMeta, StdioConn, WireCounts};
 
 /// Default per-request timeout for HTTP backends.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);

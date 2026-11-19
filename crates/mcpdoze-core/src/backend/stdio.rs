@@ -8,7 +8,9 @@
 //! * reader: demultiplexes stdout lines. Responses go to the pending call
 //!   with that broker id (the original agent id is restored); notifications
 //!   and server-to-client requests go to [`BackendEvents`]. Non-JSON lines are
-//!   logged at debug and dropped; lines over [`MAX_LINE`] are dropped.
+//!   counted ([`WireStats`]) and dropped without logging their content; a line
+//!   over [`MAX_LINE`] is dropped and fails the pending calls (its response
+//!   cannot be attributed).
 //! * stderr: keeps the last [`STDERR_LINES`] lines in a ring buffer.
 //! * exit watch: waits for the root process to exit. Exit is a crash signal
 //!   on its own (a grandchild may keep stdout open): after a short drain
@@ -30,7 +32,7 @@ use tokio::time::Instant;
 
 use super::jsonrpc::{self, Kind};
 use super::{handle_server_request, BackendEvents, BackendSpec, ClientSide, Reply};
-use crate::proctree::{resolve_command, ProcessTree, TreeMemory};
+use crate::proctree::{resolve_command, ExitInfo, ProcessTree, TreeMemory};
 
 /// Largest stdout line accepted from a backend.
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
@@ -61,7 +63,8 @@ pub enum CallError {
     /// The call was cancelled by the agent.
     #[error("request cancelled")]
     Cancelled,
-    /// The backend is not available (start failure or crash backoff).
+    /// The backend is not available (start failure, crash backoff, or a
+    /// response the broker could not accept such as an oversize line).
     #[error("backend unavailable: {0}")]
     Unavailable(String),
 }
@@ -102,6 +105,41 @@ impl PendingMap {
     }
 }
 
+/// Counters of unusual traffic on a backend's stdout. Counts only; the
+/// content of such lines is never kept or logged.
+#[derive(Debug, Default)]
+pub struct WireStats {
+    non_json: AtomicU64,
+    invalid: AtomicU64,
+    oversize: AtomicU64,
+    foreign_ids: AtomicU64,
+}
+
+/// Snapshot of [`WireStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WireCounts {
+    /// Lines that were not valid JSON (stdout pollution).
+    pub non_json_lines: u64,
+    /// Valid JSON that was not a JSON-RPC message.
+    pub invalid_messages: u64,
+    /// Lines over [`MAX_LINE`].
+    pub oversize_lines: u64,
+    /// Responses whose id matched no broker id format.
+    pub foreign_ids: u64,
+}
+
+impl WireStats {
+    /// Current counts.
+    pub fn snapshot(&self) -> WireCounts {
+        WireCounts {
+            non_json_lines: self.non_json.load(Ordering::Relaxed),
+            invalid_messages: self.invalid.load(Ordering::Relaxed),
+            oversize_lines: self.oversize.load(Ordering::Relaxed),
+            foreign_ids: self.foreign_ids.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Ring buffer of the most recent stderr lines of a backend.
 #[derive(Debug, Default)]
 pub struct StderrRing(Mutex<VecDeque<String>>);
@@ -133,6 +171,9 @@ pub struct StdioConn {
     closed: watch::Receiver<bool>,
     init: Mutex<Value>,
     client: ClientSide,
+    wire: Arc<WireStats>,
+    exit: watch::Receiver<Option<ExitInfo>>,
+    protocol: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for StdioConn {
@@ -172,6 +213,8 @@ impl StdioConn {
         let (closed_tx, closed) = watch::channel(false);
         let closed_tx = Arc::new(closed_tx);
         let pending = Arc::new(Mutex::new(PendingMap::default()));
+        let wire = Arc::new(WireStats::default());
+        let (exit_tx, exit) = watch::channel(None);
 
         tokio::spawn(write_loop(stdio.stdin, rx));
         tokio::spawn(read_loop(ReadCtx {
@@ -182,7 +225,14 @@ impl StdioConn {
             events,
             closed: closed_tx.clone(),
             client: spec.client.clone(),
+            wire: wire.clone(),
         }));
+        let info = tree.exited_info();
+        tokio::spawn(async move {
+            if let Some(i) = info.await {
+                let _ = exit_tx.send(Some(i));
+            }
+        });
         tokio::spawn(exit_watch(
             server.to_owned(),
             pid,
@@ -203,6 +253,9 @@ impl StdioConn {
             closed,
             init: Mutex::new(Value::Null),
             client: spec.client.clone(),
+            wire,
+            exit,
+            protocol: Mutex::new(None),
         })
     }
 
@@ -229,6 +282,11 @@ impl StdioConn {
         self.notify("notifications/initialized", json!({}))
             .await
             .map_err(|e| e.to_string())?;
+        // Accepted whatever it is; kept so diagnostics can show a mismatch.
+        *lock(&self.protocol) = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .map(|v| v.chars().take(64).collect());
         *lock(&self.init) = result.clone();
         Ok(result)
     }
@@ -251,6 +309,42 @@ impl StdioConn {
     /// The backend's `initialize` result (`Null` before the handshake).
     pub fn init_result(&self) -> Value {
         lock(&self.init).clone()
+    }
+
+    /// The protocol version the backend answered `initialize` with
+    /// (`None` before the handshake or when it sent none).
+    pub fn protocol_version(&self) -> Option<String> {
+        lock(&self.protocol).clone()
+    }
+
+    /// True when the backend negotiated a version other than the one the
+    /// broker requested ([`BACKEND_PROTOCOL_VERSION`]). The connection is
+    /// kept; this only feeds diagnostics.
+    pub fn protocol_mismatch(&self) -> bool {
+        lock(&self.protocol)
+            .as_deref()
+            .is_some_and(|v| v != BACKEND_PROTOCOL_VERSION)
+    }
+
+    /// Counts of non-JSON, invalid, oversize and foreign-id traffic.
+    pub fn wire_counts(&self) -> WireCounts {
+        self.wire.snapshot()
+    }
+
+    /// How the root process ended, if it has.
+    pub fn exit_info(&self) -> Option<ExitInfo> {
+        *self.exit.borrow()
+    }
+
+    /// Waits up to `grace` for the root process exit status (the stdout EOF
+    /// can be seen a moment before the reaper reports the exit).
+    pub(crate) async fn exit_info_wait(&self, grace: Duration) -> Option<ExitInfo> {
+        let mut rx = self.exit.clone();
+        let got = tokio::time::timeout(grace, rx.wait_for(Option::is_some)).await;
+        match got {
+            Ok(Ok(v)) => *v,
+            _ => None,
+        }
     }
 
     /// Memory summed over the process tree (zero once stopped). May scan the
@@ -365,6 +459,38 @@ impl StdioConn {
         }
         fail_all(&self.pending);
     }
+}
+
+/// Fails every pending call with `err` but keeps the connection open.
+fn fail_pending_with(pending: &Mutex<PendingMap>, err: &CallError) {
+    let drained: Vec<Pending> = lock(pending).calls.drain().map(|(_, v)| v).collect();
+    for call in drained {
+        let _ = call.tx.send(Err(err.clone()));
+    }
+}
+
+/// The broker id a response `id` refers to: a JSON number, or a string that
+/// is the canonical decimal form of one (some servers echo ids as strings).
+pub(crate) fn response_id(id: &Value) -> Option<u64> {
+    match id {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok().filter(|n| n.to_string() == *s),
+        _ => None,
+    }
+}
+
+/// Hands a response to the pending call it answers. False when no call
+/// matched (late, unknown or foreign id).
+fn deliver_response(pending: &Mutex<PendingMap>, mut msg: Value) -> bool {
+    let Some(id) = msg.get("id").and_then(response_id) else {
+        return false;
+    };
+    let Some(call) = lock(pending).calls.remove(&id) else {
+        return false;
+    };
+    msg["id"] = call.meta.orig_id;
+    let _ = call.tx.send(Ok(msg));
+    true
 }
 
 fn fail_all(pending: &Mutex<PendingMap>) {
@@ -484,6 +610,7 @@ struct ReadCtx {
     events: Arc<dyn BackendEvents>,
     closed: Arc<watch::Sender<bool>>,
     client: ClientSide,
+    wire: Arc<WireStats>,
 }
 
 async fn read_loop(mut ctx: ReadCtx) {
@@ -492,7 +619,17 @@ async fn read_loop(mut ctx: ReadCtx) {
         match read_frame(&mut ctx.stdout, &mut buf, MAX_LINE).await {
             Ok(Frame::Line) => {}
             Ok(Frame::TooLong) => {
+                ctx.wire.oversize.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(server = %ctx.server, "backend line over 16 MiB dropped");
+                // The dropped line may have been a response; which call it
+                // answered is unknowable, so fail the pending ones rather
+                // than leave them hanging.
+                fail_pending_with(
+                    &ctx.pending,
+                    &CallError::Unavailable(
+                        "backend response exceeded the 16 MiB line limit".into(),
+                    ),
+                );
                 continue;
             }
             Ok(Frame::Eof) | Err(_) => break,
@@ -502,7 +639,9 @@ async fn read_loop(mut ctx: ReadCtx) {
         }
         match serde_json::from_slice::<Value>(&buf) {
             Ok(msg) => dispatch(&ctx, msg),
-            Err(_) => tracing::debug!(server = %ctx.server, "non-JSON backend line dropped"),
+            Err(_) => {
+                ctx.wire.non_json.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     fail_all(&ctx.pending);
@@ -510,19 +649,15 @@ async fn read_loop(mut ctx: ReadCtx) {
     tracing::debug!(server = %ctx.server, "backend stdout closed");
 }
 
-fn dispatch(ctx: &ReadCtx, mut msg: Value) {
+fn dispatch(ctx: &ReadCtx, msg: Value) {
     match jsonrpc::kind(&msg) {
         Kind::Response => {
-            let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+            if msg.get("id").and_then(response_id).is_none() {
+                ctx.wire.foreign_ids.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(server = %ctx.server, "response with foreign id dropped");
-                return;
-            };
-            let Some(call) = lock(&ctx.pending).calls.remove(&id) else {
-                tracing::debug!(server = %ctx.server, id, "late or unknown response dropped");
-                return;
-            };
-            msg["id"] = call.meta.orig_id;
-            let _ = call.tx.send(Ok(msg));
+            } else if !deliver_response(&ctx.pending, msg) {
+                tracing::debug!(server = %ctx.server, "late or unknown response dropped");
+            }
         }
         Kind::Notification => {
             let sessions = lock(&ctx.pending).sessions();
@@ -552,7 +687,9 @@ fn dispatch(ctx: &ReadCtx, mut msg: Value) {
                 reply,
             );
         }
-        Kind::Invalid => tracing::debug!(server = %ctx.server, "invalid JSON-RPC line dropped"),
+        Kind::Invalid => {
+            ctx.wire.invalid.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -594,6 +731,83 @@ mod tests {
                 (Frame::TooLong, vec![]),
                 (Frame::Line, b"xyz".to_vec()),
             ]
+        );
+    }
+
+    type Rx = oneshot::Receiver<Result<Value, CallError>>;
+
+    fn pending_with(id: u64, orig: Value) -> (Mutex<PendingMap>, Rx) {
+        let (tx, rx) = oneshot::channel();
+        let mut m = PendingMap::default();
+        m.calls.insert(
+            id,
+            Pending {
+                tx,
+                meta: CallMeta {
+                    orig_id: orig,
+                    ..CallMeta::default()
+                },
+            },
+        );
+        (Mutex::new(m), rx)
+    }
+
+    #[test]
+    fn response_ids_accept_numbers_and_canonical_numeric_strings() {
+        assert_eq!(response_id(&json!(7)), Some(7));
+        assert_eq!(response_id(&json!("7")), Some(7));
+        assert_eq!(response_id(&json!("007")), None);
+        assert_eq!(response_id(&json!("+7")), None);
+        assert_eq!(response_id(&json!(" 7")), None);
+        assert_eq!(response_id(&json!("abc")), None);
+        assert_eq!(response_id(&json!(-1)), None);
+        assert_eq!(response_id(&json!(1.5)), None);
+        assert_eq!(response_id(&json!(null)), None);
+        assert_eq!(response_id(&json!({"a": 1})), None);
+    }
+
+    #[tokio::test]
+    async fn string_id_response_reaches_pending_call_with_original_id() {
+        let (p, rx) = pending_with(3, json!("agent-1"));
+        assert!(deliver_response(
+            &p,
+            json!({"jsonrpc":"2.0","id":"3","result":{}})
+        ));
+        let v = rx.await.unwrap().unwrap();
+        assert_eq!(v["id"], json!("agent-1"));
+        assert!(lock(&p).calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_or_foreign_id_leaves_pending_alone() {
+        let (p, _rx) = pending_with(3, json!(1));
+        assert!(!deliver_response(&p, json!({"id":"x","result":{}})));
+        assert!(!deliver_response(&p, json!({"id":4,"result":{}})));
+        assert_eq!(lock(&p).calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversize_failure_errors_pending_without_closing() {
+        let (p, rx) = pending_with(1, json!(1));
+        fail_pending_with(&p, &CallError::Unavailable("too big".into()));
+        assert_eq!(
+            rx.await.unwrap(),
+            Err(CallError::Unavailable("too big".into()))
+        );
+        let g = lock(&p);
+        assert!(g.calls.is_empty());
+        assert!(!g.closed, "connection stays usable");
+    }
+
+    #[test]
+    fn wire_stats_snapshot_counts() {
+        let w = WireStats::default();
+        w.non_json.fetch_add(2, Ordering::Relaxed);
+        w.oversize.fetch_add(1, Ordering::Relaxed);
+        let c = w.snapshot();
+        assert_eq!(
+            (c.non_json_lines, c.oversize_lines, c.foreign_ids),
+            (2, 1, 0)
         );
     }
 

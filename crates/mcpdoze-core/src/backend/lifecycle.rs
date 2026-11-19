@@ -33,7 +33,8 @@ use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 
 use super::http::HttpConn;
-use super::stdio::{lock, StderrRing, StdioConn};
+use super::stdio::{lock, StderrRing, StdioConn, EXIT_DRAIN};
+use crate::proctree::ExitInfo;
 use super::{BackendEvents, BackendSpec, CallError, Conn, SubscriptionPolicy};
 
 /// Timing knobs of the lifecycle; defaults follow the development plan.
@@ -114,6 +115,8 @@ pub enum LifecycleEvent {
         reason: UnloadReason,
         /// How long the process ran.
         uptime: Duration,
+        /// How the root process ended, when known (stdio backends only).
+        exit: Option<ExitInfo>,
     },
 }
 
@@ -648,6 +651,7 @@ impl Instance {
             generation,
             reason,
             uptime,
+            exit: stdio_exit(&conn),
         });
         let _ = done.send(true);
     }
@@ -681,7 +685,15 @@ impl Instance {
         Some(g.idle_deadline)
     }
 
-    fn on_closed(self: &Arc<Self>, generation: u64) {
+    fn running_conn_gen(&self, generation: u64) -> Option<Arc<Conn>> {
+        let g = lock(&self.inner);
+        match &g.state {
+            State::Running { conn, .. } if g.generation == generation => Some(conn.clone()),
+            _ => None,
+        }
+    }
+
+    fn on_closed(self: &Arc<Self>, generation: u64, exit: Option<ExitInfo>) {
         let eager;
         let conn = {
             let g = &mut *lock(&self.inner);
@@ -700,10 +712,14 @@ impl Instance {
             let wait = self.tuning.backoff(g.failures);
             g.idle_deadline = None;
             g.drain = false;
-            g.last_error = Some("backend exited unexpectedly".into());
+            let error = exit.map_or_else(
+                || "backend exited unexpectedly".to_owned(),
+                |e| e.describe(),
+            );
+            g.last_error = Some(error.clone());
             g.state = State::Failed {
                 until: Instant::now() + wait,
-                error: "backend exited unexpectedly".into(),
+                error,
             };
             tracing::warn!(server = %self.name, pid = ?conn.pid(), backoff_ms = wait.as_millis() as u64, "backend crashed");
             eager = self.keeps_alive(g);
@@ -713,6 +729,7 @@ impl Instance {
             generation,
             reason: UnloadReason::Crash,
             uptime: conn.started().elapsed(),
+            exit,
         });
         // Reap whatever is left of the tree (grandchildren).
         tokio::spawn(async move { conn.shutdown(Duration::ZERO).await });
@@ -780,8 +797,21 @@ async fn respawn_pinned(inst: Weak<Instance>) {
 
 async fn monitor(inst: Weak<Instance>, generation: u64, mut closed: watch::Receiver<bool>) {
     let _ = closed.wait_for(|c| *c).await;
-    if let Some(inst) = inst.upgrade() {
-        inst.on_closed(generation);
+    let Some(inst) = inst.upgrade() else { return };
+    // The stdout EOF can arrive a moment before the exit status is reaped.
+    let conn = inst.running_conn_gen(generation);
+    let exit = match conn.as_deref() {
+        Some(Conn::Stdio(c)) => c.exit_info_wait(EXIT_DRAIN).await,
+        _ => None,
+    };
+    inst.on_closed(generation, exit);
+}
+
+/// Exit status of a stdio connection's root process, if it has ended.
+fn stdio_exit(conn: &Conn) -> Option<ExitInfo> {
+    match conn {
+        Conn::Stdio(c) => c.exit_info(),
+        Conn::Http(_) => None,
     }
 }
 
