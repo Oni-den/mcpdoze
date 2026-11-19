@@ -204,6 +204,10 @@ pub struct ReloadResponse {
     pub errors: Vec<String>,
     /// Broker-section changes that only take effect after a restart.
     pub restart_required: Vec<String>,
+    /// Some server's `optimize` or `tools` table changed. These never respawn
+    /// a backend; the broker sends `notifications/tools/list_changed` when set.
+    #[serde(default)]
+    pub optimize_changed: bool,
 }
 
 /// `POST /servers/{name}/refresh` response, and one item of

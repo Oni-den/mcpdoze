@@ -488,6 +488,7 @@ impl Control {
     ) -> ReloadResponse {
         let mut resp = ReloadResponse {
             restart_required: broker_restart_fields(&st.config.broker, &new.broker),
+            optimize_changed: config::optimize_changed(&st.config, &new),
             ..ReloadResponse::default()
         };
         if st.config.stats != new.stats {
@@ -1360,6 +1361,41 @@ debug = "trace"
             .set_runtime_debug(config::DebugLayer::from_cli(Some(DebugMode::Off), &[]))
             .await;
         assert_eq!(control.debug_now().mode_for("srv"), DebugMode::Off);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn optimize_change_is_flagged_without_reregistering() {
+        const SERVER: &str = "[servers.srv]\ntransport = \"stdio\"\ncommand = \"c\"\n";
+        let dir = std::env::temp_dir().join(format!("mcpdoze-admin-opt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, SERVER).unwrap();
+
+        let router = Router::with(Arc::new(MemoryCatalog::default()), Default::default());
+        let control = Control::new(
+            router.clone(),
+            Config::load(&path).unwrap(),
+            Some(path.clone()),
+        );
+        assert_eq!(control.apply_initial().await.added, vec!["srv".to_owned()]);
+
+        // Adding an optimize table flags the change; the backend is kept.
+        std::fs::write(
+            &path,
+            format!("{SERVER}[servers.srv.optimize]\nminify_json = true\n"),
+        )
+        .unwrap();
+        let resp = control.reload().await.unwrap();
+        assert!(resp.optimize_changed, "{resp:?}");
+        assert!(resp.changed.is_empty(), "{resp:?}");
+        assert!(resp.restart_required.is_empty(), "{resp:?}");
+        assert!(resp.added.is_empty() && resp.removed.is_empty(), "{resp:?}");
+        assert!(router.server("srv").is_some());
+
+        // The same file again is not a change.
+        let resp = control.reload().await.unwrap();
+        assert!(!resp.optimize_changed, "{resp:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
