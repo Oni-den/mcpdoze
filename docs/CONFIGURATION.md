@@ -72,6 +72,51 @@ retention_days = 30
 sample_interval_secs = 120
 ```
 
+## `[debug]`
+
+Failure diagnostics (see [DEBUG.md](DEBUG.md)). The default is `mode = "off"`:
+nothing is recorded and no directory is created.
+
+```toml
+[debug]
+mode = "failures"
+tool_errors = false
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `mode` | `"off"`, `"failures"` or `"trace"` | `"off"` | `failures` writes classified failure records; `trace` adds slow calls and odd-but-successful events. Applies to every server without its own `debug` key. |
+| `dir` | path | `"debug"` | Relative paths are under the platform data directory; absolute paths are used as written. Must not be empty. |
+| `max_file_bytes` | integer | `5242880` | Size at which `failures.jsonl` rotates. At least `4096`. |
+| `keep` | integer | `5` | Rotated files kept. Range 1-100. |
+| `frames` | integer | `32` | Recent frames kept per backend for a failure record. Range 1-4096. |
+| `stderr_lines` | integer | `40` | Stderr lines kept in a record's tail. At most 1000. |
+| `slow_call` | duration | `"30s"` | Calls slower than this are recorded in `trace` mode. Must be greater than 0. |
+| `tool_errors` | bool | `false` | Also record tool results with `isError: true`. |
+| `raw` | bool | `false` | Raw frame capture. **Not available in this version**: the admin API and the CLI refuse `true`. Leave it `false`. |
+| `raw_for` | duration | `"30m"` | Lifetime of raw capture if it were enabled. Must be greater than 0. Reserved. |
+
+Unknown keys are rejected. Changes apply on reload without unloading a backend.
+
+### Enabling per server and per run
+
+Precedence, highest first: runtime (admin API `/admin/v1/debug`, reverts on
+restart), CLI, environment, per-server, global `[debug] mode`.
+
+- `servers.<name>.debug = "off" | "failures" | "trace"` overrides the global
+  mode for one server.
+- Environment: `MCPDOZE_DEBUG` takes a mode (applies to every server) or a
+  comma list of server names (each at `failures`). Two different modes in
+  one value are an error. The value is never echoed in errors.
+- CLI: `mcpdoze serve --debug[=MODE]` applies to every server;
+  `--debug-server NAME` (repeatable) limits it to the named servers, and the
+  mode then defaults to `failures`. A bare `--debug` means `failures`.
+
+```toml
+[servers.example]
+debug = "trace"
+```
+
 ## `[servers.<name>]`
 
 The name uses `[A-Za-z0-9_.-]`, at most 64 characters. Tools are exposed as
@@ -97,6 +142,14 @@ suffix.
 | `probe` | bool | `true` | At registration, start a throwaway instance once to list tools when no valid catalog exists. With `false`, the first `tools/list` starts the server. |
 | `catalog_max_age` | duration | `broker.catalog_max_age` | Background catalog refresh age for this server. |
 | `subscriptions` | `"keep-alive"` or `"allow-unload"` | `"keep-alive"` | What an instance holding resource subscriptions does at its idle TTL: stay loaded (and respawn eagerly after a crash), or unload and resubscribe on its next start. See [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md). |
+| `call_timeout` | duration | unset (no limit) | Longest one `tools/call` may wait for the backend. Past it the call fails with JSON-RPC error `-32000` and the backend is told to cancel. Must be greater than 0. |
+| `debug` | `"off"`, `"failures"` or `"trace"` | `[debug] mode` | Failure-diagnostics mode of this server. See [`[debug]`](#debug). |
+| `optimize` | table | unset (off) | Token-optimisation settings. See [`[servers.<name>.optimize]`](#serversnameoptimize). |
+| `tools` | table of tables | `{}` | Per-tool settings, keyed by backend tool name. See [`[servers.<name>.tools.<tool>]`](#serversnametoolstool). |
+
+`optimize` and `tools` are not part of the backend registration: changing them
+never respawns a backend. A change that affects tool lists sends
+`notifications/tools/list_changed`.
 
 ```toml
 [servers.remote]
@@ -105,6 +158,55 @@ url = "https://example.com/mcp"
 headers = { Authorization = { from_env = "REMOTE_AUTH" } }
 idle_ttl = "30m"
 prefix = "rem"
+```
+
+## `[servers.<name>.optimize]`
+
+Opt-in token optimisation for one server (see [OPTIMIZE.md](OPTIMIZE.md)). A
+server without this table behaves exactly as before. Unknown keys are rejected.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `tools_allow` | list of globs | `[]` (all) | Only backend tools matching a pattern are listed. Globs use `*`, `?` and `[...]` on backend tool names. |
+| `tools_deny` | list of globs | `[]` | Matching tools are not listed. A denied tool that is still called returns `-32602` (unknown tool). |
+| `description_max_chars` | integer | unset | Trims tool descriptions to this length, cutting at a sentence boundary. Must be greater than 0. |
+| `strip_schema_descriptions` | bool | `false` | Removes `description`, `title` and `examples` inside `inputSchema` only. |
+| `minify_json` | bool | `false` | Re-serialises pretty-printed JSON text results compactly. Lossless. |
+| `encode` | `"none"` or `"toon"` | `"none"` | `toon` encodes text results only when the round trip is lossless and at least 20 % smaller. |
+| `max_result_bytes` | integer | `0` (off) | Larger results are truncated and the full result is kept for `mcpdoze__result_get`. `0` or at least `512`. |
+| `cache` | table | unset (off) | Session cache for listed read-only tools. Keys: `ttl` (duration, greater than 0), `tools` (non-empty list of globs), `on_hit` (`"full"` default, or `"reference"`). |
+| `batch` | `"off"`, `"read-only"` or `"all"` | `"off"` | Accepted by the parser, but the `mcpdoze__batch` meta-tool is not built in this version, so the value has no effect yet. `"all"` bypasses per-tool approval and must be explicit. |
+
+```toml
+[servers.example.optimize]
+tools_allow = ["search*", "get_*"]
+minify_json = true
+max_result_bytes = 8192
+cache = { ttl = "60s", tools = ["get_user"] }
+```
+
+`cache.on_hit = "reference"` is refused at runtime for tools that have an
+`outputSchema`. Cache eligibility (read-only tools only) is described in
+OPTIMIZE.md.
+
+## `[servers.<name>.tools.<tool>]`
+
+Per-tool settings, keyed by the backend tool name (not the prefixed name).
+Unknown keys are rejected.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `default_args` | table | `{}` | Merged into the call's `arguments` only for keys the agent omitted. Keys are checked against the live catalog `inputSchema` at runtime, not at config load. |
+| `keep` | list of JSON pointers (globs allowed) | `[]` | Output filter: only the matching fields of the result are kept. |
+| `drop` | list of JSON pointers (globs allowed) | `[]` | Output filter: the matching fields are removed. |
+
+`keep` and `drop` are mutually exclusive. A tool whose `structuredContent` the
+filter changes is listed without its `outputSchema`.
+
+```toml
+[servers.example.tools.list_issues]
+default_args = { per_page = 20 }
+keep = ["/items/*/id", "/items/*/title"]
 ```
 
 ## Headers helper

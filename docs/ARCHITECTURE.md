@@ -17,6 +17,11 @@ endpoint and manages the MCP servers (backends) behind it.
 
 - `mcpdoze-core`: config, auth, router, catalog, backends (stdio and HTTP),
   lifecycle, process-tree handling, admin API, import (migration).
+  - `diag`: failure diagnostics. The recorder, the sanitising record types and
+    the failure log (`docs/DEBUG.md`).
+  - `router/optimize`: opt-in token optimisation applied at view time: list
+    and result transforms, the result store, the session cache and meta-tools
+    (`docs/OPTIMIZE.md`).
 - `mcpdoze`: the binary: `serve`, the admin-API client commands, `doctor`,
   `autostart`, `import`, and the optional Claude Code `hook`.
 - `mcpdoze-testkit`: scriptable mock stdio and HTTP MCP servers for tests.
@@ -91,6 +96,10 @@ the owning agent session over its event stream. See [SCOPES.md](SCOPES.md).
   literals are rejected by default. Values are never logged or written to the
   catalog or admin responses.
 - Request bodies are capped at 16 MiB.
+- The failure log (`diag`) is sanitised by construction: its record types
+  cannot hold a raw JSON value, so argument values, results, environment
+  values and header values cannot be written to it. It is off by default and
+  writes nothing until enabled.
 - `unsafe` code is confined to process-tree management.
 
 The broker does not sandbox backends: they run with your user's rights.

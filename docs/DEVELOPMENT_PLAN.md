@@ -139,6 +139,8 @@ paragraph above is historical.
 | M6 | done | HTTP passthrough. |
 | M7 | done | `per-cwd` / `per-session` scopes and server-to-client routing (sampling, elicitation, roots). |
 | M8 | done | Autostart, migration skill (surgical rollback), hook and case study done; release workflow builds the binaries; Linux/macOS covered by CI; version 0.1.0. Open: the nightly soak run. The v0.2 items (the stateless 2026-07-28 protocol, decisions/0002; resource subscriptions, SUBSCRIPTIONS.md) are implemented on main. |
+| M9 | done, except raw capture | Failure diagnostics (`diag`, `mcpdoze debug`, export and replay), the stdio call timeout and the oversize-frame, string-id and exit-status fixes. Raw frame capture is deferred and refused. See [DEBUG.md](DEBUG.md). |
+| M10 | partly done | Built: per-tool stats, tool allow/deny, description trimming, `default_args`, `minify_json`, truncation with `mcpdoze__result_get`, field filters, session cache, TOON. Not built: the batch meta-tool (A4); deferred tool mode (3c) is not built, see [decisions/0003](decisions/0003-deferred-tools.md). See [OPTIMIZE.md](OPTIMIZE.md). |
 
 
 ## Hardest problems

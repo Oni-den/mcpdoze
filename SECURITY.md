@@ -31,6 +31,13 @@ supported.
 - **Backend secrets.** Secrets are referenced by environment-variable name
   (`{ from_env = "NAME" }`). Literal secret-looking values are refused unless
   explicitly allowed. Leaking backend environment values is in scope.
+- **Failure logs and export.** The failure log is off by default. Its records
+  are built from types that cannot hold argument, result, environment or
+  header values. `mcpdoze debug export` is designed to be safe to paste into a
+  public issue, but review its output before posting it; a report that it
+  leaks something is in scope. `mcpdoze logs` prints unscrubbed backend
+  stderr and is **not** safe to paste. Raw frame capture is not available in
+  this version.
 - **Admin API.** Loopback-only regardless of the bind address.
 - **Process trees.** Failures to terminate child processes, or orphaned
   processes after the broker exits, are in scope.

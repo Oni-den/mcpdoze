@@ -44,6 +44,14 @@ memory stays allocated even when the tools are idle.
   connections are shared as well.
 - **Migration skill.** An agent skill moves your existing MCP configuration
   behind the broker, with backup and rollback.
+- **Failure diagnostics.** Off by default. When enabled, `mcpdoze debug`
+  records why a brokered server failed, as shape and size data with no
+  argument or result values, and exports a report that is designed to be safe
+  to attach to an issue. See [docs/DEBUG.md](docs/DEBUG.md).
+- **Opt-in token optimisation.** Per-server settings can trim tool lists,
+  shrink results, cache read-only calls and cut oversize output with on-demand
+  retrieval. Nothing changes unless configured. See
+  [docs/OPTIMIZE.md](docs/OPTIMIZE.md).
 
 ## Results
 
