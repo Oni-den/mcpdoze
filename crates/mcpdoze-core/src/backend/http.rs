@@ -42,6 +42,7 @@ use super::stdio::{lock, BACKEND_PROTOCOL_VERSION};
 use super::{
     handle_server_request, BackendEvents, BackendSpec, CallError, CallMeta, ClientSide, Reply,
 };
+use crate::diag::{BackendView, BodyClass, DiagTap, HttpView, Kind as DKind};
 
 /// Largest upstream response body accepted (JSON body or whole SSE stream).
 pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
@@ -93,24 +94,107 @@ struct Session {
     epoch: u64,
 }
 
-enum XErr {
+/// Metadata of one HTTP exchange, kept for diagnostics. Shapes only: no
+/// header value, URL query or body byte is ever stored here.
+#[derive(Debug, Clone, Default)]
+struct Meta {
+    status: Option<u16>,
+    /// Media type without parameters.
+    content_type: Option<String>,
+    body_len: Option<u64>,
+    body_class: Option<BodyClass>,
+    /// Scheme word of `www-authenticate` only.
+    www_auth: Option<String>,
+    retry_after_s: Option<u64>,
+    session_present: bool,
+    transport_error: Option<&'static str>,
+}
+
+enum XKind {
     SessionGone,
     Transport(String),
     Status(u16),
     Other(String),
 }
 
+/// A failed exchange: what happened, the response metadata and the
+/// diagnostic record kind it maps to.
+struct XErr {
+    kind: XKind,
+    meta: Meta,
+    diag: DKind,
+}
+
 impl XErr {
+    fn new(kind: XKind, diag: DKind, meta: &Meta) -> Box<Self> {
+        Box::new(Self {
+            kind,
+            meta: meta.clone(),
+            diag,
+        })
+    }
+
     fn into_call(self) -> CallError {
-        CallError::Unavailable(match self {
-            XErr::SessionGone => "upstream session lost".into(),
-            XErr::Transport(m) => format!("upstream connection failed: {m}"),
-            XErr::Status(401 | 403) => {
+        CallError::Unavailable(match self.kind {
+            XKind::SessionGone => "upstream session lost".into(),
+            XKind::Transport(m) => format!("upstream connection failed: {m}"),
+            XKind::Status(401 | 403) => {
                 "upstream rejected the request (HTTP 401/403); check the configured headers".into()
             }
-            XErr::Status(c) => format!("upstream returned HTTP {c}"),
-            XErr::Other(m) => m,
+            XKind::Status(c) => format!("upstream returned HTTP {c}"),
+            XKind::Other(m) => m,
         })
+    }
+}
+
+/// Class of a body from its media type and first bytes.
+fn classify_body(content_type: Option<&str>, head: &[u8], len: u64) -> BodyClass {
+    if len == 0 {
+        return BodyClass::Empty;
+    }
+    let ct = content_type.unwrap_or("");
+    if ct.contains("event-stream") {
+        return BodyClass::Sse;
+    }
+    if ct.contains("json") {
+        return BodyClass::Json;
+    }
+    if ct.contains("html") {
+        return BodyClass::Html;
+    }
+    match head.iter().find(|b| !b.is_ascii_whitespace()) {
+        Some(b'<') => BodyClass::Html,
+        Some(b'{' | b'[') => BodyClass::Json,
+        _ if ct.starts_with("text/") => BodyClass::Text,
+        _ => BodyClass::Other,
+    }
+}
+
+/// Response metadata known from the head alone.
+fn head_meta(resp: &reqwest::Response, had_session: bool) -> Meta {
+    let h = resp.headers();
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok());
+    let content_type = get("content-type").map(|v| {
+        v.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    });
+    Meta {
+        status: Some(resp.status().as_u16()),
+        body_class: content_type
+            .as_deref()
+            .filter(|c| c.contains("event-stream"))
+            .map(|_| BodyClass::Sse),
+        content_type,
+        body_len: get("content-length").and_then(|v| v.parse().ok()),
+        www_auth: get("www-authenticate")
+            .and_then(|v| v.split_whitespace().next())
+            .map(str::to_owned),
+        retry_after_s: get("retry-after").and_then(|v| v.trim().parse().ok()),
+        session_present: had_session,
+        transport_error: None,
     }
 }
 
@@ -143,6 +227,8 @@ pub struct HttpConn {
     client: ClientSide,
     /// The upstream `GET` event stream task (see `http_listen.rs`).
     listen: Mutex<Option<AbortHandle>>,
+    /// Failure diagnostics (see [`Self::set_diag`]).
+    diag: Mutex<Option<Arc<DiagTap>>>,
 }
 
 impl std::fmt::Debug for HttpConn {
@@ -156,7 +242,7 @@ impl std::fmt::Debug for HttpConn {
 
 impl HttpConn {
     /// Prepares a connection (no network traffic until [`Self::initialize`]).
-    pub(crate) fn new(
+    pub fn new(
         server: &str,
         generation: u64,
         spec: &BackendSpec,
@@ -192,7 +278,46 @@ impl HttpConn {
             init: Mutex::new(Value::Null),
             client: spec.client.clone(),
             listen: Mutex::new(None),
+            diag: Mutex::new(None),
         }))
+    }
+
+    /// Attaches the failure-diagnostics tap (the single integration point;
+    /// call before [`Self::initialize`]). Records carry response shapes
+    /// only, never header values, URL queries or bodies.
+    pub fn set_diag(&self, tap: Arc<DiagTap>) {
+        *lock(&self.diag) = Some(tap);
+    }
+
+    fn tap(&self) -> Option<Arc<DiagTap>> {
+        lock(&self.diag).clone().filter(|t| t.enabled())
+    }
+
+    fn backend_view(&self) -> BackendView<'static> {
+        let epoch = lock(&self.session).epoch;
+        BackendView::new(
+            if epoch == 0 { "starting" } else { "running" },
+            self.generation,
+        )
+    }
+
+    /// Records a failed exchange (no-op when diagnostics are off).
+    fn diag_xerr(&self, e: &XErr, helper_rerun: bool) {
+        let Some(tap) = self.tap() else { return };
+        let m = &e.meta;
+        let view = HttpView {
+            url: Some(&self.url),
+            status: m.status,
+            content_type: m.content_type.as_deref(),
+            body_len: m.body_len,
+            body_class: m.body_class,
+            www_authenticate: m.www_auth.as_deref(),
+            retry_after_s: m.retry_after_s,
+            session_present: Some(m.session_present),
+            transport_error: m.transport_error,
+            helper_rerun,
+        };
+        tap.on_http(e.diag, None, &view, &self.backend_view());
     }
 
     /// Lifecycle generation.
@@ -225,7 +350,7 @@ impl HttpConn {
     }
 
     /// The broker's own `initialize` handshake with the upstream.
-    pub(crate) async fn initialize(self: &Arc<Self>) -> Result<Value, String> {
+    pub async fn initialize(self: &Arc<Self>) -> Result<Value, String> {
         let _g = self.init_lock.lock().await;
         self.do_init().await
     }
@@ -270,15 +395,42 @@ impl HttpConn {
         let ex = self
             .exchange(&body, Some(id), None, None)
             .await
-            .map_err(|e| e.into_call().to_string())?;
+            .map_err(|e| {
+                self.diag_xerr(&e, false);
+                (*e).into_call().to_string()
+            })?;
         let resp = ex.response.ok_or("initialize returned no response")?;
         let Some(result) = resp.get("result").cloned() else {
+            if let Some(tap) = self.tap() {
+                let err = &resp["error"];
+                tap.on_init_error(
+                    BACKEND_PROTOCOL_VERSION,
+                    None,
+                    Some((
+                        err["code"].as_i64().unwrap_or(0),
+                        err["message"].as_str().unwrap_or("no result"),
+                    )),
+                    &self.backend_view(),
+                    None,
+                );
+            }
             return Err(format!(
                 "initialize failed: {}",
                 resp.get("error").cloned().unwrap_or(Value::Null)
             ));
         };
         let protocol = result["protocolVersion"].as_str().map(str::to_owned);
+        if protocol.as_deref() != Some(BACKEND_PROTOCOL_VERSION) {
+            if let Some(tap) = self.tap() {
+                tap.on_init_error(
+                    BACKEND_PROTOCOL_VERSION,
+                    protocol.as_deref(),
+                    None,
+                    &self.backend_view(),
+                    None,
+                );
+            }
+        }
         {
             let mut s = lock(&self.session);
             s.id = ex.session;
@@ -332,7 +484,7 @@ impl HttpConn {
         want: Option<u64>,
         session: Option<String>,
         protocol: Option<String>,
-    ) -> Result<Exchange, XErr> {
+    ) -> Result<Exchange, Box<XErr>> {
         let mut req = client()
             .post(&self.url)
             .timeout(self.timeout)
@@ -348,13 +500,32 @@ impl HttpConn {
         if let Some(p) = protocol {
             req = req.header("MCP-Protocol-Version", p);
         }
-        let mut resp = req.body(body.to_string()).send().await.map_err(map_err)?;
+        let mut resp = match req.body(body.to_string()).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let meta = Meta {
+                    session_present: had_session,
+                    ..Meta::default()
+                };
+                return Err(map_err(e, meta, false));
+            }
+        };
         let status = resp.status();
+        let mut meta = head_meta(&resp, had_session);
         if status.as_u16() == 404 && had_session {
-            return Err(XErr::SessionGone);
+            return Err(XErr::new(XKind::SessionGone, DKind::HttpSessionLost, &meta));
         }
         if !status.is_success() {
-            return Err(XErr::Status(status.as_u16()));
+            if self.tap().is_some() {
+                sample_body(&mut resp, &mut meta).await;
+            }
+            let code = status.as_u16();
+            let diag = if matches!(code, 401 | 403) {
+                DKind::HttpAuth
+            } else {
+                DKind::HttpStatus
+            };
+            return Err(XErr::new(XKind::Status(code), diag, &meta));
         }
         let session_hdr = resp
             .headers()
@@ -367,13 +538,23 @@ impl HttpConn {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
         let mut found = None;
+        let mut head = Vec::new();
         let mut total = 0usize;
         if is_sse {
             let mut parser = SseParser::default();
-            'outer: while let Some(chunk) = resp.chunk().await.map_err(map_err)? {
+            'outer: while let Some(chunk) = resp
+                .chunk()
+                .await
+                .map_err(|e| map_err(e, meta.clone(), true))?
+            {
                 total += chunk.len();
                 if total > MAX_RESPONSE {
-                    return Err(XErr::Other("upstream response over 16 MiB".into()));
+                    meta.body_len = Some(total as u64);
+                    return Err(XErr::new(
+                        XKind::Other("upstream response over 16 MiB".into()),
+                        DKind::HttpNonMcpBody,
+                        &meta,
+                    ));
                 }
                 for data in parser.feed(&chunk) {
                     if let Ok(msg) = serde_json::from_str::<Value>(&data) {
@@ -386,16 +567,37 @@ impl HttpConn {
             }
         } else {
             let mut buf = Vec::new();
-            while let Some(chunk) = resp.chunk().await.map_err(map_err)? {
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .map_err(|e| map_err(e, meta.clone(), false))?
+            {
                 total += chunk.len();
                 if total > MAX_RESPONSE {
-                    return Err(XErr::Other("upstream response over 16 MiB".into()));
+                    meta.body_len = Some(total as u64);
+                    return Err(XErr::new(
+                        XKind::Other("upstream response over 16 MiB".into()),
+                        DKind::HttpNonMcpBody,
+                        &meta,
+                    ));
                 }
                 buf.extend_from_slice(&chunk);
             }
+            head.extend_from_slice(&buf[..buf.len().min(64)]);
+            meta.body_len = Some(buf.len() as u64);
             if !buf.iter().all(u8::is_ascii_whitespace) {
-                let v: Value = serde_json::from_slice(&buf)
-                    .map_err(|_| XErr::Other("upstream sent invalid JSON".into()))?;
+                let v: Value = serde_json::from_slice(&buf).map_err(|_| {
+                    meta.body_class = Some(classify_body(
+                        meta.content_type.as_deref(),
+                        &head,
+                        buf.len() as u64,
+                    ));
+                    XErr::new(
+                        XKind::Other("upstream sent invalid JSON".into()),
+                        DKind::HttpNonMcpBody,
+                        &meta,
+                    )
+                })?;
                 let msgs = match v {
                     Value::Array(a) => a,
                     other => vec![other],
@@ -408,8 +610,21 @@ impl HttpConn {
             }
         }
         if want.is_some() && found.is_none() {
-            return Err(XErr::Other(
-                "upstream ended the response without a result".into(),
+            let diag = if is_sse {
+                meta.body_len = Some(total as u64);
+                DKind::SseTruncated
+            } else {
+                meta.body_class = Some(classify_body(
+                    meta.content_type.as_deref(),
+                    &head,
+                    meta.body_len.unwrap_or(0),
+                ));
+                DKind::HttpNonMcpBody
+            };
+            return Err(XErr::new(
+                XKind::Other("upstream ended the response without a result".into()),
+                diag,
+                &meta,
             ));
         }
         Ok(Exchange {
@@ -470,22 +685,30 @@ impl HttpConn {
                         .response
                         .ok_or_else(|| CallError::Unavailable("upstream sent no response".into()))
                 }
-                Err(XErr::SessionGone) if attempt == 0 => {
-                    attempt += 1;
-                    self.reinit(epoch).await.map_err(CallError::Unavailable)?;
+                Err(e) => {
+                    let will_rerun = matches!(e.kind, XKind::Status(401 | 403))
+                        && self.helper.is_some()
+                        && !helper_rerun;
+                    self.diag_xerr(&e, helper_rerun || will_rerun);
+                    match e.kind {
+                        XKind::SessionGone if attempt == 0 => {
+                            attempt += 1;
+                            self.reinit(epoch).await.map_err(CallError::Unavailable)?;
+                        }
+                        XKind::Transport(_) if attempt == 0 => {
+                            attempt += 1;
+                            self.reconnect(epoch).await?;
+                        }
+                        // Credentials may have expired: ask the helper once more.
+                        XKind::Status(401 | 403) if will_rerun => {
+                            helper_rerun = true;
+                            self.refresh_headers()
+                                .await
+                                .map_err(CallError::Unavailable)?;
+                        }
+                        _ => return Err((*e).into_call()),
+                    }
                 }
-                Err(XErr::Transport(_)) if attempt == 0 => {
-                    attempt += 1;
-                    self.reconnect(epoch).await?;
-                }
-                // Credentials may have expired: ask the helper once more.
-                Err(XErr::Status(401 | 403)) if self.helper.is_some() && !helper_rerun => {
-                    helper_rerun = true;
-                    self.refresh_headers()
-                        .await
-                        .map_err(CallError::Unavailable)?;
-                }
-                Err(e) => return Err(e.into_call()),
             }
         }
     }
@@ -533,12 +756,7 @@ impl HttpConn {
     }
 
     /// Sends a request and waits for its response.
-    pub(crate) async fn call(
-        self: &Arc<Self>,
-        method: &str,
-        params: Value,
-        meta: CallMeta,
-    ) -> CallResult {
+    pub async fn call(self: &Arc<Self>, method: &str, params: Value, meta: CallMeta) -> CallResult {
         let (_, rx) = self.begin(method, params, meta).await?;
         rx.await.unwrap_or(Err(CallError::Closed))
     }
@@ -554,7 +772,10 @@ impl HttpConn {
         self.exchange(&jsonrpc::notification(method, params), None, sid, proto)
             .await
             .map(|_| ())
-            .map_err(XErr::into_call)
+            .map_err(|e| {
+                self.diag_xerr(&e, false);
+                (*e).into_call()
+            })
     }
 
     /// Forgets pending call `id`, aborts its POST and tells the upstream.
@@ -581,7 +802,7 @@ impl HttpConn {
 
     /// Ends the upstream session: aborts in-flight POSTs, fails pending calls
     /// and DELETEs the session. Idempotent.
-    pub(crate) async fn shutdown(self: &Arc<Self>, grace: Duration) {
+    pub async fn shutdown(self: &Arc<Self>, grace: Duration) {
         self.set_listening(false);
         let aborts: Vec<AbortHandle> = lock(&self.pending)
             .calls
@@ -613,13 +834,53 @@ impl HttpConn {
     }
 }
 
-fn map_err(e: reqwest::Error) -> XErr {
+/// Maps a transport error; `sse` is true while an event stream is read.
+fn map_err(e: reqwest::Error, mut meta: Meta, sse: bool) -> Box<XErr> {
     let e = e.without_url();
     if e.is_timeout() {
-        XErr::Other("upstream request timed out".into())
-    } else {
-        XErr::Transport(e.to_string())
+        meta.transport_error = Some("timeout");
+        return XErr::new(
+            XKind::Other("upstream request timed out".into()),
+            DKind::HttpTimeout,
+            &meta,
+        );
     }
+    meta.transport_error = Some(if e.is_connect() {
+        "connect"
+    } else if e.is_body() || e.is_decode() {
+        "body"
+    } else if e.is_redirect() {
+        "redirect"
+    } else {
+        "request"
+    });
+    let diag = if sse {
+        DKind::SseTruncated
+    } else {
+        DKind::ConnectFailed
+    };
+    XErr::new(XKind::Transport(e.to_string()), diag, &meta)
+}
+
+/// Reads at most 64 KiB of an error body to learn its length and class.
+async fn sample_body(resp: &mut reqwest::Response, meta: &mut Meta) {
+    const CAP: usize = 64 * 1024;
+    let mut head = Vec::new();
+    let mut total = 0usize;
+    while total < CAP {
+        match resp.chunk().await {
+            Ok(Some(c)) => {
+                if head.len() < 64 {
+                    head.extend_from_slice(&c[..c.len().min(64 - head.len())]);
+                }
+                total += c.len();
+            }
+            _ => break,
+        }
+    }
+    let len = meta.body_len.unwrap_or(total as u64);
+    meta.body_len = Some(len);
+    meta.body_class = Some(classify_body(meta.content_type.as_deref(), &head, len));
 }
 
 fn fail_all(pending: &Mutex<PendingMap>) {
