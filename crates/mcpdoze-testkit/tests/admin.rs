@@ -827,7 +827,6 @@ async fn debug_toggle_failures_and_stats() {
         assert_eq!(recs.len(), 1, "{f}");
         assert_eq!(recs[0]["server"], "flaky");
         assert_eq!(recs[0]["kind"], "crash_in_flight");
-        let id = recs[0]["id"].as_str().unwrap().to_owned();
         // Filters that match nothing.
         let none = api
             .ok("GET", "/admin/v1/debug/failures?server=other", None)
