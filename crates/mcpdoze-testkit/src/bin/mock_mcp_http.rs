@@ -12,7 +12,10 @@
 //! 401), `--subscribe` (advertise `resources.subscribe`, serve
 //! subscribe/unsubscribe and keep `GET` event streams open; tool `touch`
 //! sends `notifications/resources/updated` on them, tool `sub_stats`
-//! reports counters). Built-in tools: `echo`, `session_count` (initialize calls seen) and
+//! reports counters), `--status N` (every `tools/call` is answered with HTTP
+//! status N and a plain-text body), `--html-error` (every `tools/call` is
+//! answered with an HTML error page; status 502 unless `--status` is given).
+//! Built-in tools: `echo`, `session_count` (initialize calls seen) and
 //! `delete_count` (DELETE requests seen).
 //!
 //! Minimal hand-written HTTP/1.1 (keep-alive, Content-Length bodies, chunked
@@ -37,6 +40,8 @@ struct Cfg {
     slow_ms: u64,
     reject_calls: u64,
     subscribe: bool,
+    status: Option<u16>,
+    html_error: bool,
 }
 
 #[derive(Default)]
@@ -82,6 +87,8 @@ fn parse_args() -> Cfg {
             }
             "--drop-session-after" => cfg.drop_after = it.next().and_then(|v| v.parse().ok()),
             "--slow-ms" => cfg.slow_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--status" => cfg.status = it.next().and_then(|v| v.parse().ok()),
+            "--html-error" => cfg.html_error = true,
             "--reject-calls" => {
                 cfg.reject_calls = it.next().and_then(|v| v.parse().ok()).unwrap_or(0)
             }
@@ -256,6 +263,19 @@ async fn handle(
         };
         if reject {
             return simple(s, "401 Unauthorized", &[], "text/plain", "expired").await;
+        }
+        if cfg.html_error || cfg.status.is_some() {
+            let code = cfg.status.unwrap_or(502);
+            let status = format!("{code} Mock Error");
+            let (ctype, body) = if cfg.html_error {
+                (
+                    "text/html",
+                    format!("<html><body><h1>{code} Mock Error</h1></body></html>"),
+                )
+            } else {
+                ("text/plain", format!("mock error {code}"))
+            };
+            return simple(s, &status, &[], ctype, &body).await;
         }
     }
 

@@ -1,5 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Scriptable mock MCP stdio server (newline-delimited JSON-RPC 2.0).
+//!
+//! Output-shape knobs: `--oversize-response` (tool replies are one line over
+//! 16 MiB), `--string-ids` (response ids are JSON strings), `--content-length-framing`
+//! (LSP-style headers), `--pretty-json` (multi-line JSON). Init knobs:
+//! `--init-error`, `--init-version V`. Exit knobs: `--exit-code N` (tool `exit`
+//! exits with N; with `--exit-after K` also on call index K, 0-based, like
+//! `--crash-after`). `--stderr-leak` prints `MCPDOZE_TEST_*` env values and the
+//! call arguments to stderr. `--script FILE` runs scripted steps (see `load_script`).
+//! Part A knobs: `--big-items N` (tool `big`), `--structured` (tool `structured`
+//! with an output schema), `--read-only TOOLS` (`readOnlyHint`),
+//! `--verbose-descriptions`. Tools `counter` and `write` are enabled via `--tools`.
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -11,6 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_VERSION: &str = "2025-11-25";
+/// Length of the `--oversize-response` line: past the 16 MiB frame limit.
+const OVERSIZE_BYTES: usize = 16 * 1024 * 1024 + 1024;
+const VERBOSE_TEXT: &str =
+    "This mock tool exists for tests and echoes its arguments back as text and structured content. ";
 
 struct Config {
     name: String,
@@ -32,12 +47,61 @@ struct Config {
     echo_env: Vec<String>,
     /// Advertise `resources.subscribe` and serve subscribe/unsubscribe.
     subscribe: bool,
+    /// Exit code for tool `exit` (and for `exit_after`); default 3 for `exit_after`.
+    exit_code: Option<i32>,
+    /// Exit on call index `n` and later (0-based, like `crash_after`).
+    exit_after: Option<u64>,
+    oversize: bool,
+    string_ids: bool,
+    framed: bool,
+    pretty: bool,
+    init_error: bool,
+    init_version: Option<String>,
+    stderr_leak: bool,
+    script: Vec<Step>,
+    big_items: Option<u64>,
+    structured: bool,
+    read_only: Option<Vec<String>>,
+    verbose: bool,
+}
+
+/// One `--script` step: matches a request by method (and tool name for
+/// `tools/call`); `nth` (1-based) restricts it to the nth match.
+struct Step {
+    method: String,
+    tool: Option<String>,
+    nth: Option<u64>,
+    actions: Vec<Action>,
+    hits: AtomicU64,
+}
+
+enum Action {
+    /// Run the normal handler for the request.
+    Respond,
+    StdoutRaw(String),
+    Stderr(String),
+    DelayMs(u64),
+    Exit(i32),
+    /// Emit a reply for the request padded to at least this many bytes.
+    Oversize(usize),
+    /// Switch output to string ids from here on.
+    StringId,
+    /// Switch output to Content-Length framing from here on.
+    ContentLengthFraming,
+    /// Switch output to pretty-printed JSON from here on.
+    PrettyJson,
 }
 
 struct State {
     cfg: Config,
     out: Mutex<std::io::Stdout>,
     calls: AtomicU64,
+    /// Value returned by the `counter` tool (incremented per call).
+    counter: AtomicU64,
+    /// Output encoding; initialised from the flags, switched by script actions.
+    string_ids: AtomicBool,
+    framed: AtomicBool,
+    pretty: AtomicBool,
     extra: AtomicBool,
     next_sid: AtomicU64,
     waiters: Mutex<HashMap<String, Sender<Value>>>,
@@ -53,8 +117,43 @@ struct State {
 impl State {
     fn send(&self, v: &Value) {
         let mut o = self.out.lock().unwrap();
-        let _ = writeln!(o, "{v}");
+        let is_reply = v.get("result").is_some() || v.get("error").is_some();
+        let text = if is_reply && v["id"].is_number() && self.string_ids.load(Ordering::SeqCst) {
+            let mut w = v.clone();
+            w["id"] = Value::String(v["id"].to_string());
+            self.encode(&w)
+        } else {
+            self.encode(v)
+        };
+        if self.framed.load(Ordering::SeqCst) {
+            let _ = write!(o, "Content-Length: {}\r\n\r\n{text}\n", text.len());
+        } else {
+            let _ = writeln!(o, "{text}");
+        }
         let _ = o.flush();
+    }
+    fn encode(&self, v: &Value) -> String {
+        if self.pretty.load(Ordering::SeqCst) {
+            serde_json::to_string_pretty(v).unwrap_or_default()
+        } else {
+            v.to_string()
+        }
+    }
+    /// Writes `text` as one line, bypassing the encoding switches.
+    fn send_raw(&self, text: &str) {
+        let mut o = self.out.lock().unwrap();
+        let _ = writeln!(o, "{text}");
+        let _ = o.flush();
+    }
+    /// Sends a successful reply for `id` whose JSON is at least `bytes` long.
+    fn send_padded(&self, id: &Value, bytes: usize) {
+        let base =
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":""}]}})
+                .to_string()
+                .len();
+        let pad = "x".repeat(bytes.saturating_sub(base));
+        self.send(&json!({"jsonrpc":"2.0","id":id,
+            "result":{"content":[{"type":"text","text":pad}]}}));
     }
     fn log(&self, msg: &str) {
         if self.cfg.noise {
@@ -63,11 +162,97 @@ impl State {
     }
     fn tool_names(&self) -> Vec<String> {
         let mut t = self.cfg.tools.clone();
+        let mut extra: Vec<&str> = Vec::new();
         if self.extra.load(Ordering::SeqCst) {
-            t.push("extra".into());
+            extra.push("extra");
+        }
+        if self.cfg.big_items.is_some() {
+            extra.push("big");
+        }
+        if self.cfg.structured {
+            extra.push("structured");
+        }
+        for n in extra {
+            if !t.iter().any(|x| x == n) {
+                t.push(n.into());
+            }
         }
         t
     }
+}
+
+fn parse_action(v: &Value) -> Result<Action, String> {
+    if let Some(name) = v.as_str() {
+        return match name {
+            "respond" => Ok(Action::Respond),
+            "string_id" => Ok(Action::StringId),
+            "content_length_framing" => Ok(Action::ContentLengthFraming),
+            "pretty_json" => Ok(Action::PrettyJson),
+            other => Err(format!("unknown action {other}")),
+        };
+    }
+    let Some((key, arg)) = v
+        .as_object()
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.iter().next())
+    else {
+        return Err(format!("bad action {v}"));
+    };
+    let bad = || format!("bad argument for {key}: {arg}");
+    match key.as_str() {
+        "stdout_raw" => Ok(Action::StdoutRaw(arg.as_str().ok_or_else(bad)?.to_owned())),
+        "stderr" => Ok(Action::Stderr(arg.as_str().ok_or_else(bad)?.to_owned())),
+        "delay_ms" => Ok(Action::DelayMs(arg.as_u64().ok_or_else(bad)?)),
+        "exit" => Ok(Action::Exit(arg["code"].as_i64().ok_or_else(bad)? as i32)),
+        "oversize" => Ok(Action::Oversize(
+            arg["bytes"].as_u64().ok_or_else(bad)? as usize
+        )),
+        other => Err(format!("unknown action {other}")),
+    }
+}
+
+/// Reads a script: a JSON array of `{"on": {"method", "tool"?, "nth"?},
+/// "do": [action, ...]}`. Actions are `respond`, `string_id`,
+/// `content_length_framing`, `pretty_json`, or one-key objects
+/// `{"stdout_raw": TEXT}`, `{"stderr": TEXT}`, `{"delay_ms": N}`,
+/// `{"exit": {"code": N}}`, `{"oversize": {"bytes": N}}`. Actions run in
+/// order. The first matching step handles a request, and only `respond`
+/// sends the normal reply, so a step without it leaves the request unanswered.
+fn load_script(path: &str) -> Result<Vec<Step>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("script {path}: {e}"))?;
+    let doc: Value = serde_json::from_str(&text).map_err(|e| format!("script {path}: {e}"))?;
+    let steps = doc.as_array().ok_or("script must be a JSON array")?;
+    steps
+        .iter()
+        .map(|s| -> Result<Step, String> {
+            let method = s["on"]["method"]
+                .as_str()
+                .ok_or("step needs on.method")?
+                .to_owned();
+            let tool = s["on"]["tool"].as_str().map(str::to_owned);
+            let nth = match s["on"].get("nth") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_u64()
+                        .filter(|n| *n >= 1)
+                        .ok_or("on.nth must be a number >= 1")?,
+                ),
+            };
+            let actions = s["do"]
+                .as_array()
+                .ok_or("step needs a do array")?
+                .iter()
+                .map(parse_action)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Step {
+                method,
+                tool,
+                nth,
+                actions,
+                hits: AtomicU64::new(0),
+            })
+        })
+        .collect()
 }
 
 fn parse_args() -> Result<Option<Config>, String> {
@@ -89,6 +274,20 @@ fn parse_args() -> Result<Option<Config>, String> {
         log_messages: false,
         echo_env: Vec::new(),
         subscribe: false,
+        exit_code: None,
+        exit_after: None,
+        oversize: false,
+        string_ids: false,
+        framed: false,
+        pretty: false,
+        init_error: false,
+        init_version: None,
+        stderr_leak: false,
+        script: Vec::new(),
+        big_items: None,
+        structured: false,
+        read_only: None,
+        verbose: false,
     };
     let list = |s: String| -> Vec<String> {
         s.split(',')
@@ -124,6 +323,26 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--log-messages" => c.log_messages = true,
             "--subscribe" => c.subscribe = true,
             "--echo-env" => c.echo_env.push(val()?),
+            "--exit-code" => {
+                c.exit_code = Some(
+                    val()?
+                        .parse::<i32>()
+                        .map_err(|e| format!("bad number: {e}"))?,
+                )
+            }
+            "--exit-after" => c.exit_after = Some(num(val()?)?),
+            "--oversize-response" => c.oversize = true,
+            "--string-ids" => c.string_ids = true,
+            "--content-length-framing" => c.framed = true,
+            "--pretty-json" => c.pretty = true,
+            "--init-error" => c.init_error = true,
+            "--init-version" => c.init_version = Some(val()?),
+            "--stderr-leak" => c.stderr_leak = true,
+            "--script" => c.script = load_script(&val()?)?,
+            "--big-items" => c.big_items = Some(num(val()?)?),
+            "--structured" => c.structured = true,
+            "--read-only" => c.read_only = Some(list(val()?)),
+            "--verbose-descriptions" => c.verbose = true,
             "--sleep-forever" => return Ok(None),
             other => return Err(format!("unknown flag {other}")),
         }
@@ -159,6 +378,19 @@ fn handle_call(st: Arc<State>, id: Value, params: Value) {
     }
     let tool = params["name"].as_str().unwrap_or("").to_string();
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    if st.cfg.stderr_leak {
+        let env: Vec<String> = std::env::vars()
+            .filter(|(k, _)| k.starts_with("MCPDOZE_TEST_"))
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        eprintln!("[mock leak] tool={tool} args={args} env={}", env.join(" "));
+    }
+    let exit_now =
+        (st.cfg.exit_code.is_some() && tool == "exit") || st.cfg.exit_after.is_some_and(|c| n >= c);
+    if exit_now {
+        st.log("exiting");
+        std::process::exit(st.cfg.exit_code.unwrap_or(3));
+    }
     if !st.tool_names().contains(&tool) {
         st.send(&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":format!("unknown tool {tool}")}}));
         return;
@@ -269,9 +501,31 @@ fn handle_call(st: Arc<State>, id: Value, params: Value) {
                 Err(e) => json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
             }
         }
+        "big" => {
+            let items: Vec<Value> = (0..st.cfg.big_items.unwrap_or(0))
+                .map(|i| json!({"id":i,"name":format!("item-{i}"),"active":i % 2 == 0}))
+                .collect();
+            let count = items.len();
+            text_result(
+                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                json!({"tool":"big","count":count}),
+            )
+        }
+        "structured" => {
+            let v = json!({"tool":"structured","value":42});
+            text_result(v.to_string(), v)
+        }
+        "counter" => {
+            let value = st.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            text_result(value.to_string(), json!({"tool":"counter","value":value}))
+        }
         name => text_result(args.to_string(), json!({"tool":name})),
     };
-    st.send(&json!({"jsonrpc":"2.0","id":id,"result":result}));
+    if st.cfg.oversize {
+        st.send_padded(&id, OVERSIZE_BYTES);
+    } else {
+        st.send(&json!({"jsonrpc":"2.0","id":id,"result":result}));
+    }
     if st.cfg.list_changed_after.is_some_and(|c| n + 1 >= c)
         && !st.extra.swap(true, Ordering::SeqCst)
     {
@@ -301,11 +555,58 @@ fn tools_list(st: &State) -> Value {
         .tool_names()
         .iter()
         .map(|n| {
-            json!({"name":n,"description":format!("mock tool {n}"),
-                "inputSchema":{"type":"object","additionalProperties":true}})
+            let desc = if st.cfg.verbose {
+                format!("mock tool {n}. {}", VERBOSE_TEXT.repeat(8))
+            } else {
+                format!("mock tool {n}")
+            };
+            let mut t = json!({"name":n,"description":desc,
+                "inputSchema":{"type":"object","additionalProperties":true}});
+            if let Some(ro) = &st.cfg.read_only {
+                t["annotations"] = json!({"readOnlyHint": ro.contains(n)});
+            }
+            if n == "structured" {
+                t["outputSchema"] = json!({"type":"object",
+                    "properties":{"tool":{"type":"string"},"value":{"type":"integer"}},
+                    "required":["tool","value"]});
+            }
+            t
         })
         .collect();
     json!({"tools":tools})
+}
+
+/// Index of the first `--script` step that handles this request, if any.
+fn script_actions<'a>(st: &'a State, method: &str, params: &Value) -> Option<&'a [Action]> {
+    for step in &st.cfg.script {
+        if step.method != method {
+            continue;
+        }
+        if let Some(t) = &step.tool {
+            if params["name"].as_str() != Some(t.as_str()) {
+                continue;
+            }
+        }
+        let hit = step.hits.fetch_add(1, Ordering::SeqCst) + 1;
+        if step.nth.is_none_or(|n| n == hit) {
+            return Some(&step.actions);
+        }
+    }
+    None
+}
+
+fn run_action(st: &Arc<State>, a: &Action, method: &str, id: &Value, params: &Value) {
+    match a {
+        Action::Respond => dispatch(st, method, id.clone(), params.clone()),
+        Action::StdoutRaw(s) => st.send_raw(s),
+        Action::Stderr(s) => eprintln!("{s}"),
+        Action::DelayMs(ms) => std::thread::sleep(Duration::from_millis(*ms)),
+        Action::Exit(code) => std::process::exit(*code),
+        Action::Oversize(bytes) => st.send_padded(id, *bytes),
+        Action::StringId => st.string_ids.store(true, Ordering::SeqCst),
+        Action::ContentLengthFraming => st.framed.store(true, Ordering::SeqCst),
+        Action::PrettyJson => st.pretty.store(true, Ordering::SeqCst),
+    }
 }
 
 fn handle(st: &Arc<State>, msg: Value) {
@@ -334,13 +635,32 @@ fn handle(st: &Arc<State>, msg: Value) {
         }
         return;
     };
+    if let Some(actions) = script_actions(st, method, &params) {
+        for a in actions {
+            run_action(st, a, method, &id, &params);
+        }
+        return;
+    }
+    dispatch(st, method, id, params);
+}
+
+fn dispatch(st: &Arc<State>, method: &str, id: Value, params: Value) {
     let reply = |result: Value| st.send(&json!({"jsonrpc":"2.0","id":id,"result":result}));
     match method {
         "initialize" => {
             *st.client_caps.lock().unwrap() = params["capabilities"].clone();
-            let v = params["protocolVersion"]
-                .as_str()
-                .unwrap_or(DEFAULT_VERSION);
+            if st.cfg.init_error {
+                st.send(&json!({"jsonrpc":"2.0","id":id,
+                    "error":{"code":-32603,"message":"mock init error"}}));
+                return;
+            }
+            let v = match &st.cfg.init_version {
+                Some(v) => v.clone(),
+                None => params["protocolVersion"]
+                    .as_str()
+                    .unwrap_or(DEFAULT_VERSION)
+                    .to_owned(),
+            };
             let resources = if st.cfg.subscribe {
                 json!({"subscribe":true})
             } else {
@@ -447,10 +767,15 @@ fn main() {
     if cfg.startup_delay_ms > 0 {
         std::thread::sleep(Duration::from_millis(cfg.startup_delay_ms));
     }
+    let (string_ids, framed, pretty) = (cfg.string_ids, cfg.framed, cfg.pretty);
     let st = Arc::new(State {
         cfg,
         out: Mutex::new(std::io::stdout()),
         calls: AtomicU64::new(0),
+        counter: AtomicU64::new(0),
+        string_ids: AtomicBool::new(string_ids),
+        framed: AtomicBool::new(framed),
+        pretty: AtomicBool::new(pretty),
         extra: AtomicBool::new(false),
         next_sid: AtomicU64::new(1),
         waiters: Mutex::new(HashMap::new()),

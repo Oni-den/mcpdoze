@@ -50,9 +50,99 @@ pub struct MockServerSpec {
     log_messages: bool,
     echo_env: Vec<String>,
     subscribe: bool,
+    exit_code: Option<i32>,
+    exit_after: Option<u64>,
+    oversize_response: bool,
+    string_ids: bool,
+    content_length_framing: bool,
+    init_error: bool,
+    init_version: Option<String>,
+    pretty_json: bool,
+    stderr_leak: bool,
+    script: Option<PathBuf>,
+    big_items: Option<u64>,
+    structured: bool,
+    read_only: Option<Vec<String>>,
+    verbose_descriptions: bool,
 }
 
 impl MockServerSpec {
+    /// Tool `exit` exits the process with `code` without replying. With
+    /// `exit_after`, every call from that index on exits instead.
+    pub fn exit_code(mut self, code: i32) -> Self {
+        self.exit_code = Some(code);
+        self
+    }
+    /// Exit (code from `exit_code`, default 3) on call index `n` (0-based)
+    /// and later, like `crash_after`.
+    pub fn exit_after(mut self, n: u64) -> Self {
+        self.exit_after = Some(n);
+        self
+    }
+    /// Every tool reply is one line of more than 16 MiB.
+    pub fn oversize_response(mut self) -> Self {
+        self.oversize_response = true;
+        self
+    }
+    /// Response ids are JSON strings (`"1"` for request id `1`).
+    pub fn string_ids(mut self) -> Self {
+        self.string_ids = true;
+        self
+    }
+    /// Frame output with LSP-style `Content-Length` headers.
+    pub fn content_length_framing(mut self) -> Self {
+        self.content_length_framing = true;
+        self
+    }
+    /// `initialize` replies with a JSON-RPC error.
+    pub fn init_error(mut self) -> Self {
+        self.init_error = true;
+        self
+    }
+    /// `initialize` always reports protocol version `v`.
+    pub fn init_version(mut self, v: &str) -> Self {
+        self.init_version = Some(v.into());
+        self
+    }
+    /// Output multi-line (pretty-printed) JSON.
+    pub fn pretty_json(mut self) -> Self {
+        self.pretty_json = true;
+        self
+    }
+    /// Print `MCPDOZE_TEST_*` env values and each call's arguments to stderr.
+    pub fn stderr_leak(mut self) -> Self {
+        self.stderr_leak = true;
+        self
+    }
+    /// Run the scripted steps in the JSON file at `path` (see the
+    /// `mock-mcp-stdio` binary for the format).
+    pub fn script(mut self, path: impl Into<PathBuf>) -> Self {
+        self.script = Some(path.into());
+        self
+    }
+    /// Tool `big` returns a pretty-printed JSON array of `n` uniform objects.
+    pub fn big_items(mut self, n: u64) -> Self {
+        self.big_items = Some(n);
+        self
+    }
+    /// Tool `structured` has an output schema and `structuredContent`
+    /// (`{"tool":"structured","value":42}`).
+    pub fn structured(mut self) -> Self {
+        self.structured = true;
+        self
+    }
+    /// Set `annotations.readOnlyHint` to true for the named tools and false
+    /// for the others.
+    pub fn read_only(mut self, tools: &[&str]) -> Self {
+        self.read_only = Some(tools.iter().map(|s| s.to_string()).collect());
+        self
+    }
+    /// Long tool descriptions (over 500 characters).
+    pub fn verbose_descriptions(mut self) -> Self {
+        self.verbose_descriptions = true;
+        self
+    }
+
     /// Prompt names offered (default `greet`); `prompts/get` echoes the
     /// arguments.
     pub fn prompts(mut self, p: &[&str]) -> Self {
@@ -202,6 +292,24 @@ impl MockServerSpec {
         for n in &self.echo_env {
             kv("--echo-env", n.clone());
         }
+        if let Some(v) = self.exit_code {
+            kv("--exit-code", v.to_string());
+        }
+        if let Some(v) = self.exit_after {
+            kv("--exit-after", v.to_string());
+        }
+        if let Some(v) = &self.init_version {
+            kv("--init-version", v.clone());
+        }
+        if let Some(v) = &self.script {
+            kv("--script", v.to_string_lossy().into_owned());
+        }
+        if let Some(v) = self.big_items {
+            kv("--big-items", v.to_string());
+        }
+        if let Some(v) = &self.read_only {
+            kv("--read-only", v.join(","));
+        }
         for (on, flag) in [
             (self.garbage_on_start, "--garbage-on-start"),
             (self.sampling_request, "--sampling-request"),
@@ -210,6 +318,14 @@ impl MockServerSpec {
             (self.stderr_noise, "--stderr-noise"),
             (self.log_messages, "--log-messages"),
             (self.subscribe, "--subscribe"),
+            (self.oversize_response, "--oversize-response"),
+            (self.string_ids, "--string-ids"),
+            (self.content_length_framing, "--content-length-framing"),
+            (self.init_error, "--init-error"),
+            (self.pretty_json, "--pretty-json"),
+            (self.stderr_leak, "--stderr-leak"),
+            (self.structured, "--structured"),
+            (self.verbose_descriptions, "--verbose-descriptions"),
         ] {
             if on {
                 a.push(flag.to_string());
@@ -283,6 +399,17 @@ impl MockHttpSpec {
     /// Delay every non-initialize response by `ms`.
     pub fn slow_ms(mut self, ms: u64) -> Self {
         self.args.extend(["--slow-ms".into(), ms.to_string()]);
+        self
+    }
+    /// Answer every `tools/call` with an HTML error page (502 unless
+    /// `status` is also set).
+    pub fn html_error(mut self) -> Self {
+        self.args.push("--html-error".into());
+        self
+    }
+    /// Answer every `tools/call` with HTTP status `code` and a plain-text body.
+    pub fn status(mut self, code: u16) -> Self {
+        self.args.extend(["--status".into(), code.to_string()]);
         self
     }
 
