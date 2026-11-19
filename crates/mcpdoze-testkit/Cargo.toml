@@ -12,17 +12,17 @@ workspace = true
 
 [dependencies]
 serde_json = "1"
+mcpdoze-core = { path = "../mcpdoze-core" }
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "io-std", "sync", "process"] }
 
 [dev-dependencies]
 # Broker data-path integration tests live here so they can use
 # CARGO_BIN_EXE_mock-mcp-stdio.
-mcpdoze-core = { path = "../mcpdoze-core" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 sysinfo = { version = "0.40.3", default-features = false, features = ["system"] }
-tempfile = "3.27.0"
 
 [[bin]]
 name = "mock-mcp-stdio"

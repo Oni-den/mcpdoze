@@ -1,6 +1,6 @@
 # Failure log and debug mode
 
-**Status: implemented (M9), except raw capture and replay.** Raw frame capture (`--raw`, `[debug] raw`) is not available in this version, and the replay helper that turns an export into a mock-server test is not built yet; the export already contains the replay description. Details are in `docs/plans/M9-M10-plan.md`.
+**Status: implemented (M9), except raw capture.** Raw frame capture (`--raw`, `[debug] raw`) is not available in this version. Details are in `docs/plans/M9-M10-plan.md`.
 
 When a brokered MCP server fails, MCPDoze can record why: which request, with what shape, against which backend state, and how the failure unfolded. The records are used to fix MCPDoze's support for specific servers, and are safe to attach to a public issue.
 
@@ -89,7 +89,9 @@ Works with the broker down (it reads the failure files; a reachable broker is as
 
 ## Replay
 
-**Planned, not implemented:** the loader that turns an export into a scripted mock server in the testkit (`mock_mcp_stdio --script`), runs synthetic requests of the same types, lengths and classes through an in-process broker, and checks that the same `kind` results. This reproduces the broker-visible symptom (framing, timing, exit), not the server's internal bug. The export's `replay` section already carries the script steps; bundles will become regression fixtures.
+`mcpdoze_testkit::replay` turns an export into a regression test. `from_bundle(path)` reads the JSON fence of the `## Replay` section; each scenario holds the `mock_mcp_stdio --script` steps for one failure kind and the recorded request shape. `Scenario::run(mock_bin)` starts the mock with that script, sends a synthetic request with the recorded method, string lengths, integer digit counts and string classes through an in-process broker with the failure log on, and returns the kinds the broker recorded. A test asserts that the recorded `kind` appears again. Sanitised fixture bundles live in `crates/mcpdoze-testkit/tests/fixtures/failures/`, and `tests/replay.rs` also replays a real export produced in the test (round trip).
+
+Limit: replay reproduces the broker-visible symptom (framing, timing, exit), not the server's internal bug. Kinds without a script (for example `spawn_failed`) have no replay.
 
 ## Related changes
 

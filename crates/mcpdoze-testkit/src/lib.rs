@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+pub mod replay;
+
 /// Protocol version the mock advertises by default.
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 

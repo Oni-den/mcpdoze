@@ -855,7 +855,10 @@ fn replay_scenario(rec: &Value) -> Value {
             )
         }
         "id_type_mismatch" => (
-            Some(step(on("tools/call"), vec![json!("string_id")])),
+            Some(step(
+                on("tools/call"),
+                vec![json!("string_id"), json!("respond")],
+            )),
             "the reply carries a string id",
         ),
         "frame_invalid" => (
