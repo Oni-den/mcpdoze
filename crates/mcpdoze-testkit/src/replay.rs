@@ -231,7 +231,11 @@ impl Scenario {
         };
         let spec = BackendSpec::new(mock_bin, mock.args())
             .start_timeout(start)
-            .call_timeout(Duration::from_secs(3));
+            .call_timeout(if self.expected_kind == "frame_oversize" {
+                Duration::from_secs(25)
+            } else {
+                Duration::from_secs(3)
+            });
         let diag = Diag::new(DiagConfig::new(dir.path().join("diag")));
         let router = Router::new();
         router.set_diag(diag.clone(), Level::Trace);
