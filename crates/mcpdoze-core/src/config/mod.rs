@@ -28,6 +28,9 @@ use serde::{Deserialize, Serialize, Serializer};
 pub const MAX_TOOL_NAME_LEN: usize = 64;
 /// Maximum length of a server prefix.
 pub const MAX_PREFIX_LEN: usize = 32;
+/// Prefix reserved for broker meta-tools (`mcpdoze__result_get`,
+/// `mcpdoze__batch`). No server may use it.
+pub const RESERVED_PREFIX: &str = "mcpdoze";
 const SEP: &str = "__";
 const DEFAULT_BIND: &str = "127.0.0.1:7878";
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
@@ -355,6 +358,14 @@ pub struct ServerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub call_timeout: Option<Duration>,
+    /// Token-optimisation settings (`docs/OPTIMIZE.md`); off when unset.
+    /// Not part of the backend registration, so a change never respawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimize: Option<OptimizeConfig>,
+    /// Per-tool settings (`[servers.<name>.tools.<tool>]`), keyed by the
+    /// backend tool name. Like `optimize`, never part of the registration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, ToolOptConfig>,
 }
 
 /// Idle policy of a backend instance that holds resource subscriptions.
@@ -556,6 +567,7 @@ impl Config {
                     "must be greater than 0",
                 ));
             }
+            optimize::validate_server(name, s, &mut errs);
             if !s.allow_literal_env {
                 for (k, v) in &s.env {
                     if let EnvValue::Literal(val) = v {
@@ -705,7 +717,7 @@ pub fn resolve_map(
                     return Err(ResolveError::Missing {
                         var: from_env.clone(),
                         key: k.clone(),
-                    })
+                    });
                 }
                 Some(o) => o.into_string().map_err(|_| ResolveError::NotUnicode {
                     var: from_env.clone(),
@@ -824,7 +836,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
             _ => {
                 return Err(format!(
                     "unknown unit `{unit}` in `{s}` (use ms, s, m, h, d)"
-                ))
+                ));
             }
         };
         total = total
@@ -906,6 +918,11 @@ fn check_prefix(p: &str) -> Result<(), String> {
     }
     if p.starts_with('_') || p.ends_with('_') {
         return Err("prefix must not start or end with `_`".into());
+    }
+    if p == RESERVED_PREFIX {
+        return Err(format!(
+            "prefix `{RESERVED_PREFIX}` is reserved for broker meta-tools"
+        ));
     }
     Ok(())
 }
@@ -1010,6 +1027,12 @@ impl NameMap {
 }
 
 mod debug;
+mod optimize;
+
+pub use optimize::{
+    changed_servers, optimize_changed, BatchMode, CacheConfig, CacheHit, Encode, GlobPattern,
+    OptimizeConfig, PointerGlob, ToolFilter, ToolOptConfig, MIN_MAX_RESULT_BYTES,
+};
 
 pub use debug::{
     resolve_debug, DebugConfig, DebugLayer, DebugLayers, DebugMode, DebugSettings,

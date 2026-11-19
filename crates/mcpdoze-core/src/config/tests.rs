@@ -271,7 +271,9 @@ fn literal_secret_header_rejected() {
 
 #[test]
 fn env_value_debug_hides_literals() {
-    let c = cfg("[servers.a]\ntransport='stdio'\ncommand='x'\nallow_literal_env=true\nenv={ MY_TOKEN = \"hunter2hunter2\" }");
+    let c = cfg(
+        "[servers.a]\ntransport='stdio'\ncommand='x'\nallow_literal_env=true\nenv={ MY_TOKEN = \"hunter2hunter2\" }",
+    );
     assert!(!format!("{c:?}").contains("hunter2"));
 }
 
@@ -294,7 +296,9 @@ fn resolve_env_from_lookup() {
 #[test]
 fn resolve_env_process_environment() {
     // Variable intentionally unset; unique name avoids touching real env.
-    let c = cfg("[servers.a]\ntransport='stdio'\ncommand='x'\nenv={ K = { from_env = \"MCPDOZE_TEST_SURELY_UNSET_VAR_X1\" } }");
+    let c = cfg(
+        "[servers.a]\ntransport='stdio'\ncommand='x'\nenv={ K = { from_env = \"MCPDOZE_TEST_SURELY_UNSET_VAR_X1\" } }",
+    );
     let e = resolve_env(&c.servers["a"]).unwrap_err();
     assert!(e.to_string().contains("MCPDOZE_TEST_SURELY_UNSET_VAR_X1"));
     assert!(c.servers["a"].resolve_env().is_err());
@@ -786,4 +790,345 @@ fn off_by_default_and_runtime_layer_overrides_global() {
         settings(GOOD, &forced).mode_for("example"),
         DebugMode::Trace
     );
+}
+
+// ------------------------------------------------------------- optimize
+
+const OPT: &str = r#"
+[servers.example]
+transport = "stdio"
+command = "npx"
+
+[servers.example.optimize]
+tools_allow = ["search*", "get_*"]
+tools_deny = ["get_secret"]
+description_max_chars = 240
+strip_schema_descriptions = true
+minify_json = true
+encode = "toon"
+max_result_bytes = 4096
+cache = { ttl = "60s", tools = ["get_user"], on_hit = "reference" }
+batch = "read-only"
+
+[servers.example.tools.list_issues]
+default_args = { per_page = 20 }
+keep = ["/items/*/id", "/items/*/title"]
+
+[servers.example.tools.get_user]
+drop = ["/debug", "/items/**/raw"]
+"#;
+
+const PLAIN: &str = "[servers.x]\ntransport = \"stdio\"\ncommand = \"c\"\n";
+
+#[test]
+fn optimize_tables_parse_and_validate() {
+    let c = cfg(OPT);
+    c.validate().unwrap();
+    let s = &c.servers["example"];
+    let o = s.optimize.as_ref().expect("optimize table");
+    assert_eq!(o.tools_allow, ["search*", "get_*"]);
+    assert_eq!(o.encode, Encode::Toon);
+    assert_eq!(o.batch, BatchMode::ReadOnly);
+    assert_eq!(o.max_result_bytes, 4096);
+    let cache = o.cache.as_ref().unwrap();
+    assert_eq!(cache.ttl, Duration::from_secs(60));
+    assert_eq!(cache.on_hit, CacheHit::Reference);
+    assert_eq!(s.tools["list_issues"].default_args["per_page"], 20);
+    assert_eq!(s.tools["list_issues"].keep.len(), 2);
+    assert_eq!(s.tools["get_user"].drop.len(), 2);
+}
+
+#[test]
+fn no_optimize_table_is_off_and_round_trips_unchanged() {
+    let c = cfg(GOOD);
+    let s = &c.servers["example"];
+    assert!(s.optimize.is_none());
+    assert!(s.tools.is_empty());
+    let text = toml::to_string(s).unwrap();
+    assert!(!text.contains("optimize"), "{text}");
+    assert!(!text.contains("tools"), "{text}");
+    let json = serde_json::to_string(s).unwrap();
+    assert!(
+        !json.contains("optimize") && !json.contains("\"tools\""),
+        "{json}"
+    );
+    let back: ServerConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(&back, s);
+}
+
+#[test]
+fn optimize_table_round_trips_through_toml_and_json() {
+    let c = cfg(OPT);
+    let s = &c.servers["example"];
+    let text = toml::to_string(s).expect("toml");
+    let back: ServerConfig = toml::from_str(&text).expect("re-parse");
+    assert_eq!(&back, s, "{text}");
+    let json = serde_json::to_string(s).unwrap();
+    let back: ServerConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(&back, s);
+}
+
+#[test]
+fn empty_optimize_table_is_some_default() {
+    let c = cfg(&format!("{PLAIN}[servers.x.optimize]\n"));
+    let o = c.servers["x"].optimize.clone().expect("present");
+    assert_eq!(o, OptimizeConfig::default());
+    assert!(o.cache.is_none() && o.batch == BatchMode::Off && o.encode == Encode::None);
+    c.validate().unwrap();
+}
+
+#[test]
+fn optimize_and_tools_reject_unknown_keys() {
+    for extra in [
+        "[servers.x.optimize]\nbogus = 1\n",
+        "[servers.x.optimize.cache]\nttl = \"1s\"\ntools = [\"a\"]\nbogus = 1\n",
+        "[servers.x.tools.a]\nbogus = []\n",
+    ] {
+        assert!(
+            Config::parse(&format!("{PLAIN}{extra}")).is_err(),
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn optimize_enum_values_are_checked() {
+    for extra in [
+        "[servers.x.optimize]\nbatch = \"some\"\n",
+        "[servers.x.optimize]\nencode = \"json\"\n",
+        "[servers.x.optimize]\ncache = { ttl = \"1s\", tools = [\"a\"], on_hit = \"stub\" }\n",
+    ] {
+        assert!(
+            Config::parse(&format!("{PLAIN}{extra}")).is_err(),
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn optimize_validation_reports_each_field() {
+    let mut bad = cfg(PLAIN);
+    bad.servers.get_mut("x").unwrap().optimize = Some(OptimizeConfig {
+        tools_allow: vec!["ok*".into(), "bad[".into()],
+        tools_deny: vec!["[]".into(), String::new()],
+        description_max_chars: Some(0),
+        max_result_bytes: 100,
+        cache: Some(CacheConfig {
+            ttl: Duration::ZERO,
+            tools: Vec::new(),
+            on_hit: CacheHit::Full,
+        }),
+        ..OptimizeConfig::default()
+    });
+    let errs = bad.validate().expect_err("invalid");
+    for field in [
+        "servers.x.optimize.tools_allow[1]",
+        "servers.x.optimize.tools_deny[0]",
+        "servers.x.optimize.tools_deny[1]",
+        "servers.x.optimize.description_max_chars",
+        "servers.x.optimize.max_result_bytes",
+        "servers.x.optimize.cache.ttl",
+        "servers.x.optimize.cache.tools",
+    ] {
+        assert!(has(&errs, field), "missing {field}: {errs:?}");
+    }
+}
+
+#[test]
+fn cache_ttl_zero_and_empty_tools_rejected_from_toml() {
+    let e = errs(&format!(
+        "{PLAIN}[servers.x.optimize]\ncache = {{ ttl = \"0s\", tools = [\"a\"] }}\n"
+    ));
+    assert!(has(&e, "servers.x.optimize.cache.ttl"), "{e:?}");
+    let e = errs(&format!(
+        "{PLAIN}[servers.x.optimize]\ncache = {{ ttl = \"5s\", tools = [] }}\n"
+    ));
+    assert!(has(&e, "servers.x.optimize.cache.tools"), "{e:?}");
+}
+
+#[test]
+fn max_result_bytes_minimum() {
+    cfg(&format!(
+        "{PLAIN}[servers.x.optimize]\nmax_result_bytes = 0\n"
+    ))
+    .validate()
+    .unwrap();
+    cfg(&format!(
+        "{PLAIN}[servers.x.optimize]\nmax_result_bytes = 512\n"
+    ))
+    .validate()
+    .unwrap();
+    let e = errs(&format!(
+        "{PLAIN}[servers.x.optimize]\nmax_result_bytes = 511\n"
+    ));
+    assert!(has(&e, "servers.x.optimize.max_result_bytes"), "{e:?}");
+}
+
+#[test]
+fn tool_keep_and_drop_are_mutually_exclusive_and_pointers_checked() {
+    let e = errs(&format!(
+        "{PLAIN}[servers.x.tools.t]\nkeep = [\"/a\"]\ndrop = [\"/b\"]\n"
+    ));
+    assert!(has(&e, "servers.x.tools.t.drop"), "{e:?}");
+    let e = errs(&format!(
+        "{PLAIN}[servers.x.tools.t]\nkeep = [\"no-slash\", \"/bad~2\"]\n"
+    ));
+    assert!(has(&e, "servers.x.tools.t.keep[0]"), "{e:?}");
+    assert!(has(&e, "servers.x.tools.t.keep[1]"), "{e:?}");
+    cfg(&format!("{PLAIN}[servers.x.tools.t]\nkeep = [\"/a\"]\n"))
+        .validate()
+        .unwrap();
+    cfg(&format!("{PLAIN}[servers.x.tools.t]\ndrop = [\"/a\"]\n"))
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn reserved_prefix_is_rejected() {
+    let e = errs("[servers.mcpdoze]\ntransport = \"stdio\"\ncommand = \"c\"\n");
+    assert!(has(&e, "servers.mcpdoze.prefix"), "{e:?}");
+    let e = errs("[servers.MCPDoze]\ntransport = \"stdio\"\ncommand = \"c\"\n");
+    assert!(has(&e, "servers.MCPDoze.prefix"), "{e:?}");
+    let e = errs("[servers.other]\ntransport = \"stdio\"\ncommand = \"c\"\nprefix = \"mcpdoze\"\n");
+    assert!(has(&e, "servers.other.prefix"), "{e:?}");
+    // Only the exact prefix is reserved.
+    cfg("[servers.mcpdoze_x]\ntransport = \"stdio\"\ncommand = \"c\"\n")
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn glob_pattern_matching() {
+    let g = |p: &str| GlobPattern::new(p).unwrap();
+    assert!(g("search*").matches("search"));
+    assert!(g("search*").matches("search_issues"));
+    assert!(!g("search*").matches("xsearch"));
+    assert!(g("*_user").matches("get_user"));
+    assert!(g("*a*b*").matches("xaxxbx"));
+    assert!(!g("*a*b*").matches("xbxa"));
+    assert!(g("get_?").matches("get_x"));
+    assert!(!g("get_?").matches("get_xy"));
+    assert!(g("t[abc]").matches("tb"));
+    assert!(!g("t[abc]").matches("td"));
+    assert!(g("t[a-c]").matches("tc"));
+    assert!(g("t[!a-c]").matches("td"));
+    assert!(!g("t[!a-c]").matches("tb"));
+    assert!(g("[]]").matches("]"));
+    assert!(g("*").matches(""));
+    assert!(g("exact").matches("exact"));
+    assert!(!g("exact").matches("exact2"));
+    assert!(!g("Exact").matches("exact"));
+    assert!(g("a**b").matches("axyzb"));
+}
+
+#[test]
+fn glob_pattern_compile_errors() {
+    assert!(GlobPattern::new("").is_err());
+    assert!(GlobPattern::new("a[").is_err());
+    assert!(GlobPattern::new("a[bc").is_err());
+    assert!(GlobPattern::new("[z-a]").is_err());
+    assert!(GlobPattern::new("[]").is_err());
+}
+
+#[test]
+fn tool_filter_deny_wins_and_empty_allow_lists_everything() {
+    let f = ToolFilter::new(&["search*", "get_*"], &["get_secret"]).unwrap();
+    assert!(f.allows("search_x"));
+    assert!(f.allows("get_user"));
+    assert!(!f.allows("get_secret"));
+    assert!(!f.allows("delete_all"));
+    let open = ToolFilter::new::<&str>(&[], &["danger"]).unwrap();
+    assert!(open.allows("anything"));
+    assert!(!open.allows("danger"));
+    assert!(ToolFilter::new(&["ok", "bad["], &[] as &[&str]).is_err());
+    assert!(OptimizeConfig::default().tool_filter().unwrap().allows("x"));
+}
+
+#[test]
+fn pointer_glob_matching() {
+    let p = |s: &str| PointerGlob::new(s).unwrap();
+    assert!(p("/items/*/id").matches("/items/3/id"));
+    assert!(p("/items/*/id").matches("/items/abc/id"));
+    assert!(!p("/items/*/id").matches("/items/3/id/x"));
+    assert!(!p("/items/*/id").matches("/items/3"));
+    assert!(!p("/items/*/id").matches("items/3/id"));
+    assert!(p("/items/**/raw").matches("/items/raw"));
+    assert!(p("/items/**/raw").matches("/items/a/b/raw"));
+    assert!(!p("/items/**/raw").matches("/items/a/b/rawx"));
+    assert!(p("/a/b").matches("/a/b"));
+    assert!(p("/").matches("/"), "empty key is a valid pointer");
+    assert!(!p("/").matches(""));
+    assert!(p("/a~1b").matches("/a~1b"), "escaped slash in key");
+    assert!(!p("/a~1b").matches("/a/b"), "pattern segment is one key");
+    assert!(p("/a~0b").matches("/a~0b"));
+    assert!(p("/k?y").matches("/key"));
+    assert!(p("/ch[ai]n").matches("/chan"));
+    assert!(!p("/x").matches("/x/y"));
+    assert!(!p("/x").matches("bad~pointer"));
+    assert!(!p("/x").matches("/bad~2"));
+}
+
+#[test]
+fn pointer_glob_ancestor_matching() {
+    let p = |s: &str| PointerGlob::new(s).unwrap();
+    let g = p("/items/*/id");
+    assert!(g.matches_or_ancestor(""));
+    assert!(g.matches_or_ancestor("/items"));
+    assert!(g.matches_or_ancestor("/items/7"));
+    assert!(g.matches_or_ancestor("/items/7/id"));
+    assert!(!g.matches_or_ancestor("/items/7/id/x"));
+    assert!(!g.matches_or_ancestor("/other"));
+    let d = p("/a/**/z");
+    assert!(d.matches_or_ancestor("/a/q/r"));
+    assert!(d.matches_or_ancestor("/a"));
+    assert!(!d.matches_or_ancestor("/b"));
+}
+
+#[test]
+fn pointer_glob_compile_errors() {
+    assert!(PointerGlob::new("").is_err());
+    assert!(PointerGlob::new("items/1").is_err());
+    assert!(PointerGlob::new("/a~").is_err());
+    assert!(PointerGlob::new("/a~2").is_err());
+    assert!(PointerGlob::new("/a[").is_err());
+}
+
+#[test]
+fn reload_change_detection_ignores_unrelated_servers() {
+    let old = cfg(OPT);
+    assert!(!optimize_changed(&old, &cfg(OPT)));
+    assert!(changed_servers(&old, &cfg(OPT)).is_empty());
+
+    // A changed optimize field is reported.
+    let mut new = cfg(OPT);
+    new.servers
+        .get_mut("example")
+        .unwrap()
+        .optimize
+        .as_mut()
+        .unwrap()
+        .minify_json = false;
+    assert!(optimize_changed(&old, &new));
+    assert_eq!(changed_servers(&old, &new), ["example"]);
+
+    // A changed tools table is reported.
+    let mut new = cfg(OPT);
+    new.servers
+        .get_mut("example")
+        .unwrap()
+        .tools
+        .remove("get_user");
+    assert_eq!(changed_servers(&old, &new), ["example"]);
+
+    // Adding a server with no optimisation tables is not a change here.
+    let mut new = cfg(OPT);
+    new.servers
+        .insert("plain".into(), cfg(PLAIN).servers["x"].clone());
+    assert!(!optimize_changed(&old, &new));
+
+    // Adding an optimize table to a server that had none is a change.
+    let base = cfg(GOOD);
+    let mut with = base.clone();
+    with.servers.get_mut("example").unwrap().optimize = Some(OptimizeConfig::default());
+    assert_eq!(changed_servers(&base, &with), ["example"]);
 }
