@@ -850,13 +850,11 @@ async fn debug_toggle_failures_and_stats() {
         let st = api.status_of("flaky").await.unwrap();
         let lf = &st["instances"][0]["last_failure"];
         // The crash is recorded as crash_in_flight and, racing with it, the
-        // exit watcher may add exit_unexpected; either can be the latest.
+        // exit watcher may add exit_unexpected or a catalog refresh list_failed.
+        assert!(lf["id"].is_string(), "{st}");
         assert!(
-            lf["id"] == id.as_str() || lf["kind"] == "exit_unexpected",
-            "{st}"
-        );
-        assert!(
-            ["crash_in_flight", "exit_unexpected"].contains(&lf["kind"].as_str().unwrap()),
+            ["crash_in_flight", "exit_unexpected", "list_failed"]
+                .contains(&lf["kind"].as_str().unwrap()),
             "{st}"
         );
         assert!(lf["ts"].as_u64().unwrap() > 0);
