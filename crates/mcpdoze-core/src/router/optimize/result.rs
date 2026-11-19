@@ -16,6 +16,8 @@ use crate::stats::json_len;
 
 /// Tag recorded for `minify_json`.
 pub const TAG_MINIFY: &str = "minify";
+/// Tag recorded for `encode = "toon"`.
+pub const TAG_TOON: &str = "toon";
 /// Tag recorded for `max_result_bytes`.
 pub const TAG_TRUNCATE: &str = "truncate";
 /// Tag recorded for the per-tool field filter.
@@ -283,6 +285,42 @@ pub fn minify_json(resp: &mut Value) -> bool {
     changed
 }
 
+/// Replaces JSON text blocks with their TOON encoding when the round trip
+/// is lossless and the saving is at least 20%. `structuredContent` is not
+/// changed. Returns whether `resp` was changed.
+pub fn toon_encode(resp: &mut Value) -> bool {
+    if is_untouchable(resp) {
+        return false;
+    }
+    let Some(blocks) = resp
+        .pointer_mut("/result/content")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for b in blocks {
+        if b["type"] != "text" {
+            continue;
+        }
+        let Some(text) = b["text"].as_str() else {
+            continue;
+        };
+        let t = text.trim_start();
+        if !(t.starts_with('{') || t.starts_with('[')) {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if let Some(enc) = super::toon::encode_if_better(&v, text.len()) {
+            b["text"] = Value::String(enc);
+            changed = true;
+        }
+    }
+    changed
+}
+
 impl ServerPolicy {
     /// Applies the configured result transforms to `resp` (a full JSON-RPC
     /// response of `tools/call` of backend tool `tool`) and returns the tags
@@ -310,6 +348,9 @@ impl ServerPolicy {
         }
         if self.minify_json && minify_json(&mut work) {
             tags.push(TAG_MINIFY.to_owned());
+        }
+        if self.encode_toon && toon_encode(&mut work) {
+            tags.push(TAG_TOON.to_owned());
         }
         let mut stored = None;
         if let (max @ 1.., Some(ctx)) = (self.max_result_bytes, store) {

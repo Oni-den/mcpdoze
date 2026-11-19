@@ -13,9 +13,11 @@
 //! `isError` result or a JSON-RPC error, never a non-text block; when the
 //! transformed result is not smaller the original is sent.
 
+pub mod cache;
 pub mod meta;
 pub mod result;
 pub mod store;
+pub mod toon;
 pub mod view;
 
 use std::collections::{HashMap, HashSet};
@@ -35,7 +37,9 @@ pub struct ServerPolicy {
     description_max_chars: Option<usize>,
     strip_schema_descriptions: bool,
     minify_json: bool,
+    encode_toon: bool,
     max_result_bytes: u64,
+    cache: Option<cache::CachePolicy>,
     filters: HashMap<String, result::FieldFilter>,
     default_args: HashMap<String, Map<String, Value>>,
     /// `tool/key` pairs already warned about (one warning each).
@@ -73,7 +77,9 @@ impl ServerPolicy {
             description_max_chars: o.description_max_chars.map(|n| n as usize),
             strip_schema_descriptions: o.strip_schema_descriptions,
             minify_json: o.minify_json,
+            encode_toon: o.encode == crate::config::Encode::Toon,
             max_result_bytes: o.max_result_bytes,
+            cache: o.cache.as_ref().map(cache::CachePolicy::new).transpose()?,
             filters,
             default_args,
             warned: Mutex::default(),
@@ -87,13 +93,25 @@ impl ServerPolicy {
 
     /// Whether any result transform is on.
     pub fn transforms_results(&self) -> bool {
-        self.minify_json || self.max_result_bytes > 0 || !self.filters.is_empty()
+        self.minify_json
+            || self.encode_toon
+            || self.max_result_bytes > 0
+            || !self.filters.is_empty()
     }
 
-    /// Whether results may be stored for `mcpdoze__result_get` (truncation;
-    /// the result cache will add itself here).
+    /// Whether results may be stored for `mcpdoze__result_get` (truncation,
+    /// or the result cache in `reference` mode).
     pub fn stores_results(&self) -> bool {
         self.max_result_bytes > 0
+            || self
+                .cache
+                .as_ref()
+                .is_some_and(|c| c.on_hit() == crate::config::CacheHit::Reference)
+    }
+
+    /// The result cache settings, when the cache is on.
+    pub fn cache(&self) -> Option<&cache::CachePolicy> {
+        self.cache.as_ref()
     }
 
     /// Whether `tool` has a field filter.

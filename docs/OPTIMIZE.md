@@ -1,6 +1,6 @@
 # Token optimisation
 
-**Status: Planned (M10), not implemented.** This document describes the intended design. Details are in `docs/plans/M9-M10-plan.md`.
+**Status: implemented in this release: measurement, tool allow/deny, description trimming, `default_args`, `minify_json`, truncation with `result_get`, field filters and `encode = "toon"`. Still planned (being finished): the result cache and the batch meta-tool.** The cache and batch sections describe the intended design. Details are in `docs/plans/M9-M10-plan.md`.
 
 A broker sits between the agent and the MCP server, so it can reduce what reaches the agent's context without touching either side. Everything here is **opt-in per server**. A server with no `optimize` table behaves exactly as today.
 
@@ -68,6 +68,12 @@ Meta-tools use the reserved prefix `mcpdoze` and appear in `tools/list` only whe
 ## Caching rules
 
 A tool is cached only if listed in `cache.tools` and annotated `readOnlyHint = true`. The key is server, scope, session, tool and canonical arguments. Entries are invalidated by TTL, any non-read-only call to the same server, a backend respawn, `list_changed`, and `notifications/resources/updated`. Stateless (2026-07-28) requests have no session and are not cached. Memory only, byte-capped, never on disk. `on_hit = "reference"` returns a stub plus a ref and is allowed only for tools without `outputSchema`.
+
+## TOON encoding
+
+With `encode = "toon"` a text block that parses as JSON is replaced by a TOON-style text: objects as indented `key: value` lines, uniform arrays of flat objects as a table (`items[3]{id,name,status}:` then one comma-separated row per element), scalar arrays inline, other arrays as `- ` lists, and JSON-style quoting only where a bare string would be ambiguous. The broker applies it only when the text decodes back to exactly the same JSON (numbers exact, key order kept) and is at least 20% smaller; otherwise the original is sent. `structuredContent` is never changed, so `outputSchema` stays valid. Results with `isError`, and non-text blocks, are never touched. The tag is `toon`.
+
+The agent sees TOON text, not JSON. A format description line is deliberately not prepended: the notation is regular enough for models to read, and a hint on every result would cost tokens that the encoding just saved. The tradeoff is that an agent may occasionally misread or mis-copy a TOON value, so leave `encode` off for tools whose output is fed verbatim into other tools or parsers. Large uniform lists (search hits, issue lists, rows) gain the most; small or deeply nested results usually fall back to JSON.
 
 ## Pitfalls
 
