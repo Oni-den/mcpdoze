@@ -89,6 +89,9 @@ pub struct Config {
     /// Usage statistics log (`docs/STATS.md`).
     #[serde(default)]
     pub stats: StatsConfig,
+    /// Failure diagnostics (`docs/DEBUG.md`); off by default.
+    #[serde(default)]
+    pub debug: DebugConfig,
 }
 
 /// `[stats]`: the append-only usage log (`docs/STATS.md`).
@@ -339,6 +342,19 @@ pub struct ServerConfig {
     /// TTL expires (see `docs/SUBSCRIPTIONS.md`).
     #[serde(default, skip_serializing_if = "is_default_subscriptions")]
     pub subscriptions: SubscriptionPolicy,
+    /// Failure-diagnostics mode of this server, overriding `[debug] mode`.
+    /// Runtime, CLI and env overrides still win (see [`DebugSettings`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<DebugMode>,
+    /// Longest a single `tools/call` may take before it fails with -32000
+    /// (no limit when unset).
+    #[serde(
+        default,
+        deserialize_with = "de_opt_duration",
+        serialize_with = "ser_opt_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub call_timeout: Option<Duration>,
 }
 
 /// Idle policy of a backend instance that holds resource subscriptions.
@@ -426,6 +442,7 @@ impl Config {
                 "must be at least 1",
             ));
         }
+        self.debug.validate(&mut errs);
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for (name, s) in &self.servers {
             let f = |k: &str| format!("servers.{name}.{k}");
@@ -530,6 +547,12 @@ impl Config {
             if s.catalog_max_age == Some(Duration::ZERO) {
                 errs.push(ValidationError::new(
                     f("catalog_max_age"),
+                    "must be greater than 0",
+                ));
+            }
+            if s.call_timeout == Some(Duration::ZERO) {
+                errs.push(ValidationError::new(
+                    f("call_timeout"),
                     "must be greater than 0",
                 ));
             }
@@ -985,6 +1008,13 @@ impl NameMap {
         self.map.is_empty()
     }
 }
+
+mod debug;
+
+pub use debug::{
+    resolve_debug, DebugConfig, DebugLayer, DebugLayers, DebugMode, DebugSettings,
+    ENV_VAR as DEBUG_ENV_VAR,
+};
 
 #[cfg(test)]
 mod tests;

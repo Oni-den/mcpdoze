@@ -419,6 +419,8 @@ pub fn build_register(a: &AddArgs) -> Result<RegisterRequest> {
             catalog_max_age: None,
             max_instances: None,
             subscriptions: Default::default(),
+            debug: None,
+            call_timeout: None,
         },
     })
 }

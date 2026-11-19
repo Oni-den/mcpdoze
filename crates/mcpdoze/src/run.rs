@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Args;
-use mcpdoze_core::config::{self, Config};
+use mcpdoze_core::config::{self, Config, DebugLayer, DebugMode};
 use mcpdoze_core::daemon::{Daemon, ServeOptions};
 use tracing_subscriber::filter::LevelFilter;
 
@@ -28,6 +28,20 @@ pub struct ServeArgs {
     /// Do not watch the config file for changes.
     #[arg(long)]
     pub no_watch: bool,
+    /// Enable failure diagnostics for this run (`--debug` means `failures`;
+    /// `--debug=trace` adds trace events). Without `--debug-server`, applies
+    /// to every server.
+    #[arg(
+        long,
+        value_name = "MODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "failures"
+    )]
+    pub debug: Option<DebugMode>,
+    /// Limit `--debug` to this server (repeatable). Alone it means `failures`.
+    #[arg(long = "debug-server", value_name = "NAME")]
+    pub debug_server: Vec<String>,
 }
 
 impl ServeArgs {
@@ -37,8 +51,14 @@ impl ServeArgs {
             config_path: self.config.clone(),
             bind: self.bind.clone(),
             watch: !self.no_watch,
+            debug_cli: self.debug_layer(),
             ..ServeOptions::default()
         }
+    }
+
+    /// The CLI layer of the debug flags (see [`DebugLayer::from_cli`]).
+    pub fn debug_layer(&self) -> DebugLayer {
+        DebugLayer::from_cli(self.debug, &self.debug_server)
     }
 
     /// The config file these flags select (explicit, else the default).
@@ -148,6 +168,7 @@ pub async fn serve(opts: ServeOptions) -> Result<(), ServeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn daemon_log_follows_log_dir() {
@@ -174,10 +195,56 @@ mod tests {
             config: Some("example.toml".into()),
             bind: Some("127.0.0.1:1".into()),
             no_watch: true,
+            ..ServeArgs::default()
         };
         let o = a.options();
         assert_eq!(o.config_path, Some(PathBuf::from("example.toml")));
         assert_eq!(o.bind.as_deref(), Some("127.0.0.1:1"));
         assert!(!o.watch);
+        assert_eq!(o.debug_cli, DebugLayer::default());
+    }
+
+    /// `serve` flags as the real parser reads them.
+    #[derive(Debug, clap::Parser)]
+    struct Parsed {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+
+    fn parse(args: &[&str]) -> Result<ServeArgs, clap::Error> {
+        let mut argv = vec!["serve"];
+        argv.extend_from_slice(args);
+        Parsed::try_parse_from(argv).map(|p| p.serve)
+    }
+
+    #[test]
+    fn debug_flags_parse() {
+        let none = parse(&[]).unwrap();
+        assert_eq!(none.debug, None);
+        assert_eq!(none.debug_layer(), DebugLayer::default());
+
+        let bare = parse(&["--debug"]).unwrap();
+        assert_eq!(bare.debug, Some(DebugMode::Failures));
+        assert_eq!(bare.debug_layer().all, Some(DebugMode::Failures));
+
+        let trace = parse(&["--debug=trace"]).unwrap();
+        assert_eq!(trace.debug_layer().all, Some(DebugMode::Trace));
+
+        let scoped = parse(&["--debug=trace", "--debug-server", "a", "--debug-server=b"]).unwrap();
+        let layer = scoped.debug_layer();
+        assert_eq!(layer.all, None);
+        assert_eq!(layer.servers.get("a"), Some(&DebugMode::Trace));
+        assert_eq!(layer.servers.get("b"), Some(&DebugMode::Trace));
+
+        let only_server = parse(&["--debug-server", "a"]).unwrap();
+        assert_eq!(
+            only_server.debug_layer().servers.get("a"),
+            Some(&DebugMode::Failures)
+        );
+        assert_eq!(only_server.debug_layer().all, None);
+
+        // `--debug trace` (space) must not consume the mode: it is an error.
+        assert!(parse(&["--debug", "trace"]).is_err());
+        assert!(parse(&["--debug=verbose"]).is_err());
     }
 }

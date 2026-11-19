@@ -47,6 +47,9 @@ pub struct ServeOptions {
     pub tuning: Tuning,
     /// Catalog; when `None`, a [`DiskCatalog`] in [`catalog_dir`].
     pub catalog: Option<Arc<dyn Catalog>>,
+    /// Debug overrides from the command line (`serve --debug`). The
+    /// environment layer (`MCPDOZE_DEBUG`) is read at start.
+    pub debug_cli: config::DebugLayer,
 }
 
 impl Default for ServeOptions {
@@ -57,6 +60,7 @@ impl Default for ServeOptions {
             watch: true,
             tuning: Tuning::default(),
             catalog: None,
+            debug_cli: config::DebugLayer::default(),
         }
     }
 }
@@ -85,6 +89,9 @@ pub enum DaemonError {
     /// The config is invalid (one problem per line).
     #[error("invalid config:\n{0}")]
     Invalid(String),
+    /// The `MCPDOZE_DEBUG` environment variable is invalid.
+    #[error("debug settings: {0}")]
+    Debug(String),
     /// No usable bearer token.
     #[error("bearer token: {0}")]
     Token(String),
@@ -338,6 +345,24 @@ impl Daemon {
         start_stats(&router, &cfg.stats);
         let security = Security::new(token, cfg.broker.allowed_hosts.clone());
         let control = Control::new(router, cfg, path.clone());
+        let env_debug = config::DebugLayer::from_env().map_err(DaemonError::Debug)?;
+        control
+            .set_debug_inputs(opts.debug_cli.clone(), env_debug)
+            .await;
+        let settings = control.debug_now();
+        let layers = settings.layers();
+        if settings.global != config::DebugMode::Off
+            || layers.cli != config::DebugLayer::default()
+            || layers.env != config::DebugLayer::default()
+        {
+            tracing::info!(
+                mode = settings.global.as_str(),
+                "failure diagnostics configured"
+            );
+        }
+        if settings.diag.is_none() {
+            tracing::warn!("cannot determine the debug directory; failure diagnostics stay off");
+        }
         let applied = control.apply_initial().await;
         tracing::info!(servers = applied.added.len(), "servers registered");
 

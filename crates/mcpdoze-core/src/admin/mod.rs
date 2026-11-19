@@ -118,6 +118,8 @@ struct ControlState {
     skipped: BTreeMap<String, String>,
     /// Initial config, applied by `apply_initial`.
     pending: Option<Config>,
+    /// CLI, env and runtime debug overrides (`config::DebugLayers`).
+    debug_layers: config::DebugLayers,
 }
 
 /// Broker control plane shared by the admin API and the config watcher.
@@ -125,6 +127,10 @@ pub struct Control {
     router: Arc<Router>,
     path: Option<PathBuf>,
     state: tokio::sync::Mutex<ControlState>,
+    /// Effective debug settings; republished on every apply and override
+    /// change. Backends subscribe via [`Control::debug_settings`]. Changing
+    /// it never unloads a backend.
+    debug: tokio::sync::watch::Sender<Arc<config::DebugSettings>>,
 }
 
 impl std::fmt::Debug for Control {
@@ -339,9 +345,14 @@ impl Control {
     /// (not applied until [`apply_initial`](Control::apply_initial)).
     /// `path` enables persistence and reload.
     pub fn new(router: Arc<Router>, config: Config, path: Option<PathBuf>) -> Arc<Self> {
+        let debug = Arc::new(config::resolve_debug(
+            &config,
+            &config::DebugLayers::default(),
+        ));
         Arc::new(Self {
             router,
             path,
+            debug: tokio::sync::watch::channel(debug).0,
             state: tokio::sync::Mutex::new(ControlState {
                 // Same broker baseline as `config`, so applying it reports
                 // no restart-only changes.
@@ -349,11 +360,53 @@ impl Control {
                     broker: config.broker.clone(),
                     servers: BTreeMap::new(),
                     stats: config.stats.clone(),
+                    debug: config.debug.clone(),
                 },
                 pending: Some(config),
                 ..ControlState::default()
             }),
         })
+    }
+
+    /// Subscribes to the effective debug settings. The value is republished
+    /// after every apply (config reload) and after [`set_debug_inputs`] or
+    /// [`set_runtime_debug`]; a change never restarts a backend.
+    ///
+    /// [`set_debug_inputs`]: Control::set_debug_inputs
+    /// [`set_runtime_debug`]: Control::set_runtime_debug
+    pub fn debug_settings(&self) -> tokio::sync::watch::Receiver<Arc<config::DebugSettings>> {
+        self.debug.subscribe()
+    }
+
+    /// The current effective debug settings.
+    pub fn debug_now(&self) -> Arc<config::DebugSettings> {
+        self.debug.borrow().clone()
+    }
+
+    /// Sets the CLI and environment layers (`serve --debug`,
+    /// `MCPDOZE_DEBUG`) and republishes the debug settings.
+    pub async fn set_debug_inputs(&self, cli: config::DebugLayer, env: config::DebugLayer) {
+        let mut st = self.state.lock().await;
+        st.debug_layers.cli = cli;
+        st.debug_layers.env = env;
+        self.publish_debug(&st);
+    }
+
+    /// Sets the runtime layer (admin API; not persisted) and republishes.
+    pub async fn set_runtime_debug(&self, runtime: config::DebugLayer) {
+        let mut st = self.state.lock().await;
+        st.debug_layers.runtime = runtime;
+        self.publish_debug(&st);
+    }
+
+    /// Resolves the debug settings of the applied config under the current
+    /// layers and publishes them. Only the debug settings change; the
+    /// backend registrations are untouched.
+    fn publish_debug(&self, st: &ControlState) {
+        self.debug.send_replace(Arc::new(config::resolve_debug(
+            &st.config,
+            &st.debug_layers,
+        )));
     }
 
     /// The router this controls.
@@ -386,6 +439,12 @@ impl Control {
         };
         if st.config.stats != new.stats {
             resp.restart_required.push("stats".to_owned());
+        }
+        // `[debug]` and `servers.*.debug` are not part of `Applied`, so a
+        // change here never re-registers or unloads a backend; the new
+        // settings are published at the end of this function.
+        if st.config.debug != new.debug {
+            tracing::info!(mode = new.debug.mode.as_str(), "debug settings changed");
         }
         let mut desired = BTreeMap::new();
         let mut skipped = BTreeMap::new();
@@ -483,6 +542,7 @@ impl Control {
         st.applied = applied;
         st.skipped = skipped;
         st.config = new;
+        self.publish_debug(st);
         resp
     }
 
@@ -920,5 +980,72 @@ mod tests {
         let spec = build_spec(&s, &broker).unwrap();
         assert!(spec.strip_env.contains("MCPDOZE_TOKEN"));
         assert!(spec.strip_env.contains("EXAMPLE_BROKER_TOKEN"));
+    }
+}
+
+#[cfg(test)]
+mod debug_reload_tests {
+    use super::*;
+    use crate::config::DebugMode;
+    use crate::router::MemoryCatalog;
+
+    const BEFORE: &str = r#"
+[servers.srv]
+transport = "stdio"
+command = "prog"
+probe = false
+"#;
+
+    const AFTER: &str = r#"
+[debug]
+mode = "failures"
+
+[servers.srv]
+transport = "stdio"
+command = "prog"
+probe = false
+debug = "trace"
+"#;
+
+    /// A `[debug]` or `servers.*.debug` change applies on reload without
+    /// touching the registration, so the backend (and its pid) survives.
+    #[tokio::test]
+    async fn debug_change_reloads_without_reregistering() {
+        let dir = std::env::temp_dir().join(format!("mcpdoze-admin-debug-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, BEFORE).unwrap();
+
+        let router = Router::with(Arc::new(MemoryCatalog::default()), Default::default());
+        let control = Control::new(
+            router.clone(),
+            Config::load(&path).unwrap(),
+            Some(path.clone()),
+        );
+        let first = control.apply_initial().await;
+        assert_eq!(first.added, vec!["srv".to_owned()]);
+        assert_eq!(control.debug_now().mode_for("srv"), DebugMode::Off);
+
+        std::fs::write(&path, AFTER).unwrap();
+        let mut rx = control.debug_settings();
+        let resp = control.reload().await.unwrap();
+        assert!(resp.added.is_empty(), "{resp:?}");
+        assert!(resp.removed.is_empty(), "{resp:?}");
+        assert!(resp.changed.is_empty(), "{resp:?}");
+        assert!(resp.restart_required.is_empty(), "{resp:?}");
+        assert!(router.server("srv").is_some());
+
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+        let now = control.debug_now();
+        assert_eq!(now.mode_for("srv"), DebugMode::Trace);
+        assert_eq!(now.global, DebugMode::Failures);
+
+        // Runtime override wins over the config and does not reregister.
+        control
+            .set_runtime_debug(config::DebugLayer::from_cli(Some(DebugMode::Off), &[]))
+            .await;
+        assert_eq!(control.debug_now().mode_for("srv"), DebugMode::Off);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
