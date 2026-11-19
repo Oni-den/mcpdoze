@@ -384,6 +384,11 @@ fn handle_call(st: Arc<State>, id: Value, params: Value) {
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
         eprintln!("[mock leak] tool={tool} args={args} env={}", env.join(" "));
+        if let Some(t) = args["text"].as_str() {
+            eprintln!("{{\"password\": \"{t}\", \"user\": \"x\"}}");
+            eprintln!("password: {t}");
+            eprintln!("spawn failed: server -t {t} --port 1");
+        }
     }
     let exit_now =
         (st.cfg.exit_code.is_some() && tool == "exit") || st.cfg.exit_after.is_some_and(|c| n >= c);

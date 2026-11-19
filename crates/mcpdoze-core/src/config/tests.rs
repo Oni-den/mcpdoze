@@ -542,7 +542,6 @@ frames = 16
 stderr_lines = 10
 slow_call = "5s"
 tool_errors = true
-raw = true
 raw_for = "10m"
 "#);
     let d = &c.debug;
@@ -554,9 +553,24 @@ raw_for = "10m"
     assert_eq!(d.stderr_lines, 10);
     assert_eq!(d.slow_call, Duration::from_secs(5));
     assert!(d.tool_errors);
-    assert!(d.raw);
+    assert!(!d.raw);
     assert_eq!(d.raw_for, Duration::from_secs(600));
     c.validate().unwrap();
+}
+
+#[test]
+fn debug_raw_capture_is_refused() {
+    for text in [
+        "[debug]\nraw = true\n",
+        "[debug]\nraw = true\nraw_for = \"5m\"\n",
+    ] {
+        let e = errs(text);
+        assert!(has(&e, "debug.raw"), "{e:?}");
+        assert!(
+            format!("{e:?}").contains("raw capture is not available in this version"),
+            "{e:?}"
+        );
+    }
 }
 
 #[test]

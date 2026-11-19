@@ -40,7 +40,7 @@ default_args = { per_page = 20 }               # merged only for keys the agent 
 keep = ["/items/*/id", "/items/*/title"]       # JSON-pointer globs (or drop = [...])
 ```
 
-Both tables reject unknown keys. `default_args` keys are validated against the tool's catalog `inputSchema` at config load. Changing `optimize` or `tools` does not unload the backend; it sends `notifications/tools/list_changed` when the change affects lists.
+Both tables reject unknown keys. `default_args` keys are checked at call time against the live catalog `inputSchema`; a key the schema does not know is skipped with one warning (config load does not reject it). Changing `optimize` or `tools` does not unload the backend; it sends `notifications/tools/list_changed` when the change affects lists.
 
 ## Protocol rules
 

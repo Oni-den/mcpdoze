@@ -93,7 +93,7 @@ tool_errors = false
 | `stderr_lines` | integer | `40` | Stderr lines kept in a record's tail. At most 1000. |
 | `slow_call` | duration | `"30s"` | Calls slower than this are recorded in `trace` mode. Must be greater than 0. |
 | `tool_errors` | bool | `false` | Also record tool results with `isError: true`. |
-| `raw` | bool | `false` | Raw frame capture. **Not available in this version**: the admin API and the CLI refuse `true`. Leave it `false`. |
+| `raw` | bool | `false` | Raw frame capture. **Not available in this version**: config validation, the admin API and the CLI refuse `true` ("raw capture is not available in this version"). |
 | `raw_for` | duration | `"30m"` | Lifetime of raw capture if it were enabled. Must be greater than 0. Reserved. |
 
 Unknown keys are rejected. Changes apply on reload without unloading a backend.
@@ -175,7 +175,7 @@ server without this table behaves exactly as before. Unknown keys are rejected.
 | `encode` | `"none"` or `"toon"` | `"none"` | `toon` encodes text results only when the round trip is lossless and at least 20 % smaller. |
 | `max_result_bytes` | integer | `0` (off) | Larger results are truncated and the full result is kept for `mcpdoze__result_get`. `0` or at least `512`. |
 | `cache` | table | unset (off) | Session cache for listed read-only tools. Keys: `ttl` (duration, greater than 0), `tools` (non-empty list of globs), `on_hit` (`"full"` default, or `"reference"`). |
-| `batch` | `"off"`, `"read-only"` or `"all"` | `"off"` | Accepted by the parser, but the `mcpdoze__batch` meta-tool is not built in this version, so the value has no effect yet. `"all"` bypasses per-tool approval and must be explicit. |
+| `batch` | `"off"`, `"read-only"` or `"all"` | `"off"` | Enables the `mcpdoze__batch` meta-tool: `read-only` batches only tools with `readOnlyHint`. `"all"` bypasses per-tool approval and must be explicit. |
 
 ```toml
 [servers.example.optimize]

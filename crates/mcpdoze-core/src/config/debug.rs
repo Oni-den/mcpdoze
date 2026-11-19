@@ -202,6 +202,12 @@ impl DebugConfig {
                 "must be greater than 0",
             ));
         }
+        if self.raw {
+            errs.push(ValidationError::new(
+                field("raw"),
+                "raw capture is not available in this version",
+            ));
+        }
         if self.raw_for.is_zero() {
             errs.push(ValidationError::new(
                 field("raw_for"),

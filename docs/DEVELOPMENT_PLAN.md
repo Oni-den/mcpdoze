@@ -140,7 +140,7 @@ paragraph above is historical.
 | M7 | done | `per-cwd` / `per-session` scopes and server-to-client routing (sampling, elicitation, roots). |
 | M8 | done | Autostart, migration skill (surgical rollback), hook and case study done; release workflow builds the binaries; Linux/macOS covered by CI; version 0.1.0. Open: the nightly soak run. The v0.2 items (the stateless 2026-07-28 protocol, decisions/0002; resource subscriptions, SUBSCRIPTIONS.md) are implemented on main. |
 | M9 | done, except raw capture | Failure diagnostics (`diag`, `mcpdoze debug`, export and replay), the stdio call timeout and the oversize-frame, string-id and exit-status fixes. Raw frame capture is deferred and refused. See [DEBUG.md](DEBUG.md). |
-| M10 | partly done | Built: per-tool stats, tool allow/deny, description trimming, `default_args`, `minify_json`, truncation with `mcpdoze__result_get`, field filters, session cache, TOON. Not built: the batch meta-tool (A4); deferred tool mode (3c) is not built, see [decisions/0003](decisions/0003-deferred-tools.md). See [OPTIMIZE.md](OPTIMIZE.md). |
+| M10 | done, except deferred tools | Built: per-tool stats, tool allow/deny, description trimming, `default_args`, `minify_json`, truncation with `mcpdoze__result_get`, field filters, session cache, TOON, the batch meta-tool. Not built: deferred tool mode (3c), see [decisions/0003](decisions/0003-deferred-tools.md). See [OPTIMIZE.md](OPTIMIZE.md). |
 
 
 ## Hardest problems
@@ -184,14 +184,14 @@ at view time, so the disk catalog keeps the backend's own lists. In scope:
 measuring bytes per tool, hiding tools, trimming descriptions, default
 arguments for pagination, compact text encoding, truncating large results
 with on-demand retrieval, field filtering, caching read-only results per
-session, and a batch tool. Out of scope: server-side computation,
+session, and a batch tool (all built except deferred tools). Out of scope: server-side computation,
 summarising with a model, and pruning or de-duplicating the agent's own
 context; MCPDoze reports duplicate calls and large tools instead. Results
 with `isError` are never changed, and a tool whose structured output is
 changed is listed without its `outputSchema`. See [OPTIMIZE.md](OPTIMIZE.md).
 
 Sequence: M9 first (it also fixes hangs on oversize frames and string ids),
-then M10 in phases A0 (measure) to A4 (batch, deferred tools after ADR 0003).
+then M10 in phases A0 (measure) to A4 (batch); deferred tools (A8) wait on ADR 0003.
 
 ## Migration skill (`skills/mcpdoze-migrate`)
 
