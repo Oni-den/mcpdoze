@@ -9,7 +9,7 @@
 MCPDoze is a small Rust broker that sits between your AI agents and your
 [Model Context Protocol](https://modelcontextprotocol.io) servers.
 
-> Status: **v0.2.1, early release.** The data path, lifecycle, catalog,
+> Status: **v0.3.0, early release.** The data path, lifecycle, catalog,
 > admin API, CLI, HTTP passthrough, `shared` / `per-cwd` / `per-session`
 > scopes, routing of server-to-client requests (sampling, elicitation,
 > roots), migration skill with rollback and the optional guardrail hook work.
@@ -17,7 +17,7 @@ MCPDoze is a small Rust broker that sits between your AI agents and your
 > builds the binaries. On main for v0.2: the stateless MCP 2026-07-28
 > protocol alongside 2025-11-25 (see
 > [decision 0002](docs/decisions/0002-stateless-protocol-support.md)) and
-> shared resource subscriptions ([SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md)). See
+> shared resource subscriptions ([SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md)). New in 0.3: opt-in failure diagnostics ([DEBUG.md](docs/DEBUG.md); raw capture is not available) and per-server token optimisation ([OPTIMIZE.md](docs/OPTIMIZE.md); deferred tools are not built). See
 > [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) and the measured
 > [case study](docs/CASE_STUDY.md): two sessions, 741 MB without MCPDoze
 > versus 394 MB with it, and about 6 MB after the idle unload.
