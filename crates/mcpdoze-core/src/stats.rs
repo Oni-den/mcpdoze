@@ -46,6 +46,67 @@ const MB: f64 = 1024.0 * 1024.0;
 /// count as one session per server and window.
 pub const STATELESS_SESSION: u64 = 0;
 
+/// Calls remembered per session for the duplicate-call metric.
+pub const DUP_WINDOW: usize = 32;
+/// Sessions tracked by the duplicate-call metric before it starts over.
+const DUP_SESSIONS: usize = 512;
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Estimated tokens for `bytes` of JSON (no tokenizer: bytes / 4).
+pub fn est_tokens(bytes: u64) -> u64 {
+    bytes / 4
+}
+
+/// In-memory hash of a call's identity (server, tool, arguments) for the
+/// duplicate-call metric. Never written anywhere.
+pub fn call_hash(server: &str, tool: &str, args: &serde_json::Value) -> u64 {
+    use std::hash::Hasher;
+    struct H(std::collections::hash_map::DefaultHasher);
+    impl Write for H {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut h = H(std::collections::hash_map::DefaultHasher::new());
+    h.0.write(server.as_bytes());
+    h.0.write_u8(0);
+    h.0.write(tool.as_bytes());
+    h.0.write_u8(0);
+    let _ = serde_json::to_writer(&mut h, args);
+    h.0.finish()
+}
+
+/// Per-session ring of the last [`DUP_WINDOW`] call hashes; memory only.
+#[derive(Debug, Default)]
+pub struct DupTracker {
+    rings: Mutex<HashMap<u64, std::collections::VecDeque<u64>>>,
+}
+
+impl DupTracker {
+    /// Records `hash` for `session` and says whether it was already among
+    /// the session's last [`DUP_WINDOW`] calls.
+    pub fn check(&self, session: u64, hash: u64) -> bool {
+        let mut rings = self.rings.lock().unwrap_or_else(|e| e.into_inner());
+        if rings.len() >= DUP_SESSIONS && !rings.contains_key(&session) {
+            rings.clear();
+        }
+        let ring = rings.entry(session).or_default();
+        let dup = ring.contains(&hash);
+        if ring.len() >= DUP_WINDOW {
+            ring.pop_front();
+        }
+        ring.push_back(hash);
+        dup
+    }
+}
+
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -154,6 +215,21 @@ pub struct CallEvent {
     /// Debug level: time from sending to the backend to its response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_ms: Option<u64>,
+    /// Size of the response as sent to the agent, when it differs from
+    /// `bytes_out` (an optimisation changed it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_sent: Option<u64>,
+    /// Tags of the optimisations applied to the response (empty: none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opt: Vec<String>,
+    /// Served from the result cache.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cached: bool,
+    /// The session already made an identical call (same tool and
+    /// arguments) among its last [`DUP_WINDOW`] calls. Only this flag is
+    /// logged, never the arguments or their hash.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dup: bool,
     /// In memory only: the calling session (concurrency counting).
     #[serde(skip)]
     pub session: Option<u64>,
@@ -642,6 +718,7 @@ pub struct Stats {
     dir: PathBuf,
     debug: bool,
     interval: Duration,
+    dups: DupTracker,
 }
 
 impl std::fmt::Debug for Stats {
@@ -688,7 +765,14 @@ impl Stats {
             dir,
             debug: cfg.debug,
             interval,
+            dups: DupTracker::default(),
         }))
+    }
+
+    /// Records a call of `session` and says whether it repeats a recent
+    /// identical call (see [`DupTracker`]).
+    pub fn note_call(&self, session: u64, hash: u64) -> bool {
+        self.dups.check(session, hash)
     }
 
     /// The log directory.
@@ -802,6 +886,42 @@ pub struct ServerSummary {
     pub failures: BTreeMap<String, u64>,
 }
 
+/// Size of one server's tool list as served to agents (live catalog).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ListSize {
+    /// Server name.
+    pub server: String,
+    /// Bytes of the prefixed tool list as JSON.
+    pub list_bytes: u64,
+    /// `list_bytes / 4`; an estimate, not a tokenizer count.
+    pub est_list_tokens: u64,
+}
+
+/// Per-tool part of a [`Summary`] (tool calls only).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolSummary {
+    /// Server name.
+    pub server: String,
+    /// Tool name (without prefix).
+    pub tool: String,
+    /// Logged calls.
+    pub calls: u64,
+    /// Average response size in bytes.
+    pub avg_bytes_out: u64,
+    /// 95th percentile response size in bytes.
+    pub p95_bytes_out: u64,
+    /// Sum of response sizes in bytes.
+    pub total_bytes: u64,
+    /// `total_bytes / 4`; an estimate, not a tokenizer count.
+    pub est_tokens: u64,
+    /// `total_bytes` over the server's total tool response bytes.
+    pub share: f64,
+    /// Calls flagged as repeats of a recent identical call.
+    pub dup_calls: u64,
+    /// Bytes not sent to the agent thanks to optimisations.
+    pub bytes_saved: u64,
+}
+
 /// Memory part of a [`Summary`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemorySummary {
@@ -838,6 +958,13 @@ pub struct Summary {
     pub dropped: u64,
     /// By server name.
     pub servers: Vec<ServerSummary>,
+    /// Per tool, largest `total_bytes` first.
+    #[serde(default)]
+    pub tools: Vec<ToolSummary>,
+    /// Tool-list size per server (filled by the admin API from the live
+    /// catalog, not read from the log).
+    #[serde(default)]
+    pub lists: Vec<ListSize>,
     /// Broker vs estimated direct memory.
     pub memory: MemorySummary,
 }
@@ -869,6 +996,7 @@ pub struct SummaryBuilder {
     peak_sessions: usize,
     dropped: u64,
     servers: BTreeMap<String, (ServerSummary, Vec<u64>)>,
+    tools: BTreeMap<(String, String), (ToolSummary, Vec<u64>)>,
     samples: u64,
     sum_actual: f64,
     sum_est: f64,
@@ -921,6 +1049,28 @@ impl SummaryBuilder {
                     s.cold_starts += 1;
                 }
                 d.push(c.duration_ms);
+                if c.kind == CallKind::Tool {
+                    let (t, sizes) = self
+                        .tools
+                        .entry((c.server.clone(), c.name.clone()))
+                        .or_insert_with(|| {
+                            (
+                                ToolSummary {
+                                    server: c.server.clone(),
+                                    tool: c.name.clone(),
+                                    ..ToolSummary::default()
+                                },
+                                Vec::new(),
+                            )
+                        });
+                    t.calls += 1;
+                    t.total_bytes += c.bytes_out;
+                    t.dup_calls += u64::from(c.dup);
+                    t.bytes_saved += c
+                        .bytes_sent
+                        .map_or(0, |sent| c.bytes_out.saturating_sub(sent));
+                    sizes.push(c.bytes_out);
+                }
             }
             Event::Spawn(e) => self.server(&e.server).0.spawns += 1,
             Event::Unload(e) => {
@@ -965,6 +1115,27 @@ impl SummaryBuilder {
                 s
             })
             .collect();
+        let mut server_bytes: HashMap<String, u64> = HashMap::new();
+        for (t, _) in self.tools.values() {
+            *server_bytes.entry(t.server.clone()).or_default() += t.total_bytes;
+        }
+        let mut tools: Vec<ToolSummary> = self
+            .tools
+            .into_values()
+            .map(|(mut t, mut sizes)| {
+                sizes.sort_unstable();
+                t.avg_bytes_out = t.total_bytes / t.calls.max(1);
+                t.p95_bytes_out = percentile(&sizes, 95.0);
+                t.est_tokens = est_tokens(t.total_bytes);
+                t.share = ratio(t.total_bytes, server_bytes[&t.server]);
+                t
+            })
+            .collect();
+        tools.sort_by(|a, b| {
+            b.total_bytes
+                .cmp(&a.total_bytes)
+                .then_with(|| (&a.server, &a.tool).cmp(&(&b.server, &b.tool)))
+        });
         let avg = |v: f64| {
             if self.samples == 0 {
                 0.0
@@ -980,6 +1151,8 @@ impl SummaryBuilder {
             peak_sessions: self.peak_sessions,
             dropped: self.dropped,
             servers,
+            tools,
+            lists: Vec::new(),
             memory: MemorySummary {
                 samples: self.samples,
                 avg_actual_mb: avg(self.sum_actual),

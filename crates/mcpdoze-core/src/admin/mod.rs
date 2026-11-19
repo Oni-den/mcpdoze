@@ -894,6 +894,19 @@ impl Control {
         .await
         .map_err(|e| ControlError::Io(e.to_string()))?
         .map_err(|e| ControlError::Io(format!("cannot read the statistics log: {e}")))
+        .map(|mut summary| {
+            let mut sizes: Vec<_> = self.router.tool_list_bytes().into_iter().collect();
+            sizes.sort();
+            summary.lists = sizes
+                .into_iter()
+                .map(|(server, bytes)| crate::stats::ListSize {
+                    server,
+                    list_bytes: bytes,
+                    est_list_tokens: crate::stats::est_tokens(bytes),
+                })
+                .collect();
+            summary
+        })
     }
 
     /// The failure log file, when a debug directory is known.

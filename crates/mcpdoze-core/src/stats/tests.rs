@@ -26,6 +26,10 @@ fn call(server: &str, ts: u64, ms: u64, ok: bool, cold: bool, session: u64) -> E
         req_id: None,
         acquire_ms: None,
         backend_ms: None,
+        bytes_sent: None,
+        opt: Vec::new(),
+        cached: false,
+        dup: false,
         session: Some(session),
     })
 }
@@ -306,6 +310,7 @@ fn overflow_drops_and_counts() {
         dir: PathBuf::new(),
         debug: false,
         interval: Duration::from_secs(60),
+        dups: DupTracker::default(),
     };
     for i in 0..5 {
         stats.record(call("a", i, 1, true, false, 1));
@@ -354,4 +359,66 @@ fn writer_appends_jsonl_and_summarizes() {
 fn json_len_counts_compact_bytes() {
     let v = serde_json::json!({"a":[1,2],"b":"x"});
     assert_eq!(json_len(&v), v.to_string().len() as u64);
+}
+
+fn tool_call(tool: &str, bytes_out: u64, dup: bool, sent: Option<u64>) -> Event {
+    let Event::Call(mut c) = call("srv", MAR_15, 1, true, false, 1) else {
+        unreachable!()
+    };
+    c.name = tool.into();
+    c.bytes_out = bytes_out;
+    c.dup = dup;
+    c.bytes_sent = sent;
+    Event::Call(c)
+}
+
+#[test]
+fn tool_table_ranks_by_bytes() {
+    let mut b = SummaryBuilder::new(MAR_15 - 1, MAR_15 + 1);
+    for ev in [
+        tool_call("small", 100, false, None),
+        tool_call("small", 100, true, None),
+        tool_call("big", 9000, false, Some(1000)),
+        tool_call("big", 1000, false, None),
+    ] {
+        b.add(&ev);
+    }
+    let s = b.finish();
+    assert_eq!(s.tools.len(), 2);
+    let big = &s.tools[0];
+    assert_eq!(
+        (big.tool.as_str(), big.calls, big.total_bytes),
+        ("big", 2, 10_000)
+    );
+    assert_eq!((big.avg_bytes_out, big.p95_bytes_out), (5000, 9000));
+    assert_eq!(
+        (big.est_tokens, big.bytes_saved, big.dup_calls),
+        (2500, 8000, 0)
+    );
+    assert!((big.share - 0.980).abs() < 0.001);
+    assert_eq!(s.tools[1].dup_calls, 1);
+}
+
+#[test]
+fn old_call_lines_parse_and_new_fields_are_not_written_by_default() {
+    let old = r#"{"ev":"call","ts":1,"server":"a","kind":"tool","name":"x","duration_ms":1,"ok":true,"cold_start":false,"spawn_wait_ms":0,"bytes_in":1,"bytes_out":2,"era":"legacy","scope":"shared"}"#;
+    let Event::Call(c) = serde_json::from_str::<Event>(old).unwrap() else {
+        panic!()
+    };
+    assert!(!c.dup && !c.cached && c.opt.is_empty() && c.bytes_sent.is_none());
+    let line = serde_json::to_string(&Event::Call(c)).unwrap();
+    assert!(!line.contains("dup") && !line.contains("cached") && !line.contains("opt"));
+}
+
+#[test]
+fn dup_tracker_window() {
+    let t = DupTracker::default();
+    let h = call_hash("s", "t", &serde_json::json!({"a": 1}));
+    assert!(!t.check(1, h));
+    assert!(t.check(1, h));
+    assert!(!t.check(2, h), "rings are per session");
+    for i in 0..DUP_WINDOW as u64 {
+        t.check(1, 1000 + i);
+    }
+    assert!(!t.check(1, h), "pushed out of the window");
 }

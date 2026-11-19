@@ -39,6 +39,53 @@ pub(super) struct CallStart {
     pub(super) name: String,
     pub(super) bytes_in: u64,
     pub(super) started: std::time::Instant,
+    /// In-memory hash of the arguments (tool calls); never logged.
+    pub(super) args_hash: Option<u64>,
+}
+
+/// What later transforms (optimize phase) learned about a call, to be
+/// recorded with it. `Default` means "untouched".
+#[derive(Debug, Default, Clone)]
+pub(super) struct CallExtras {
+    /// Response size as sent to the agent; `None`: same as the backend's.
+    pub(super) bytes_sent: Option<u64>,
+    /// Tags of the transforms applied (empty: none).
+    pub(super) opt: Vec<String>,
+    /// Served from the result cache.
+    pub(super) cached: bool,
+}
+
+/// A call being measured: created before forwarding, finished once the
+/// final response (after every transform) is known.
+#[allow(dead_code)] // used by the optimize phase
+pub(super) struct CallRecord {
+    pub(super) st: Arc<Stats>,
+    pub(super) start: CallStart,
+    pub(super) trace: CallTrace,
+}
+
+#[allow(dead_code)]
+impl CallRecord {
+    /// Writes the call event. `resp` is the response as received from the
+    /// backend (`bytes_out`); `extras` describes what was changed after.
+    pub(super) fn finish(
+        self,
+        router: &Router,
+        session: &Session,
+        server: &Server,
+        resp: &Value,
+        extras: CallExtras,
+    ) {
+        router.record_call_with(
+            &self.st,
+            session,
+            server,
+            self.start,
+            &self.trace,
+            resp,
+            extras,
+        );
+    }
 }
 
 fn instance_tag(scope_key: &str) -> Option<String> {
@@ -84,6 +131,8 @@ impl CallStart {
             name,
             bytes_in: stats::json_len(params),
             started: std::time::Instant::now(),
+            args_hash: (kind == CallKind::Tool)
+                .then(|| stats::call_hash("", "", params.get("arguments").unwrap_or(&Value::Null))),
         })
     }
 }
@@ -203,7 +252,7 @@ impl Router {
         }
     }
 
-    /// Logs one forwarded call.
+    /// Logs one forwarded call with no later transform.
     pub(super) fn record_call(
         &self,
         st: &Stats,
@@ -213,6 +262,39 @@ impl Router {
         trace: &CallTrace,
         resp: &Value,
     ) {
+        self.record_call_with(
+            st,
+            session,
+            server,
+            start,
+            trace,
+            resp,
+            CallExtras::default(),
+        );
+    }
+
+    /// Logs one call with the facts later transforms added.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_call_with(
+        &self,
+        st: &Stats,
+        session: &Session,
+        server: &Server,
+        start: CallStart,
+        trace: &CallTrace,
+        resp: &Value,
+        extras: CallExtras,
+    ) {
+        let session_key = if session.is_ephemeral() {
+            stats::STATELESS_SESSION
+        } else {
+            stats::session_key(session.id())
+        };
+        let bytes_out = stats::json_len(resp);
+        let dup = start.args_hash.is_some_and(|h| {
+            let h = stats::call_hash(&server.name, &start.name, &Value::from(h));
+            st.note_call(session_key, h)
+        });
         let error_code = resp["error"]["code"].as_i64();
         let tool_error = resp["result"]["isError"] == Value::Bool(true);
         let debug = st.debug();
@@ -233,7 +315,7 @@ impl Router {
                 0
             },
             bytes_in: start.bytes_in,
-            bytes_out: stats::json_len(resp),
+            bytes_out,
             era: match session.era() {
                 Era::Legacy => "legacy",
                 Era::Modern => "modern",
@@ -244,11 +326,37 @@ impl Router {
             req_id: debug.then_some(trace.req),
             acquire_ms: debug.then(|| ms(trace.acquire)),
             backend_ms: debug.then(|| ms(trace.backend)),
-            session: Some(if session.is_ephemeral() {
-                stats::STATELESS_SESSION
-            } else {
-                stats::session_key(session.id())
-            }),
+            bytes_sent: extras.bytes_sent.filter(|b| *b != bytes_out),
+            opt: extras.opt,
+            cached: extras.cached,
+            dup,
+            session: Some(session_key),
         }));
+    }
+}
+
+impl Router {
+    /// Size in bytes of each server's tool list as served to agents (the
+    /// shared catalog entry, names prefixed), for `GET /stats`. Servers
+    /// without a catalog entry are absent.
+    pub fn tool_list_bytes(&self) -> std::collections::HashMap<String, u64> {
+        let mut out = std::collections::HashMap::new();
+        for server in self.servers() {
+            let Some((entry, _)) = self.entry_for(&server, None) else {
+                continue;
+            };
+            let tools: Vec<Value> = entry
+                .tools
+                .iter()
+                .filter_map(|tool| {
+                    let name = tool["name"].as_str()?;
+                    let mut t = tool.clone();
+                    t["name"] = Value::String(super::naming::join(&server.prefix, name));
+                    Some(t)
+                })
+                .collect();
+            out.insert(server.name.clone(), stats::json_len(&Value::Array(tools)));
+        }
+        out
     }
 }
