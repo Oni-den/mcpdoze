@@ -10,8 +10,9 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use super::events::ProgressRoute;
+use super::optimize::{meta, TAG_ARGS};
 use super::session::RootsState;
-use super::usage::{CallStart, CallTrace};
+use super::usage::{CallExtras, CallRecord, CallStart, CallTrace};
 use super::{naming, uri, Router, Server, Session};
 use crate::backend::jsonrpc::{self, Kind};
 use crate::backend::stdio::id_type_of;
@@ -257,18 +258,66 @@ impl Router {
         let Some(name) = params["name"].as_str().map(str::to_owned) else {
             return jsonrpc::error(id, jsonrpc::INVALID_PARAMS, "tools/call needs a name");
         };
+        // Reserved prefix: broker-served meta-tools, before server routing.
+        if let Some(bare) = meta::bare(&name) {
+            let tool = self
+                .meta
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .find(bare);
+            return match tool {
+                Some(t) => {
+                    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                    jsonrpc::result(id, t.call(session, args).await)
+                }
+                None => {
+                    jsonrpc::error(id, jsonrpc::INVALID_PARAMS, format!("unknown tool: {name}"))
+                }
+            };
+        }
         let Some((server, tool)) = self.named(Some(&name)) else {
             return jsonrpc::error(id, jsonrpc::INVALID_PARAMS, format!("unknown tool: {name}"));
         };
+        let policy = self.policy(&server.name);
+        if policy.as_ref().is_some_and(|p| !p.allows(&tool)) {
+            return jsonrpc::error(id, jsonrpc::INVALID_PARAMS, format!("unknown tool: {name}"));
+        }
         params["name"] = Value::String(tool.clone());
-        let resp = self
-            .forward_routed(session, &server, id, "tools/call", params)
-            .await;
-        // Stale catalog: the backend rejected a listed tool, or served one
-        // the catalog does not know.
         let ckey = self
             .session_key_now(session)
             .and_then(|k| server.catalog_key_of(&k));
+        let mut tags = Vec::new();
+        if let Some(p) = &policy {
+            let schema = self.input_schema(session, &server, &tool);
+            if p.apply_default_args(&server.name, &tool, &mut params, schema.as_ref()) {
+                tags.push(TAG_ARGS.to_owned());
+            }
+        }
+        let (mut resp, rec) = self
+            .forward_routed_open(session, &server, id, "tools/call", params)
+            .await;
+        // Result transforms (never on errors; see `optimize::result`).
+        let mut raw_bytes = None;
+        if let Some(p) = policy.as_ref().filter(|p| p.transforms_results()) {
+            let raw = crate::stats::json_len(&resp);
+            let applied = p.transform_result(&mut resp);
+            if !applied.is_empty() {
+                raw_bytes = Some(raw);
+                tags.extend(applied);
+            }
+        }
+        if let Some(rec) = rec {
+            // `bytes_out` stays the raw backend size, `bytes_sent` is what
+            // the agent gets.
+            let extras = CallExtras {
+                raw_bytes,
+                opt: tags,
+                ..CallExtras::default()
+            };
+            rec.finish(self, session, &server, &resp, extras);
+        }
+        // Stale catalog: the backend rejected a listed tool, or served one
+        // the catalog does not know.
         if let Some((entry, _)) = self.entry_for(&server, ckey.as_deref()) {
             let rejected = matches!(
                 resp["error"]["code"].as_i64(),
@@ -334,8 +383,27 @@ impl Router {
         server: &Arc<Server>,
         id: Value,
         method: &str,
-        mut params: Value,
+        params: Value,
     ) -> Value {
+        let (resp, rec) = self
+            .forward_routed_open(session, server, id, method, params)
+            .await;
+        if let Some(rec) = rec {
+            rec.finish(self, session, server, &resp, CallExtras::default());
+        }
+        resp
+    }
+
+    /// Like [`forward_routed`](Self::forward_routed), but hands back the
+    /// unfinished call record so the caller can add what its transforms did.
+    pub(super) async fn forward_routed_open(
+        &self,
+        session: &Arc<Session>,
+        server: &Arc<Server>,
+        id: Value,
+        method: &str,
+        mut params: Value,
+    ) -> (Value, Option<CallRecord>) {
         let mut route = None;
         let orig_token = params
             .pointer("/_meta/progressToken")
@@ -352,17 +420,18 @@ impl Router {
                 token,
             });
         }
-        let resp = self
-            .forward(session, server, id, method, params, orig_token)
+        let out = self
+            .forward_open(session, server, id, method, params, orig_token)
             .await;
         drop(route);
-        resp
+        out
     }
 
     /// Forwards one request to `server`, starting it if needed, and maps the
-    /// response back to the agent's id. Logged to the statistics log when
-    /// one is set.
-    pub(super) async fn forward(
+    /// response back to the agent's id. Returns the raw response and, when a
+    /// statistics log is set, the call record to finish once the final
+    /// response is known (`bytes_out` is the raw size).
+    pub(super) async fn forward_open(
         &self,
         session: &Arc<Session>,
         server: &Arc<Server>,
@@ -370,7 +439,7 @@ impl Router {
         method: &str,
         params: Value,
         progress_token: Option<Value>,
-    ) -> Value {
+    ) -> (Value, Option<CallRecord>) {
         let mut trace = CallTrace {
             req: self.next_request_id(),
             ..CallTrace::default()
@@ -389,10 +458,8 @@ impl Router {
                 &mut trace,
             )
             .await;
-        if let Some((st, start)) = logged {
-            self.record_call(&st, session, server, start, &trace, &resp);
-        }
-        resp
+        let rec = logged.map(|(st, start)| CallRecord { st, start, trace });
+        (resp, rec)
     }
 
     #[allow(clippy::too_many_arguments)]

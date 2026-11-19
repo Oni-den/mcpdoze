@@ -47,8 +47,10 @@ pub(super) struct CallStart {
 /// recorded with it. `Default` means "untouched".
 #[derive(Debug, Default, Clone)]
 pub(super) struct CallExtras {
-    /// Response size as sent to the agent; `None`: same as the backend's.
-    pub(super) bytes_sent: Option<u64>,
+    /// Size of the backend's response before the transforms (`bytes_out`);
+    /// `None`: the response given to `finish` is the raw one. When set, the
+    /// response given to `finish` is the one sent (`bytes_sent`).
+    pub(super) raw_bytes: Option<u64>,
     /// Tags of the transforms applied (empty: none).
     pub(super) opt: Vec<String>,
     /// Served from the result cache.
@@ -57,14 +59,12 @@ pub(super) struct CallExtras {
 
 /// A call being measured: created before forwarding, finished once the
 /// final response (after every transform) is known.
-#[allow(dead_code)] // used by the optimize phase
 pub(super) struct CallRecord {
     pub(super) st: Arc<Stats>,
     pub(super) start: CallStart,
     pub(super) trace: CallTrace,
 }
 
-#[allow(dead_code)]
 impl CallRecord {
     /// Writes the call event. `resp` is the response as received from the
     /// backend (`bytes_out`); `extras` describes what was changed after.
@@ -252,27 +252,6 @@ impl Router {
         }
     }
 
-    /// Logs one forwarded call with no later transform.
-    pub(super) fn record_call(
-        &self,
-        st: &Stats,
-        session: &Session,
-        server: &Server,
-        start: CallStart,
-        trace: &CallTrace,
-        resp: &Value,
-    ) {
-        self.record_call_with(
-            st,
-            session,
-            server,
-            start,
-            trace,
-            resp,
-            CallExtras::default(),
-        );
-    }
-
     /// Logs one call with the facts later transforms added.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_call_with(
@@ -290,7 +269,8 @@ impl Router {
         } else {
             stats::session_key(session.id())
         };
-        let bytes_out = stats::json_len(resp);
+        let sent = stats::json_len(resp);
+        let bytes_out = extras.raw_bytes.unwrap_or(sent);
         let dup = start.args_hash.is_some_and(|h| {
             let h = stats::call_hash(&server.name, &start.name, &Value::from(h));
             st.note_call(session_key, h)
@@ -326,7 +306,7 @@ impl Router {
             req_id: debug.then_some(trace.req),
             acquire_ms: debug.then(|| ms(trace.acquire)),
             backend_ms: debug.then(|| ms(trace.backend)),
-            bytes_sent: extras.bytes_sent.filter(|b| *b != bytes_out),
+            bytes_sent: extras.raw_bytes.map(|_| sent).filter(|b| *b != bytes_out),
             opt: extras.opt,
             cached: extras.cached,
             dup,
@@ -345,8 +325,8 @@ impl Router {
             let Some((entry, _)) = self.entry_for(&server, None) else {
                 continue;
             };
-            let tools: Vec<Value> = entry
-                .tools
+            let tools: Vec<Value> = self
+                .view_tools(&server, &entry.tools)
                 .iter()
                 .filter_map(|tool| {
                     let name = tool["name"].as_str()?;

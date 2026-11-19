@@ -559,20 +559,30 @@ impl Router {
         out
     }
 
-    /// Aggregated, prefixed tool list.
+    /// Aggregated, prefixed tool list, after the per-server view transforms
+    /// (`optimize`), plus the enabled meta-tools.
     pub async fn list_tools(&self, session: &Session) -> Vec<Value> {
         let mut out = Vec::new();
         for (server, entry) in self.catalog_entries(session).await {
-            for tool in &entry.tools {
-                let Some(name) = tool["name"].as_str() else {
+            for mut t in self.view_tools(&server, &entry.tools) {
+                let Some(name) = t["name"].as_str() else {
                     continue;
                 };
-                let mut t = tool.clone();
                 t["name"] = Value::String(naming::join(&server.prefix, name));
                 out.push(t);
             }
         }
+        out.extend(self.meta.read().unwrap_or_else(|e| e.into_inner()).listed());
         out
+    }
+
+    /// `tools` of `server` as listed to agents (backend names): the raw
+    /// catalog list through the server's policy, if it has one.
+    pub(super) fn view_tools(&self, server: &Server, tools: &[Value]) -> Vec<Value> {
+        match self.policy(&server.name) {
+            Some(p) => p.view_tools(tools),
+            None => tools.to_vec(),
+        }
     }
 
     /// Aggregated, prefixed prompt list.

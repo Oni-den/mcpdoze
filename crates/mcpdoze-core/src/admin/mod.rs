@@ -32,6 +32,7 @@ use axum::Json;
 use crate::backend::stdio::STDERR_LINES;
 use crate::backend::{BackendSpec, Conn, Instance, StateKind, UnloadReason};
 use crate::config::{self, Config, ServerConfig, Transport};
+use crate::router::optimize;
 use crate::router::{scope_name, CatalogOptions, Router, ScopeOptions, Server};
 use api::*;
 
@@ -600,6 +601,23 @@ impl Control {
         }
         for e in &resp.errors {
             tracing::warn!(error = %e, "server skipped");
+        }
+        // Optimisation policies: swapped without touching any backend. A
+        // change to what lists show is announced to streaming sessions.
+        for server in self.router.servers() {
+            let policy = new.servers.get(&server.name).and_then(|s| {
+                match optimize::ServerPolicy::compile(s) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(server = %server.name, error = %e, "optimize ignored");
+                        None
+                    }
+                }
+            });
+            self.router.set_policy(&server.name, policy);
+        }
+        if resp.optimize_changed {
+            self.router.notify_tools_changed();
         }
         self.router
             .set_client_request_timeout(new.broker.client_request_timeout);

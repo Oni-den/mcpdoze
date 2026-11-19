@@ -69,6 +69,7 @@ mod forward;
 mod lists;
 pub mod modern;
 pub mod naming;
+pub mod optimize;
 mod session;
 mod subs;
 pub mod uri;
@@ -440,6 +441,10 @@ pub struct Router {
     /// Per-process request counter shared by the statistics log and the
     /// diagnostics records.
     next_req: AtomicU64,
+    /// Compiled `optimize` policies by server name (absent: untouched).
+    policies: RwLock<HashMap<String, Arc<optimize::ServerPolicy>>>,
+    /// Broker-served meta-tools (`mcpdoze__*`).
+    meta: RwLock<optimize::meta::MetaRegistry>,
 }
 
 impl std::fmt::Debug for Router {
@@ -483,7 +488,49 @@ impl Router {
             stats: RwLock::new(None),
             diag: RwLock::new(None),
             next_req: AtomicU64::new(1),
+            policies: RwLock::new(HashMap::new()),
+            meta: RwLock::new(optimize::meta::MetaRegistry::default()),
         })
+    }
+
+    /// Sets (or with `None` clears) the optimisation policy of `server`.
+    /// Backends are not touched; callers announce a changed tool list with
+    /// [`notify_tools_changed`](Router::notify_tools_changed).
+    pub fn set_policy(&self, server: &str, policy: Option<optimize::ServerPolicy>) {
+        let mut m = self.policies.write().unwrap_or_else(|e| e.into_inner());
+        match policy {
+            Some(p) => m.insert(server.to_owned(), Arc::new(p)),
+            None => m.remove(server),
+        };
+    }
+
+    /// The optimisation policy of `server`, if it has one.
+    pub fn policy(&self, server: &str) -> Option<Arc<optimize::ServerPolicy>> {
+        self.policies
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(server)
+            .cloned()
+    }
+
+    /// Registers a meta-tool (`mcpdoze__<name>`), listed while it is enabled.
+    pub fn register_meta_tool(&self, tool: Arc<dyn optimize::meta::MetaTool>) {
+        self.meta
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(tool);
+    }
+
+    /// Sends `notifications/tools/list_changed` to every streaming session
+    /// that takes it (an optimisation policy changed the served list).
+    pub fn notify_tools_changed(&self) {
+        let method = "notifications/tools/list_changed";
+        let msg = json!({"jsonrpc": "2.0", "method": method});
+        for s in self.streaming_sessions() {
+            if s.wants_notification(method) {
+                s.push(msg.clone());
+            }
+        }
     }
 
     /// The next request number. One counter serves both the statistics log
@@ -694,7 +741,7 @@ impl Router {
         options: CatalogOptions,
         scope: ScopeOptions,
     ) -> Result<(), RegisterError> {
-        if !naming::valid_prefix(prefix) {
+        if !naming::valid_prefix(prefix) || prefix == optimize::meta::PREFIX {
             return Err(RegisterError::InvalidPrefix(prefix.to_owned()));
         }
         let server = {
