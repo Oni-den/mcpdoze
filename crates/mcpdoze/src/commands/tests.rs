@@ -573,6 +573,7 @@ fn stats_rendering() {
             cold_start_rate: 0.2,
             spawns: 2,
             unloads: [("idle".to_owned(), 2)].into_iter().collect(),
+            failures: Default::default(),
         }],
         memory: MemorySummary {
             samples: 3,

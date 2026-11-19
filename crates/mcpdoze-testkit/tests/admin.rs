@@ -280,6 +280,7 @@ async fn start_daemon(config: &Path, watch: bool) -> (Daemon, Api) {
         watch,
         tuning: tuning(),
         catalog: None,
+        debug_cli: Default::default(),
     })
     .await
     .expect("daemon start");
@@ -750,6 +751,214 @@ async fn graceful_shutdown_leaves_no_processes() {
         .await;
         // The port is closed.
         assert!(TcpStream::connect(api.addr).await.is_err());
+    })
+    .await;
+}
+
+// ------------------------------------------------------- debug endpoints
+
+fn debug_toml(dir: &Path) -> String {
+    format!(
+        "[debug]\ndir = {}\n\n",
+        toml_str(&dir.join("debug").to_string_lossy())
+    )
+}
+
+/// The runtime debug switch: off by default, `POST /debug` turns failure
+/// capture on and off without restarting the backend, `GET /debug/failures`
+/// returns what was captured, and `GET /status` and `GET /stats` show the
+/// additions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_toggle_failures_and_stats() {
+    with_timeout(async {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        // Every call kills the backend.
+        let flaky = MockServerSpec::new().tools(&["echo"]).crash_after(0);
+        write_file(
+            &cfg,
+            &format!(
+                "{}{}{}",
+                broker_toml(dir.path()),
+                debug_toml(dir.path()),
+                mock_server_toml("flaky", &flaky)
+            ),
+        );
+        let (d, api) = start_daemon(&cfg, false).await;
+
+        // Off by default.
+        let g = api.ok("GET", "/admin/v1/debug", None).await;
+        assert_eq!(g["mode"], "off", "{g}");
+        assert_eq!(g["servers"]["flaky"], "off", "{g}");
+        assert_eq!(g["available"], true, "{g}");
+        assert_eq!(g["runtime"], json!({}), "{g}");
+        assert_eq!(g["raw"], false);
+
+        // A failing call with debug off leaves no record.
+        let r = api.tool("flaky__echo").await;
+        assert!(r.get("error").is_some(), "{r}");
+        let f = api.ok("GET", "/admin/v1/debug/failures", None).await;
+        assert_eq!(f["records"], json!([]), "{f}");
+        let st = api.status_of("flaky").await.unwrap();
+        assert_eq!(st["instances"][0]["debug"], "off", "{st}");
+        assert!(st["instances"][0].get("last_failure").is_none(), "{st}");
+
+        // Turn it on at runtime.
+        sleep(Duration::from_millis(1300)).await;
+        let on = api
+            .ok("POST", "/admin/v1/debug", Some(json!({"mode":"failures"})))
+            .await;
+        assert_eq!(on["mode"], "failures", "{on}");
+        assert_eq!(on["servers"]["flaky"], "failures", "{on}");
+        assert_eq!(on["runtime"]["all"], "failures", "{on}");
+        let st = api.status_of("flaky").await.unwrap();
+        assert_eq!(st["instances"][0]["debug"], "failures", "{st}");
+
+        let r = api.tool("flaky__echo").await;
+        assert!(r.get("error").is_some(), "{r}");
+        let f = api
+            .ok(
+                "GET",
+                "/admin/v1/debug/failures?server=flaky&kind=crash_in_flight&limit=5",
+                None,
+            )
+            .await;
+        let recs = f["records"].as_array().unwrap();
+        assert_eq!(recs.len(), 1, "{f}");
+        assert_eq!(recs[0]["server"], "flaky");
+        assert_eq!(recs[0]["kind"], "crash_in_flight");
+        let id = recs[0]["id"].as_str().unwrap().to_owned();
+        // Filters that match nothing.
+        let none = api
+            .ok("GET", "/admin/v1/debug/failures?server=other", None)
+            .await;
+        assert_eq!(none["records"], json!([]));
+        let none = api
+            .ok(
+                "GET",
+                "/admin/v1/debug/failures?since=1h&kind=stalled",
+                None,
+            )
+            .await;
+        assert_eq!(none["records"], json!([]));
+        let all = api
+            .ok("GET", "/admin/v1/debug/failures?since=1h", None)
+            .await;
+        assert!(!all["records"].as_array().unwrap().is_empty());
+
+        // last_failure and the debug mode in status.
+        let st = api.status_of("flaky").await.unwrap();
+        let lf = &st["instances"][0]["last_failure"];
+        assert_eq!(lf["id"], id.as_str(), "{st}");
+        assert_eq!(lf["kind"], "crash_in_flight", "{st}");
+        assert!(lf["ts"].as_u64().unwrap() > 0);
+        assert!(st["instances"][0]["last_error"].is_string(), "{st}");
+
+        // Turn it off again: no new records.
+        let off = api
+            .ok("POST", "/admin/v1/debug", Some(json!({"mode":"off"})))
+            .await;
+        assert_eq!(off["mode"], "off", "{off}");
+        assert_eq!(off["servers"]["flaky"], "off", "{off}");
+        sleep(Duration::from_millis(1300)).await;
+        let r = api.tool("flaky__echo").await;
+        assert!(r.get("error").is_some(), "{r}");
+        let f = api
+            .ok("GET", "/admin/v1/debug/failures?kind=crash_in_flight", None)
+            .await;
+        assert_eq!(f["records"].as_array().unwrap().len(), 1, "{f}");
+
+        // The statistics log counts classified failures per kind, whatever
+        // the debug mode.
+        let stats = api.ok("GET", "/admin/v1/stats?since=1h", None).await;
+        let s = stats["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["server"] == "flaky")
+            .unwrap_or_else(|| panic!("{stats}"));
+        assert_eq!(s["failures"]["crash_in_flight"], 3, "{stats}");
+        d.shutdown().await.unwrap();
+    })
+    .await;
+}
+
+/// `POST /debug` validation, per-server scope, expiry with `for`, and the
+/// owner-only token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_post_validation_scope_and_expiry() {
+    with_timeout(async {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let m = MockServerSpec::new().tools(&["echo"]);
+        write_file(
+            &cfg,
+            &format!(
+                "{}{}{}{}",
+                broker_toml(dir.path()),
+                debug_toml(dir.path()),
+                mock_server_toml("one", &m),
+                mock_server_toml("two", &m)
+            ),
+        );
+        let (d, api) = start_daemon(&cfg, false).await;
+
+        for bad in [
+            json!({"mode":"loud"}),
+            json!({"mode":"failures","raw":true}),
+            json!({"mode":"failures","for":"soon"}),
+            json!({"mode":"failures","servers":["bad name"]}),
+            json!({"mode":"failures","extra":1}),
+            json!({}),
+        ] {
+            let r = api.call("POST", "/admin/v1/debug", Some(bad.clone())).await;
+            assert_eq!(r.status, 400, "{bad}: {r:?}");
+        }
+        let g = api.ok("GET", "/admin/v1/debug", None).await;
+        assert_eq!(g["mode"], "off", "bad requests must change nothing: {g}");
+
+        // One server only; expires.
+        let on = api
+            .ok(
+                "POST",
+                "/admin/v1/debug",
+                Some(json!({"mode":"trace","servers":["one"],"for":"2s"})),
+            )
+            .await;
+        assert_eq!(on["mode"], "off", "{on}");
+        assert_eq!(on["servers"]["one"], "trace", "{on}");
+        assert_eq!(on["servers"]["two"], "off", "{on}");
+        assert!(on["expires_in_secs"].as_u64().unwrap() <= 2, "{on}");
+        sleep(Duration::from_millis(3000)).await;
+        let g = api.ok("GET", "/admin/v1/debug", None).await;
+        assert_eq!(g["servers"]["one"], "off", "{g}");
+        assert!(g.get("expires_in_secs").is_none(), "{g}");
+
+        // A newer POST cancels the older timer.
+        api.ok(
+            "POST",
+            "/admin/v1/debug",
+            Some(json!({"mode":"failures","for":"1s"})),
+        )
+        .await;
+        api.ok("POST", "/admin/v1/debug", Some(json!({"mode":"failures"})))
+            .await;
+        sleep(Duration::from_millis(1800)).await;
+        let g = api.ok("GET", "/admin/v1/debug", None).await;
+        assert_eq!(g["mode"], "failures", "{g}");
+
+        // The token is required, like on every admin route.
+        for (m, p) in [
+            ("GET", "/admin/v1/debug"),
+            ("POST", "/admin/v1/debug"),
+            ("GET", "/admin/v1/debug/failures"),
+        ] {
+            let r = raw(api.addr, m, p, Some("127.0.0.1"), None, &[], "").await;
+            assert_eq!(r.status, 401, "{m} {p}: {r:?}");
+            let r = raw(api.addr, m, p, Some("127.0.0.1"), Some("wrong"), &[], "").await;
+            assert_eq!(r.status, 401, "{m} {p}: {r:?}");
+        }
+        d.shutdown().await.unwrap();
     })
     .await;
 }

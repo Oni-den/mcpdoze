@@ -349,6 +349,7 @@ impl Daemon {
         control
             .set_debug_inputs(opts.debug_cli.clone(), env_debug)
             .await;
+        control.router().follow_debug(control.debug_settings());
         let settings = control.debug_now();
         let layers = settings.layers();
         if settings.global != config::DebugMode::Off

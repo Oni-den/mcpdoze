@@ -126,6 +126,10 @@ pub struct CallEvent {
     /// JSON-RPC error code, when the response is an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<i64>,
+    /// Classified failure kind (a `diag` kind such as `stalled`), when the
+    /// call failed in a way the broker can classify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail: Option<String>,
     /// The backend was not running when the call arrived.
     pub cold_start: bool,
     /// Time spent waiting for the backend to start (0 when warm).
@@ -514,7 +518,7 @@ pub fn prune(dir: &Path, retention_days: u32, now_ms: u64) -> io::Result<Vec<Str
 // ------------------------------------------------------------------ writer
 
 enum Msg {
-    Event(Event),
+    Event(Box<Event>),
     Sample(SampleInput),
     Flush(SyncSender<()>),
 }
@@ -720,7 +724,7 @@ impl Stats {
 
     /// Queues an event; never blocks (dropped and counted when full).
     pub fn record(&self, ev: Event) {
-        self.send(Msg::Event(ev));
+        self.send(Msg::Event(Box::new(ev)));
     }
 
     /// Queues a measurement; the writer turns it into a `sample` event.
@@ -793,6 +797,9 @@ pub struct ServerSummary {
     pub spawns: u64,
     /// Unloads by reason.
     pub unloads: BTreeMap<String, u64>,
+    /// Classified call failures by kind.
+    #[serde(default)]
+    pub failures: BTreeMap<String, u64>,
 }
 
 /// Memory part of a [`Summary`].
@@ -906,6 +913,9 @@ impl SummaryBuilder {
                 s.calls += 1;
                 if !c.ok {
                     s.errors += 1;
+                }
+                if let Some(k) = &c.fail {
+                    *s.failures.entry(k.clone()).or_default() += 1;
                 }
                 if c.cold_start {
                     s.cold_starts += 1;

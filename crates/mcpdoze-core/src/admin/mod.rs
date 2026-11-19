@@ -13,6 +13,7 @@
 //! calls and file-watch reloads are applied one at a time.
 
 pub mod api;
+mod debug;
 pub mod persist;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -102,12 +103,27 @@ impl IntoResponse for ControlError {
 }
 
 /// What a configured server was registered as.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 struct Applied {
     prefix: String,
     spec: BackendSpec,
     catalog: CatalogOptions,
     scope: ScopeOptions,
+}
+
+impl Applied {
+    /// Same registration, ignoring `call_timeout`: changing it must not
+    /// unload a backend (it is read when the server is next registered).
+    fn same_launch(&self, other: &Applied) -> bool {
+        let mut a = self.spec.clone();
+        let mut b = other.spec.clone();
+        a.call_timeout = None;
+        b.call_timeout = None;
+        self.prefix == other.prefix
+            && a == b
+            && self.catalog == other.catalog
+            && self.scope == other.scope
+    }
 }
 
 #[derive(Default)]
@@ -131,6 +147,13 @@ pub struct Control {
     /// change. Backends subscribe via [`Control::debug_settings`]. Changing
     /// it never unloads a backend.
     debug: tokio::sync::watch::Sender<Arc<config::DebugSettings>>,
+    /// Bumped on every runtime debug change; a pending `for` timer reverts
+    /// the runtime layer only if it still holds its own number.
+    debug_epoch: std::sync::atomic::AtomicU64,
+    /// When the runtime debug layer reverts (`POST /debug` with `for`).
+    debug_until: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Newest failure per instance, cached on the log file's state.
+    last_failures: std::sync::Mutex<debug::LastCache>,
 }
 
 impl std::fmt::Debug for Control {
@@ -178,6 +201,9 @@ fn build_spec(server: &ServerConfig, broker: &config::BrokerConfig) -> Result<Ba
         }
     };
     let mut spec = spec.idle_ttl(ttl).start_timeout(broker.start_timeout);
+    if let Some(t) = server.call_timeout {
+        spec = spec.call_timeout(t);
+    }
     spec.subscriptions = server.subscriptions;
     Ok(spec)
 }
@@ -260,8 +286,29 @@ fn refresh_result(name: &str, res: Result<crate::router::RefreshOutcome, String>
     }
 }
 
+/// Newest failure per instance, for `last_failure` in `GET /status`.
+#[derive(Default)]
+struct LastView {
+    map: debug::LastMap,
+    diag: Option<Arc<crate::diag::Diag>>,
+}
+
+impl LastView {
+    fn get(&self, server: &str, scope_key: &str) -> Option<LastFailure> {
+        if self.map.is_empty() {
+            return None;
+        }
+        let instance = if scope_key.is_empty() {
+            None
+        } else {
+            Some(self.diag.as_ref()?.salt().hash8("instance", scope_key))
+        };
+        self.map.get(&(server.to_owned(), instance)).cloned()
+    }
+}
+
 /// Status of one instance (memory scanned in a blocking task).
-async fn instance_status(key: String, inst: Arc<Instance>) -> InstanceStatus {
+async fn instance_status(key: String, inst: Arc<Instance>, last: &LastView) -> InstanceStatus {
     let (pids, mem) = match inst.running_conn() {
         Some(conn) => tokio::task::spawn_blocking(move || match &*conn {
             Conn::Stdio(c) => (c.pids(), c.memory()),
@@ -271,6 +318,7 @@ async fn instance_status(key: String, inst: Arc<Instance>) -> InstanceStatus {
         .unwrap_or_default(),
         None => (Vec::new(), Default::default()),
     };
+    let last_failure = last.get(inst.name(), &key);
     InstanceStatus {
         scope_key: key,
         state: state_name(inst.state()),
@@ -283,14 +331,16 @@ async fn instance_status(key: String, inst: Arc<Instance>) -> InstanceStatus {
         restarts: inst.spawn_count().saturating_sub(1),
         failures: inst.failures(),
         last_error: inst.last_error(),
+        debug: inst.tap().level().as_str().to_owned(),
+        last_failure,
     }
 }
 
 /// Status of one server: its instances plus the aggregate.
-async fn server_status(server: &Server) -> ServerStatus {
+async fn server_status(server: &Server, last: &LastView) -> ServerStatus {
     let mut instances = Vec::new();
     for (key, inst) in server.instances() {
-        instances.push(instance_status(key, inst).await);
+        instances.push(instance_status(key, inst, last).await);
     }
     let transport = if server.instance.spec().http.is_some() {
         Transport::Http
@@ -353,6 +403,9 @@ impl Control {
             router,
             path,
             debug: tokio::sync::watch::channel(debug).0,
+            debug_epoch: std::sync::atomic::AtomicU64::new(0),
+            debug_until: std::sync::Mutex::new(None),
+            last_failures: std::sync::Mutex::new(debug::LastCache::default()),
             state: tokio::sync::Mutex::new(ControlState {
                 // Same broker baseline as `config`, so applying it reports
                 // no restart-only changes.
@@ -484,11 +537,17 @@ impl Control {
                     resp.removed.push(name.clone());
                     true
                 }
-                Some(d) if d != old => {
+                Some(d) if !d.same_launch(old) => {
                     resp.changed.push(name.clone());
                     false
                 }
-                Some(_) => continue,
+                Some(d) => {
+                    if d.spec.call_timeout != old.spec.call_timeout {
+                        resp.restart_required
+                            .push(format!("servers.{name}.call_timeout"));
+                    }
+                    continue;
+                }
             };
             if let Some(server) = self.router.unregister(name) {
                 unload.extend(server.all_instances());
@@ -502,7 +561,7 @@ impl Control {
         unload_all(unload, RELOAD_DRAIN_TIMEOUT, reason).await;
         let mut applied = BTreeMap::new();
         for (name, d) in desired {
-            let unchanged = st.applied.get(&name) == Some(&d);
+            let unchanged = st.applied.get(&name).is_some_and(|o| o.same_launch(&d));
             if !unchanged {
                 if let Err(e) = self.router.register_scoped(
                     &name,
@@ -519,7 +578,13 @@ impl Control {
                     resp.added.push(name.clone());
                 }
             }
-            applied.insert(name, d);
+            // An unchanged server keeps its running registration (which may
+            // differ in `call_timeout` only).
+            let keep = match st.applied.get(&name) {
+                Some(old) if unchanged => old.clone(),
+                _ => d,
+            };
+            applied.insert(name, keep);
         }
         for f in &resp.restart_required {
             tracing::warn!(field = %f, "config change takes effect after a restart");
@@ -763,10 +828,11 @@ impl Control {
     }
 
     /// Runtime status of every registered backend.
-    pub async fn status(&self) -> StatusResponse {
+    pub async fn status(self: &Arc<Self>) -> StatusResponse {
+        let last = self.last_view().await;
         let mut servers = Vec::new();
         for server in self.router.servers() {
-            servers.push(server_status(&server).await);
+            servers.push(server_status(&server, &last).await);
         }
         StatusResponse {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -830,6 +896,190 @@ impl Control {
         .map_err(|e| ControlError::Io(format!("cannot read the statistics log: {e}")))
     }
 
+    /// The failure log file, when a debug directory is known.
+    fn failure_file(&self) -> Option<(PathBuf, usize)> {
+        let settings = self.debug_now();
+        let cfg = settings.diag.as_ref()?;
+        Some((cfg.dir.join(crate::diag::FILE_NAME), cfg.keep))
+    }
+
+    async fn last_view(self: &Arc<Self>) -> LastView {
+        let Some((file, _)) = self.failure_file() else {
+            return LastView::default();
+        };
+        let me = self.clone();
+        let map = tokio::task::spawn_blocking(move || {
+            me.last_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&file)
+                .clone()
+        })
+        .await
+        .unwrap_or_default();
+        LastView {
+            map,
+            diag: self.router.diag(),
+        }
+    }
+
+    fn debug_view(&self) -> DebugStatus {
+        let settings = self.debug_now();
+        let layers = settings.layers();
+        let available = settings.diag.is_some();
+        let mode_of = |m: Option<config::DebugMode>| m.map(|m| m.as_str().to_owned());
+        let global = layers
+            .runtime
+            .all
+            .or(layers.cli.all)
+            .or(layers.env.all)
+            .unwrap_or(settings.global);
+        let stats = self.router.diag().map(|d| d.stats());
+        DebugStatus {
+            mode: if available {
+                global
+            } else {
+                config::DebugMode::Off
+            }
+            .as_str()
+            .to_owned(),
+            servers: self
+                .router
+                .servers()
+                .iter()
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        settings.mode_for(&s.name).as_str().to_owned(),
+                    )
+                })
+                .collect(),
+            runtime: DebugOverride {
+                all: mode_of(layers.runtime.all),
+                servers: layers
+                    .runtime
+                    .servers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
+                    .collect(),
+            },
+            raw: false,
+            expires_in_secs: self
+                .debug_until
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(|t| {
+                    t.saturating_duration_since(tokio::time::Instant::now())
+                        .as_secs()
+                }),
+            available,
+            written: stats.map_or(0, |s| s.written),
+            dropped: stats.map_or(0, |s| s.dropped),
+        }
+    }
+
+    /// Sets the runtime debug layer (not persisted; replaces the previous
+    /// runtime layer). With `for`, it reverts after that long.
+    pub async fn set_debug(
+        self: &Arc<Self>,
+        req: DebugSetRequest,
+    ) -> Result<DebugStatus, ControlError> {
+        use std::sync::atomic::Ordering;
+        let mode: config::DebugMode = req
+            .mode
+            .parse()
+            .map_err(|e: String| ControlError::Invalid("invalid `mode`".into(), vec![e]))?;
+        if req.raw {
+            return Err(ControlError::Invalid(
+                "raw capture is not available".into(),
+                vec!["raw: must be false".into()],
+            ));
+        }
+        for n in &req.servers {
+            if !valid_server_name(n) {
+                return Err(ControlError::Invalid(
+                    "invalid `servers`".into(),
+                    vec![format!("{n:?} is not a valid server name")],
+                ));
+            }
+        }
+        let lifetime = match &req.duration {
+            Some(d) => Some(
+                config::parse_duration(d)
+                    .map_err(|e| ControlError::Invalid("invalid `for`".into(), vec![e]))?,
+            ),
+            None => None,
+        };
+        if self.debug_now().diag.is_none() {
+            return Err(ControlError::Conflict(
+                "no debug directory can be determined; set [debug] dir".into(),
+            ));
+        }
+        let epoch = self.debug_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.debug_until.lock().unwrap_or_else(|e| e.into_inner()) =
+            lifetime.map(|d| tokio::time::Instant::now() + d);
+        self.set_runtime_debug(config::DebugLayer::from_cli(Some(mode), &req.servers))
+            .await;
+        tracing::info!(
+            mode = mode.as_str(),
+            servers = req.servers.len(),
+            "runtime debug override set"
+        );
+        if let Some(d) = lifetime {
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                tokio::time::sleep(d).await;
+                let Some(c) = weak.upgrade() else { return };
+                if c.debug_epoch.load(Ordering::SeqCst) == epoch {
+                    *c.debug_until.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    c.set_runtime_debug(config::DebugLayer::default()).await;
+                    tracing::info!("runtime debug override expired");
+                }
+            });
+        }
+        Ok(self.debug_view())
+    }
+
+    /// Failure records of the debug log, filtered. Pending records are
+    /// flushed first.
+    pub async fn failures(&self, q: FailuresQuery) -> Result<FailuresResponse, ControlError> {
+        let now = crate::stats::now_ms();
+        let since_ms = match q.since.as_deref() {
+            Some(s) => debug::parse_since(s, now)
+                .map_err(|e| ControlError::Invalid("invalid `since`".into(), vec![e]))?,
+            None => 0,
+        };
+        let limit = q
+            .limit
+            .unwrap_or(debug::DEFAULT_LIMIT)
+            .clamp(1, debug::MAX_LIMIT);
+        let filter = debug::Filter {
+            server: q.server,
+            kind: q.kind,
+            since_ms,
+        };
+        let Some((file, keep)) = self.failure_file() else {
+            return Ok(FailuresResponse {
+                records: Vec::new(),
+            });
+        };
+        let diag = self.router.diag();
+        let records = tokio::task::spawn_blocking(move || {
+            if let Some(d) = diag {
+                d.flush(Duration::from_millis(500));
+            }
+            debug::read_failures(&file, keep, &filter, limit)
+        })
+        .await
+        .map_err(|e| ControlError::Io(e.to_string()))?;
+        Ok(FailuresResponse { records })
+    }
+
+    /// The runtime debug state.
+    pub fn debug_state(&self) -> DebugStatus {
+        self.debug_view()
+    }
+
     /// Stops every backend (broker shutdown).
     pub async fn shutdown(&self) {
         self.router.shutdown().await;
@@ -851,6 +1101,8 @@ pub fn routes(control: Arc<Control>) -> axum::Router {
         .route("/reload", post(post_reload))
         .route("/refresh", post(post_refresh_all))
         .route("/stats", get(get_stats))
+        .route("/debug", get(get_debug).post(post_debug))
+        .route("/debug/failures", get(get_failures))
         .with_state(control)
 }
 
@@ -870,6 +1122,34 @@ async fn get_stats(
     Query(q): Query<StatsQuery>,
 ) -> Result<Json<StatsResponse>, ControlError> {
     c.stats(q.since.as_deref()).await.map(Json)
+}
+
+async fn get_debug(State(c): State<Arc<Control>>) -> Json<DebugStatus> {
+    Json(c.debug_state())
+}
+
+async fn post_debug(State(c): State<Arc<Control>>, body: Bytes) -> Response {
+    if body.len() > MAX_ADMIN_BODY {
+        return ControlError::Invalid("request body too large".into(), Vec::new()).into_response();
+    }
+    let req: DebugSetRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return ControlError::Invalid("invalid request body".into(), vec![e.to_string()])
+                .into_response()
+        }
+    };
+    match c.set_debug(req).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn get_failures(
+    State(c): State<Arc<Control>>,
+    Query(q): Query<FailuresQuery>,
+) -> Result<Json<FailuresResponse>, ControlError> {
+    c.failures(q).await.map(Json)
 }
 
 async fn get_status(State(c): State<Arc<Control>>) -> Json<StatusResponse> {
@@ -980,6 +1260,27 @@ mod tests {
         let spec = build_spec(&s, &broker).unwrap();
         assert!(spec.strip_env.contains("MCPDOZE_TOKEN"));
         assert!(spec.strip_env.contains("EXAMPLE_BROKER_TOKEN"));
+    }
+
+    #[test]
+    fn call_timeout_maps_into_the_spec_without_changing_the_launch() {
+        let broker = config::BrokerConfig::default();
+        let plain: ServerConfig =
+            serde_json::from_str(r#"{"transport":"stdio","command":"prog"}"#).unwrap();
+        let timed: ServerConfig =
+            serde_json::from_str(r#"{"transport":"stdio","command":"prog","call_timeout":"90s"}"#)
+                .unwrap();
+        let a = build_spec(&plain, &broker).unwrap();
+        let b = build_spec(&timed, &broker).unwrap();
+        assert_eq!(a.call_timeout, None);
+        assert_eq!(b.call_timeout, Some(Duration::from_secs(90)));
+        let reg = |spec: BackendSpec| Applied {
+            prefix: "p".into(),
+            spec,
+            catalog: CatalogOptions::default(),
+            scope: ScopeOptions::default(),
+        };
+        assert!(reg(a).same_launch(&reg(b)));
     }
 }
 

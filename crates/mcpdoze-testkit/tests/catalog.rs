@@ -321,6 +321,7 @@ async fn start_daemon(config: &Path) -> (Daemon, Api) {
         watch: false,
         tuning: tuning(),
         catalog: None,
+        debug_cli: Default::default(),
     })
     .await
     .expect("daemon start");

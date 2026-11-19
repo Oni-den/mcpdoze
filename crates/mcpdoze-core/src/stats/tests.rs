@@ -15,6 +15,7 @@ fn call(server: &str, ts: u64, ms: u64, ok: bool, cold: bool, session: u64) -> E
         duration_ms: ms,
         ok,
         error_code: (!ok).then_some(-32000),
+        fail: None,
         cold_start: cold,
         spawn_wait_ms: if cold { 100 } else { 0 },
         bytes_in: 10,

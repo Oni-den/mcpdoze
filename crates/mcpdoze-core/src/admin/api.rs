@@ -6,6 +6,8 @@
 //! endpoints. Unknown response fields must be ignored by clients so the API
 //! can grow without a version bump.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ServerConfig, Transport};
@@ -83,6 +85,29 @@ pub struct InstanceStatus {
     pub failures: u32,
     /// Most recent start failure or crash.
     pub last_error: Option<String>,
+    /// Failure diagnostics mode of this instance (`off`, `failures` or
+    /// `trace`).
+    #[serde(default = "default_debug")]
+    pub debug: String,
+    /// Newest classified failure of this instance in the failure log
+    /// (`None` while the log has none, or diagnostics never ran).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<LastFailure>,
+}
+
+fn default_debug() -> String {
+    "off".into()
+}
+
+/// A failure record reference in [`InstanceStatus::last_failure`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastFailure {
+    /// Record id in the failure log (`f-NNNNNN`).
+    pub id: String,
+    /// Failure kind (snake case).
+    pub kind: String,
+    /// Unix time in ms.
+    pub ts: u64,
 }
 
 /// `GET /status` response.
@@ -243,6 +268,77 @@ pub struct LogsResponse {
     pub name: String,
     /// Last stderr lines, oldest first.
     pub lines: Vec<String>,
+}
+
+/// Runtime debug overrides in [`DebugStatus`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugOverride {
+    /// Mode for every server, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all: Option<String>,
+    /// Modes of named servers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub servers: BTreeMap<String, String>,
+}
+
+/// `GET /debug` and `POST /debug` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DebugStatus {
+    /// Effective mode for servers without a per-server setting.
+    pub mode: String,
+    /// Effective mode of every registered server.
+    pub servers: BTreeMap<String, String>,
+    /// The runtime layer (set by `POST /debug`, lost on restart).
+    pub runtime: DebugOverride,
+    /// Raw frame capture is on. Always false in this build.
+    pub raw: bool,
+    /// Seconds until the runtime layer reverts (when `for` was given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_secs: Option<u64>,
+    /// False when no debug directory can be determined (everything stays
+    /// off).
+    pub available: bool,
+    /// Records written to the failure log by this process.
+    pub written: u64,
+    /// Records dropped (queue full) by this process.
+    pub dropped: u64,
+}
+
+/// `POST /debug` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugSetRequest {
+    /// `off`, `failures` or `trace`.
+    pub mode: String,
+    /// Apply to these servers only (default: every server).
+    #[serde(default)]
+    pub servers: Vec<String>,
+    /// Raw capture is not available; `true` is rejected.
+    #[serde(default)]
+    pub raw: bool,
+    /// Revert after this duration (`30m`); default: until restart.
+    #[serde(default, rename = "for")]
+    pub duration: Option<String>,
+}
+
+/// `GET /debug/failures` query.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailuresQuery {
+    /// Only this server.
+    pub server: Option<String>,
+    /// Only this kind (snake case).
+    pub kind: Option<String>,
+    /// Only records newer than this: a duration ago (`1h`) or unix ms.
+    pub since: Option<String>,
+    /// Newest records to return (default 50, at most 500).
+    pub limit: Option<usize>,
+}
+
+/// `GET /debug/failures` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FailuresResponse {
+    /// Matching records, oldest first (the schema of `docs/DEBUG.md`).
+    pub records: Vec<serde_json::Value>,
 }
 
 /// Error body of every non-2xx admin response.

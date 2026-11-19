@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{scope_name, Era, Router, Server, Session};
+use crate::backend::jsonrpc;
 use crate::backend::stdio::lock;
 use crate::backend::{Conn, Instance, LifecycleEvent};
 use crate::stats::{
@@ -42,6 +43,32 @@ pub(super) struct CallStart {
 
 fn instance_tag(scope_key: &str) -> Option<String> {
     (!scope_key.is_empty()).then(|| stats::short_hash(scope_key))
+}
+
+/// The failure kind of a call, from its response (the broker's own error
+/// shapes and backend JSON-RPC errors); `None` for successes and for tool
+/// results that merely carry `isError`. Kinds are those of `diag::Kind`
+/// (snake case), so the statistics log and the failure log agree.
+fn classify_fail(resp: &Value) -> Option<String> {
+    let err = resp.get("error").filter(|e| e.is_object())?;
+    let code = err["code"].as_i64().unwrap_or(0);
+    let msg = err["message"].as_str().unwrap_or("");
+    let kind = if code == jsonrpc::REQUEST_CANCELLED {
+        "agent_cancelled"
+    } else if code == jsonrpc::BACKEND_UNAVAILABLE {
+        if msg.contains("(call_timeout)") {
+            "stalled"
+        } else if msg.contains("connection closed") {
+            "crash_in_flight"
+        } else if msg.contains("; retry in ") {
+            "backoff_rejected"
+        } else {
+            "backend_unavailable"
+        }
+    } else {
+        "rpc_error"
+    };
+    Some(kind.to_owned())
 }
 
 impl CallStart {
@@ -198,6 +225,7 @@ impl Router {
             duration_ms: ms(start.started.elapsed()),
             ok: resp.get("error").is_none() && !tool_error,
             error_code,
+            fail: classify_fail(resp),
             cold_start: trace.cold_start,
             spawn_wait_ms: if trace.cold_start {
                 ms(trace.acquire)
