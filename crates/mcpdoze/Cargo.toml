@@ -15,7 +15,7 @@ homepage = "https://github.com/Oni-den/mcpdoze"
 workspace = true
 
 [dependencies]
-mcpdoze-core = { path = "../mcpdoze-core" }
+mcpdoze-core = { path = "../mcpdoze-core", version = "0.3.0" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "signal", "macros", "time"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 tracing = "0.1.44"
