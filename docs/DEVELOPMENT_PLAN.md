@@ -115,6 +115,8 @@ admin), systemd user unit (Linux), LaunchAgent (macOS). A stdio-to-HTTP shim
 | M6 | HTTP passthrough | Mock remote: SSE streamed, reconnect works |
 | M7 | `per-cwd` and `per-session` scopes, server-to-client routing | Elicitation reaches the right session |
 | M8 | Autostart, migration skill, case study, soak, release binaries | Case-study numbers published; v0.1.0 tagged |
+| M9 | Failure diagnostics: `diag` module, sanitised failure log, `mcpdoze debug`, `doctor` summary, replay through testkit; exit status in `status`; framing fixes (oversize frame, string ids); optional `call_timeout` | Every failure kind has a testkit test; canary secrets never reach the failure log or an export; with `mode = "off"` no file is created |
+| M10 | Token optimisation, per-server opt-in: per-tool size report, tool allow/deny, description trimming, `default_args`, JSON minify, truncation with `mcpdoze__result_get`, field filter, read-only result cache, TOON text encoding, batch meta-tool | `stats --tools` shows bytes saved per tool; transformed results stay protocol-valid (no `outputSchema` mismatch); nothing changes for servers without an `optimize` table |
 
 Sequence: M0, M1, then M2 and M3 are sequential (core router and lifecycle).
 After M2 interfaces freeze, M4, M5, M6, the skill and docs run in parallel.
@@ -155,6 +157,39 @@ paragraph above is historical.
 
 Other risks: `rmcp` API churn, agents ignoring `list_changed`, cold start
 exceeding agent tool timeouts (`prewarm = true` option).
+
+## v0.3: diagnostics and token optimisation
+
+Full plan: [plans/M9-M10-plan.md](plans/M9-M10-plan.md).
+
+**Failure diagnostics (M9).** When a brokered server fails, MCPDoze records
+why in `<data dir>/debug/failures.jsonl`: the failure kind, the backend's
+lifecycle state, the last frames exchanged (direction, type, size, never
+content), the exit code or signal, a scrubbed stderr tail, and the shape of
+the triggering request (types and sizes, compared with the tool's input
+schema). Records hold no argument values, results, environment values,
+header values, directories or session ids, so `mcpdoze debug export` output
+can be attached to a public issue. Off by default; enabled with `[debug]
+mode`, `servers.<name>.debug`, `MCPDOZE_DEBUG`, `serve --debug` or at
+runtime through `/admin/v1/debug`. Raw frame capture is a separate opt-in,
+local-only and time-limited. A bundle can be replayed against the testkit
+mock server to reproduce the symptom. See [DEBUG.md](DEBUG.md).
+
+**Token optimisation (M10).** A broker can reduce what reaches the agent's
+context without touching servers or agents. Everything is opt-in per server
+(`[servers.<name>.optimize]`, `[servers.<name>.tools.<tool>]`) and applied
+at view time, so the disk catalog keeps the backend's own lists. In scope:
+measuring bytes per tool, hiding tools, trimming descriptions, default
+arguments for pagination, compact text encoding, truncating large results
+with on-demand retrieval, field filtering, caching read-only results per
+session, and a batch tool. Out of scope: server-side computation,
+summarising with a model, and pruning or de-duplicating the agent's own
+context; MCPDoze reports duplicate calls and large tools instead. Results
+with `isError` are never changed, and a tool whose structured output is
+changed is listed without its `outputSchema`. See [OPTIMIZE.md](OPTIMIZE.md).
+
+Sequence: M9 first (it also fixes hangs on oversize frames and string ids),
+then M10 in phases A0 (measure) to A4 (batch, deferred tools after ADR 0003).
 
 ## Migration skill (`skills/mcpdoze-migrate`)
 
