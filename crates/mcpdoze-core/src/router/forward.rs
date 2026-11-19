@@ -84,6 +84,9 @@ struct CallDiag {
     acquire_ms: u64,
     cold_start: bool,
     arguments: Option<Value>,
+    /// Params of other methods (prompts/get, completion, resource reads):
+    /// only their string leaves are used, for scrubbing.
+    other_params: Option<Value>,
     disconnect: bool,
 }
 
@@ -99,6 +102,7 @@ impl CallDiag {
         v.cold_start = self.cold_start;
         v.suspect = suspect;
         v.arguments = self.arguments.as_ref();
+        v.params = self.other_params.as_ref();
         v.input_schema = schema;
         v
     }
@@ -703,8 +707,15 @@ impl Router {
             arguments: (method == "tools/call")
                 .then(|| params.get("arguments").cloned())
                 .flatten(),
+            other_params: (method != "tools/call" && !params.is_null()).then(|| params.clone()),
             disconnect: true,
         });
+        if let Some(v) = cd
+            .as_ref()
+            .and_then(|c| c.arguments.as_ref().or(c.other_params.as_ref()))
+        {
+            tap.remember_call_args(v);
+        }
         let sending = std::time::Instant::now();
         let (back_id, mut rx) = match guard.conn().begin(method, params, meta).await {
             Ok(x) => x,

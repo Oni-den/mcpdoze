@@ -250,3 +250,74 @@ fn reader_folds_repeats_and_filters() {
     assert!(parse_since("24h", 10_000_000).unwrap() < 10_000_000);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn leak_review_short_option_values_are_not_exported() {
+    let cfg: ServerConfig = toml::from_str(
+        r#"
+transport = "stdio"
+command = "tool"
+args = ["-ptopsecretvalue", "-p", "--ok"]
+"#,
+    )
+    .unwrap();
+    let l = LaunchShape::from_config("example", &cfg);
+    assert!(
+        l.flags.iter().all(|f| !f.contains("topsecret")),
+        "{:?}",
+        l.flags
+    );
+    assert!(l.flags.contains(&"-?".to_string()) && l.flags.contains(&"-p".to_string()));
+}
+
+#[test]
+fn leak_review_self_check_catches_glued_placeholders_and_config_secrets() {
+    let c = lint().with_secrets(["conf-secret-7731".to_string()]);
+    let hit = |t: &str| !self_check(t, &c).is_empty();
+    assert!(hit("<user>:S3cretPass"));
+    assert!(hit("<env:API_KEY>:S3cretPass"));
+    assert!(hit("<arg:/q>tailvalue"));
+    assert!(hit("x conf-secret-7731 y"));
+    assert!(!hit("<user> <env:A> <arg:/q> <host#1234abcd>:8080 <user>s"));
+    // The second pass must also have removed them (fail closed otherwise).
+    let mut o = opts();
+    o.lint = lint().with_secrets(["conf-secret-7731".to_string()]);
+    assert!(build(input("boom conf-secret-7731"), &o).is_err());
+    o.scrub = ScrubContext::new([("CFG".to_string(), "conf-secret-7731".to_string())])
+        .with_home(HOME)
+        .with_user("canaryuser")
+        .with_host("canaryhost");
+    let ok = build(input("boom conf-secret-7731"), &o).unwrap();
+    assert!(!ok.text.contains("conf-secret-7731"));
+}
+
+#[test]
+fn leak_review_config_secrets_reach_the_second_pass_and_self_check() {
+    let cfg: ServerConfig = toml::from_str(
+        r#"
+transport = "http"
+url = "https://api.example.com/v1/PATHKEY-abcdef123/mcp?token=qs-value-5521"
+[headers]
+X-Custom = "hdr-literal-value-77"
+"#,
+    )
+    .unwrap();
+    let secrets = config_secrets(&cfg);
+    for v in ["hdr-literal-value-77", "PATHKEY-abcdef123", "qs-value-5521"] {
+        assert!(secrets.iter().any(|(_, x)| x == v), "{v}");
+    }
+    let stdio: ServerConfig = toml::from_str(
+        "transport = \"stdio\"\ncommand = \"x\"\nargs = [\"--token=argsecret-991\", \"-pshortsecret-12\"]\n",
+    )
+    .unwrap();
+    let s2 = config_secrets(&stdio);
+    assert!(s2.iter().any(|(_, x)| x == "argsecret-991"));
+    assert!(s2.iter().any(|(_, x)| x == "shortsecret-12"));
+    let o = opts().with_secrets(secrets);
+    let ex = build(input("boom hdr-literal-value-77 PATHKEY-abcdef123"), &o).unwrap();
+    assert!(!ex.text.contains("hdr-literal") && !ex.text.contains("PATHKEY"));
+    // Without the scrub pass knowing it, the exact-value self-check fails closed.
+    let mut o2 = opts();
+    o2.lint = lint().with_secrets(["hdr-literal-value-77".to_string()]);
+    assert!(build(input("boom hdr-literal-value-77"), &o2).is_err());
+}

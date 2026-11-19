@@ -364,6 +364,14 @@ impl HttpConn {
         match headers_helper::run(cmd).await {
             Ok(extra) => {
                 tracing::debug!(server = %self.server, count = extra.len(), "headers helper ran");
+                if let Some(tap) = self.tap() {
+                    tap.add_secrets(extra.iter().map(|(k, v)| {
+                        (
+                            k.to_string(),
+                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                        )
+                    }));
+                }
                 *lock(&self.headers) = headers_helper::merge(&self.static_headers, extra);
                 Ok(())
             }

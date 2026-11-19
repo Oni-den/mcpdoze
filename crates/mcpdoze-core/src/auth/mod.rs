@@ -167,6 +167,45 @@ pub fn warn_if_permissive(path: &Path) -> Option<String> {
     }
 }
 
+/// Warnings about a directory and the regular files directly in it that
+/// pre-date this process (a debug directory created earlier or by another
+/// tool). Unix: group/other access bits. Elsewhere: one note that access
+/// follows the inherited ACL (see the module docs).
+pub fn permissions_warnings(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut check = |p: &Path, want: &str| {
+            if let Ok(m) = std::fs::metadata(p) {
+                let mode = m.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    out.push(format!(
+                        "{} is accessible by group/others (mode {mode:o}); run chmod {want}",
+                        p.display()
+                    ));
+                }
+            }
+        };
+        check(dir, "700");
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.file_type().is_ok_and(|t| t.is_file()) {
+                    check(&e.path(), "600");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if dir.is_dir() {
+        out.push(format!(
+            "{} gets its access rules from the parent folder's ACL; keep it out of shared or synced folders",
+            dir.display()
+        ));
+    }
+    out
+}
+
 /// Validate an `Authorization` header value (`Bearer <token>`, scheme
 /// case-insensitive) against `token` in constant time.
 pub fn verify_bearer(header_value: &str, token: &Token) -> bool {
@@ -268,3 +307,28 @@ pub fn check_origin(origin_header: Option<&str>, allowed: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn warns_about_a_preexisting_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let w = permissions_warnings(d.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let f = d.path().join("failures.jsonl");
+            std::fs::write(&f, b"x").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let w = permissions_warnings(d.path());
+            assert_eq!(w.len(), 2, "{w:?}");
+        }
+        #[cfg(not(unix))]
+        assert_eq!(w.len(), 1, "{w:?}");
+        #[cfg(unix)]
+        let _ = w;
+    }
+}

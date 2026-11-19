@@ -134,12 +134,13 @@ fn failure_record_end_to_end_holds_no_canary() {
     req.arguments = Some(&args);
     req.input_schema = Some(&schema);
     req.suspect = true;
+    req.elapsed_ms = 60_000;
     req.id_type = Some(IdType::Number);
     let mut be = BackendView::new("failed", 4);
     be.prev_state = Some("running");
     be.in_flight = 2;
     be.protocol = Some("2025-11-25");
-    be.server_info = Some(("example-server", Some("1.2.3")));
+    be.server_info = Some(("demo-server", Some("1.2.3")));
     be.caps = &["tools", "resources.subscribe"];
 
     tap.on_transition("running", "spawn", 0);
@@ -153,6 +154,7 @@ fn failure_record_end_to_end_holds_no_canary() {
     let stderr = StderrView {
         total: 3,
         lines: &stderr_lines,
+        ts: &[crate::stats::now_ms(); 3],
     };
     let incident = tap.new_incident(4);
     assert!(incident.starts_with("i-4-"));
@@ -178,7 +180,7 @@ fn failure_record_end_to_end_holds_no_canary() {
     assert_eq!(r["launcher"], "npx");
     assert_eq!(r["generation"], 4);
     assert_eq!(r["backend"]["state"], "failed");
-    assert_eq!(r["backend"]["server_info"]["name"], "example-server");
+    assert_eq!(r["backend"]["server_info"]["name"], "demo-server");
     assert_eq!(r["backend"]["stdout_noise"], 1);
     assert_eq!(r["request"]["req"], 881);
     assert_eq!(r["request"]["suspect"], true);
@@ -447,4 +449,190 @@ fn http_records_hold_a_reduced_url_and_no_query() {
     );
     let text = fs::read_to_string(diag.file()).unwrap();
     assert!(!text.contains("canary-query-1") && !text.contains("mcp.example.com"));
+}
+
+fn stderr_err(lines: &[&str], ts: &[u64]) -> (Vec<String>, Vec<u64>) {
+    (lines.iter().map(|l| l.to_string()).collect(), ts.to_vec())
+}
+
+#[test]
+fn leak_review_stderr_tail_holds_only_the_calls_own_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let diag = Diag::new(cfg(dir.path()));
+    let tap = diag.tap(
+        ident("example"),
+        Level::Failures,
+        Arc::new(ScrubContext::default()),
+    );
+    let now = crate::stats::now_ms();
+    let (lines, ts) = stderr_err(
+        &[
+            "Error: other session said OLDLINE",
+            "Error: during this call NEWLINE",
+        ],
+        &[now - 120_000, now - 500],
+    );
+    let view = StderrView {
+        total: 2,
+        lines: &lines,
+        ts: &ts,
+    };
+    let mut req = RequestView::new(1, Era::Legacy, "tools/call");
+    req.tool = Some("t");
+    req.elapsed_ms = 2_000;
+    let be = BackendView::new("running", 1);
+    tap.on_stalled(&req, &be, Some(&view));
+    // A lifecycle kind (no request): only lines since the last good response.
+    tap.on_frame(Dir::In, FrameType::Response, "", 1, 10);
+    let (lines2, ts2) = stderr_err(
+        &[
+            "Error: before good response ZZ",
+            "Error: after good response YY",
+        ],
+        &[now - 5_000, crate::stats::now_ms() + 1],
+    );
+    let v2 = StderrView {
+        total: 2,
+        lines: &lines2,
+        ts: &ts2,
+    };
+    tap.on_exit(ExitView::default(), &be, Some(&v2));
+    // Mismatched timestamp length: fail closed.
+    let v3 = StderrView {
+        total: 2,
+        lines: &lines,
+        ts: &[],
+    };
+    tap.on_exit(
+        ExitView {
+            code: Some(3),
+            signal: None,
+        },
+        &be,
+        Some(&v3),
+    );
+    assert!(diag.flush(Duration::from_secs(5)));
+    let text = fs::read_to_string(diag.file()).unwrap();
+    assert!(
+        text.contains("NEWLINE") && !text.contains("OLDLINE"),
+        "{text}"
+    );
+    assert!(text.contains("YY") && !text.contains("ZZ"), "{text}");
+    let recs = read_lines(&diag);
+    let last = recs.last().unwrap();
+    assert_eq!(
+        last["stderr"]["tail"].as_array().unwrap().len(),
+        0,
+        "{last}"
+    );
+}
+
+#[test]
+fn leak_review_recent_calls_arguments_scrub_other_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let diag = Diag::new(cfg(dir.path()));
+    let tap = diag.tap(
+        ident("example"),
+        Level::Failures,
+        Arc::new(ScrubContext::default()),
+    );
+    // Call A succeeded; its argument shows up in a lifecycle record later.
+    tap.remember_call_args(&json!({"note": "earlier-call-private-text-9921"}));
+    let now = crate::stats::now_ms();
+    let lines = vec!["Error: bad input earlier-call-private-text-9921 seen".to_string()];
+    let ts = vec![now];
+    let v = StderrView {
+        total: 1,
+        lines: &lines,
+        ts: &ts,
+    };
+    tap.on_exit(
+        ExitView::default(),
+        &BackendView::new("running", 1),
+        Some(&v),
+    );
+    assert!(diag.flush(Duration::from_secs(5)));
+    let text = fs::read_to_string(diag.file()).unwrap();
+    assert!(!text.contains("earlier-call-private-text"), "{text}");
+}
+
+#[test]
+fn leak_review_a_per_tap_gate_stops_record_building_floods() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg(dir.path());
+    c.per_minute = 10_000;
+    let diag = Diag::new(c);
+    let tap = diag.tap(
+        ident("example"),
+        Level::Failures,
+        Arc::new(ScrubContext::default()),
+    );
+    let be = BackendView::new("running", 1);
+    for _ in 0..200 {
+        tap.on_exit(ExitView::default(), &be, None);
+    }
+    assert!(diag.flush(Duration::from_secs(5)));
+    let s = diag.stats();
+    assert!(s.dropped >= 150, "{s:?}");
+}
+
+#[test]
+fn leak_review_secrets_learned_late_and_url_parts_are_scrubbed() {
+    let parts = url_secret_parts("https://api.example.com/v1/KEYSEGMENT12345/x?k=qv-secret-88&a=b");
+    for p in ["KEYSEGMENT12345", "qv-secret-88"] {
+        assert!(parts.iter().any(|x| x == p), "{p} in {parts:?}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let diag = Diag::new(cfg(dir.path()));
+    let tap = diag.tap(
+        ident("example"),
+        Level::Failures,
+        Arc::new(ScrubContext::default()),
+    );
+    // A headers_helper refresh teaches the tap a new value.
+    tap.add_secrets([(
+        "X-Auth".to_string(),
+        "helper-minted-credential-55".to_string(),
+    )]);
+    let now = crate::stats::now_ms();
+    let lines = vec!["Error: rejected helper-minted-credential-55".to_string()];
+    let v = StderrView {
+        total: 1,
+        lines: &lines,
+        ts: &[now],
+    };
+    tap.on_exit(
+        ExitView::default(),
+        &BackendView::new("running", 1),
+        Some(&v),
+    );
+    assert!(diag.flush(Duration::from_secs(5)));
+    let text = fs::read_to_string(diag.file()).unwrap();
+    assert!(
+        !text.contains("helper-minted") && text.contains("<env:X-Auth>"),
+        "{text}"
+    );
+}
+
+#[test]
+fn leak_review_wire_names_are_checked_for_user_host_and_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let diag = Diag::new(cfg(dir.path()));
+    let scrub = ScrubContext::default()
+        .with_user("canaryuser")
+        .with_host("canaryhost");
+    let tap = diag.tap(ident("example"), Level::Failures, Arc::new(scrub));
+    let mut req = RequestView::new(1, Era::Legacy, "tools/call");
+    req.tool = Some("canaryuser-private-tool");
+    let mut be = BackendView::new("failed", 1);
+    be.server_info = Some((
+        "canaryhost-server",
+        Some("0123456789abcdef0123456789abcdef"),
+    ));
+    tap.on_stalled(&req, &be, None);
+    assert!(diag.flush(Duration::from_secs(5)));
+    let text = fs::read_to_string(diag.file()).unwrap();
+    for c in ["canaryuser", "canaryhost", "0123456789abcdef0123"] {
+        assert!(!text.contains(c), "{c}: {text}");
+    }
 }

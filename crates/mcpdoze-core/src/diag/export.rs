@@ -166,7 +166,9 @@ const SUBCOMMANDS: &[&str] = &["run", "dlx", "exec", "x", "tool", "start", "mcp"
 fn is_flag_name(s: &str) -> bool {
     let body = s.trim_start_matches('-');
     let dashes = s.len() - body.len();
-    (1..=2).contains(&dashes)
+    // A single dash takes one letter: `-p` is a flag, `-ptoken` is a flag
+    // with its value attached.
+    (dashes == 2 || (dashes == 1 && body.len() == 1))
         && body.len() <= 40
         && body.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && body
@@ -250,6 +252,7 @@ pub struct Finding {
 /// This machine's identity for the self-check.
 #[derive(Debug, Clone, Default)]
 pub struct LintContext {
+    secrets: Vec<String>,
     homes: Vec<String>,
     user: Option<String>,
     host: Option<String>,
@@ -283,6 +286,25 @@ impl LintContext {
         let h = h.trim_end_matches('/').to_owned();
         if h.len() >= 4 && !self.homes.contains(&h) {
             self.homes.push(h);
+        }
+        self
+    }
+
+    /// Adds literal secret values (resolved env and header values, URL
+    /// parts, the broker token) that must not appear verbatim, either raw
+    /// or JSON-escaped. Values shorter than 4 bytes are ignored.
+    pub fn with_secrets(mut self, values: impl IntoIterator<Item = String>) -> Self {
+        for v in values {
+            if v.len() < 4 {
+                continue;
+            }
+            let esc = serde_json::to_string(&v).unwrap_or_default();
+            let esc = esc.trim_matches('"').to_owned();
+            for x in [v, esc] {
+                if x.len() >= 4 && !self.secrets.contains(&x) {
+                    self.secrets.push(x);
+                }
+            }
         }
         self
     }
@@ -401,6 +423,38 @@ fn token_hit(line: &str) -> bool {
         || long_hex_hit(b)
 }
 
+/// `<env:X>:pass`, `<user>:pass`, `<arg:/p>tail`: a placeholder at the start
+/// of a token with more text attached (the scrubber must have removed it).
+fn placeholder_glue_hit(line: &str) -> bool {
+    let b = line.as_bytes();
+    for p in ["<env:", "<arg:", "<user>", "<host>", "<host#"] {
+        for (at, _) in line.match_indices(p) {
+            if at > 0 && b[at - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            let Some(close) = line[at..].find('>') else {
+                continue;
+            };
+            let end = at + close + 1;
+            let Some(&c) = b.get(end) else {
+                continue;
+            };
+            let name = p == "<user>" || p == "<host>" || p == "<host#";
+            let next = b.get(end + 1).copied().unwrap_or(b' ');
+            let hit = if name {
+                c == b':' && next.is_ascii_alphabetic()
+            } else {
+                c.is_ascii_alphanumeric()
+                    || ((c == b':' || c == b'.') && next.is_ascii_alphanumeric())
+            };
+            if hit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn xox_hit(line: &str) -> bool {
     ["xoxb-", "xoxp-", "xoxa-", "xoxs-"].iter().any(|p| {
         line.match_indices(p).any(|(at, _)| {
@@ -505,6 +559,12 @@ pub fn self_check(text: &str, ctx: &LintContext) -> Vec<Finding> {
         if token_hit(line) {
             hit("secret-looking token");
         }
+        if placeholder_glue_hit(line) {
+            hit("text glued to a placeholder");
+        }
+        if ctx.secrets.iter().any(|v| line.contains(v.as_str())) {
+            hit("configured secret value");
+        }
         if private_ip_hit(line) {
             hit("private IP address");
         }
@@ -577,6 +637,60 @@ impl ExportOptions {
             lint: LintContext::from_env(),
             salt: Salt::ephemeral(),
         }
+    }
+}
+
+/// Literal secret values of a server's configuration: env and header
+/// values (literals and the resolved `from_env` ones), credential parts of
+/// the URL, and values attached to flags (`--k=v`, `-kv`). Names only label
+/// the placeholders.
+pub fn config_secrets(cfg: &ServerConfig) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let resolve = |v: &EnvValue| match v {
+        EnvValue::Literal(l) => Some(l.clone()),
+        EnvValue::Ref { from_env } => std::env::var(from_env).ok(),
+    };
+    for (k, v) in cfg.env.iter().chain(cfg.headers.iter()) {
+        if let Some(val) = resolve(v) {
+            out.push((k.clone(), val));
+        }
+    }
+    if let Some(u) = &cfg.url {
+        out.extend(
+            super::url_secret_parts(u)
+                .into_iter()
+                .map(|v| ("URL".to_owned(), v)),
+        );
+    }
+    for a in &cfg.args {
+        if let Some(rest) = a.strip_prefix("--") {
+            if let Some((k, v)) = rest.split_once('=') {
+                out.push((k.to_owned(), v.to_owned()));
+            }
+        } else if let Some(rest) = a.strip_prefix('-') {
+            if rest.len() > 1 {
+                let v = rest.split_once('=').map_or(&rest[1..], |(_, v)| v);
+                out.push(("ARG".to_owned(), v.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+impl ExportOptions {
+    /// Teaches the second scrub pass and the self-check the secret values
+    /// of the configuration (see [`config_secrets`]) plus any extra ones
+    /// (such as the broker token). The self-check only takes values of 8+
+    /// bytes, so short common values cannot make every export fail.
+    pub fn with_secrets(mut self, secrets: Vec<(String, String)>) -> Self {
+        let lint: Vec<String> = secrets
+            .iter()
+            .filter(|(_, v)| v.len() >= 8)
+            .map(|(_, v)| v.clone())
+            .collect();
+        self.scrub = self.scrub.with_secrets(secrets);
+        self.lint = self.lint.with_secrets(lint);
+        self
     }
 }
 

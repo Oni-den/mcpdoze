@@ -61,6 +61,10 @@ The record types cannot hold a raw JSON value, so values cannot leak by construc
 - URLs keep scheme, host hash and path depth. Resource URIs, session ids and directories are salted hashes; the salt is per install and never exported.
 - Raw capture (**planned, not available in this version**) writes full frames to an owner-only file, turns itself off after 30 minutes by default, is deleted after 24 hours, and is never read by `export`. It still contains no env or header values. `doctor` warns while it is on.
 
+Scrubbing details: input to the scrubber is cut to 4 KiB (a trailing partial token is dropped); a keyword (`password`, `api_key`, `X-Auth-Token`, ...) redacts its value even across a lone `:` or `=` (JSON `"password": "x"`); a token that merely starts with one of our placeholders is not trusted; dotted hostnames become `<host#hash>`; every string, number and key of the triggering call's parameters, and of the last 8 calls, is matched as an exact value, as a JSON-escaped variant, and as any 12-byte window. Stderr lines attached to a record are limited to those written since the call started (lifecycle records: since the last good response). The broker token (from any source), `headers_helper` output, literal URL userinfo, path segments of 8+ characters and query values are scrubbed as exact values.
+
+Known limits (accepted): a secret of fewer than 4 bytes, or a short lowercase word that appears in no keyword context, cannot be told from text; a URL-encoded or otherwise re-encoded secret is matched only if the encoded form is itself a known value or a 12-byte window of one; a secret split across two stderr lines is not recognised; an agent-supplied tool name that is not in the catalog is only character-filtered and scrubbed like free text. The export self-check fails closed on what it can recognise, but it is a net, not a proof: read the file before posting it.
+
 Files are owner-only, rotated at 5 MB with 5 kept, and flood-limited to 20 records per minute per server; identical failures bump a `repeat` counter.
 
 ## Export

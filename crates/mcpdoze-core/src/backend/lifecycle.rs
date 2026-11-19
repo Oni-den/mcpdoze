@@ -353,10 +353,11 @@ impl Instance {
 
     /// Runs `f` with the stderr tail (call only when the tap is enabled).
     pub fn with_stderr<R>(&self, f: impl FnOnce(&StderrView<'_>) -> R) -> R {
-        let (total, lines) = self.stderr.snapshot();
+        let (total, lines, ts) = self.stderr.snapshot();
         f(&StderrView {
             total,
             lines: &lines,
+            ts: &ts,
         })
     }
 

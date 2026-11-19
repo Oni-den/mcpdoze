@@ -79,7 +79,7 @@ pub mod redact;
 pub mod ring;
 pub mod shape;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -94,7 +94,7 @@ pub use record::{
     BackendRec, Era, ErrorRec, ExitRec, FrameRec, HttpRec, IdType, Identity, Kind, Name, Origin,
     Record, RepeatLine, RequestRec, Scope, Scrubbed, StderrRec, Transport, UrlInfo, SCHEMA_VERSION,
 };
-pub use redact::{launcher_basename, reduce_url, Salt, ScrubContext, Scrubber};
+pub use redact::{launcher_basename, reduce_url, url_secret_parts, Salt, ScrubContext, Scrubber};
 pub use ring::{Dir, FrameRing, FrameType, MethodTag, TransitionRing};
 pub use shape::{analyse, schema_diff, ArgSet, SchemaDiff, ShapeNode, ShapeRoot};
 
@@ -526,6 +526,11 @@ impl Diag {
     }
 
     fn start_writer(&self) -> Option<SyncSender<Msg>> {
+        // The directory may pre-date us with looser permissions; the log is
+        // sensitive even after scrubbing.
+        for w in crate::auth::permissions_warnings(self.dir()) {
+            tracing::warn!("{w}");
+        }
         let log =
             RotatingLog::open_private(&self.file(), self.cfg.max_file_bytes, self.cfg.keep).ok()?;
         let (tx, rx) = mpsc::sync_channel(self.cfg.queue.max(1));
@@ -695,6 +700,9 @@ pub struct RequestView<'a> {
     pub arguments: Option<&'a Value>,
     /// The tool's catalog `inputSchema`.
     pub input_schema: Option<&'a Value>,
+    /// Params of a non-`tools/call` request (string leaves only feed the
+    /// scrubber; never stored).
+    pub params: Option<&'a Value>,
 }
 
 impl<'a> RequestView<'a> {
@@ -714,6 +722,7 @@ impl<'a> RequestView<'a> {
             suspect: false,
             arguments: None,
             input_schema: None,
+            params: None,
         }
     }
 }
@@ -734,6 +743,10 @@ pub struct StderrView<'a> {
     pub total: u64,
     /// The newest lines.
     pub lines: &'a [String],
+    /// Arrival time of each line, unix ms (same length as `lines`). Lines
+    /// are dropped when the lengths differ: the tap cannot tell whose they
+    /// are.
+    pub ts: &'a [u64],
 }
 
 /// An error to attach to a record.
@@ -832,12 +845,23 @@ pub struct DiagTap {
     diag: Option<Arc<Diag>>,
     src: TapIdent,
     ident: OnceLock<Identity>,
-    scrub: Arc<ScrubContext>,
+    scrub: Mutex<Arc<ScrubContext>>,
     frames: FrameRing,
     transitions: TransitionRing,
     noise: AtomicU64,
     incidents: AtomicU64,
+    /// Unix ms of the last good response from the backend.
+    last_good_ms: AtomicU64,
+    /// Arguments of the most recent calls (leaves only), so a stderr line
+    /// caused by one call is scrubbed in the record of another.
+    recent_args: Mutex<VecDeque<ArgSet>>,
+    /// Cheap per-tap rate gate: (window start ms, records in the window).
+    gate: Mutex<(u64, u32)>,
 }
+
+const RECENT_CALLS: usize = 8;
+const GATE_WINDOW_MS: u64 = 10_000;
+const GATE_MAX: u32 = 30;
 
 impl std::fmt::Debug for DiagTap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -861,11 +885,14 @@ impl DiagTap {
             diag,
             src,
             ident: OnceLock::new(),
-            scrub,
+            scrub: Mutex::new(scrub),
             frames: FrameRing::new(frames),
             transitions: TransitionRing::default(),
             noise: AtomicU64::new(0),
             incidents: AtomicU64::new(0),
+            last_good_ms: AtomicU64::new(0),
+            recent_args: Mutex::new(VecDeque::new()),
+            gate: Mutex::new((0, 0)),
         }
     }
 
@@ -937,6 +964,45 @@ impl DiagTap {
         })
     }
 
+    /// Adds secrets learned after the tap was built (a `headers_helper`
+    /// refresh): later records scrub them as exact values.
+    pub fn add_secrets(&self, more: impl IntoIterator<Item = (String, String)>) {
+        let mut g = self.scrub.lock().unwrap_or_else(|e| e.into_inner());
+        let next = (**g).clone().with_secrets(more);
+        *g = Arc::new(next);
+    }
+
+    /// Remembers the arguments of a call that is starting (leaves only, in
+    /// memory), for scrubbing the records of later events.
+    pub fn remember_call_args(&self, v: &Value) {
+        if !self.enabled() {
+            return;
+        }
+        let mut a = ArgSet::new();
+        a.add_all_leaves(v);
+        if a.leaves().is_empty() {
+            return;
+        }
+        let mut g = self.recent_args.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() == RECENT_CALLS {
+            g.pop_front();
+        }
+        g.push_back(a);
+    }
+
+    /// Cheap rate gate, checked before any record is built.
+    fn gate_ok(&self, now: u64) -> bool {
+        let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if now.saturating_sub(g.0) >= GATE_WINDOW_MS {
+            *g = (now, 0);
+        }
+        if g.1 >= GATE_MAX {
+            return false;
+        }
+        g.1 += 1;
+        true
+    }
+
     /// Builds and submits one record. Everything below runs only at an
     /// active level.
     fn emit(&self, d: Draft<'_>) {
@@ -947,8 +1013,18 @@ impl DiagTap {
         }
         let Some(diag) = &self.diag else { return };
         diag.counters.active.fetch_add(1, Ordering::Relaxed);
+        if !self.gate_ok(now_ms()) {
+            diag.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let salt = diag.salt();
         let ident = self.identity(diag).clone();
+        let scrub = self.scrub.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let no_args = ArgSet::new();
+        let sc0 = Scrubber::new(&scrub, salt, &no_args);
+        // A name taken from the wire: character-filtered and also checked
+        // for user names, host names, secrets and addresses.
+        let wire_name = |n: &str| Name::new(sc0.scrub(n).as_str());
         let mut rec = Record::new(kind, ident, now_ms());
         rec.incident = d.incident.map(str::to_string);
 
@@ -971,8 +1047,8 @@ impl DiagTap {
                 last_transition: trans.last().cloned(),
                 protocol: b.protocol.map(Name::new),
                 server_info: b.server_info.map(|(n, v)| record::ServerInfoRec {
-                    name: Name::new(n),
-                    version: v.map(Name::new),
+                    name: wire_name(n),
+                    version: v.map(wire_name),
                 }),
                 caps: b.caps.iter().map(|c| Name::new(c)).collect(),
                 stdout_noise: self.noise.load(Ordering::Relaxed),
@@ -999,12 +1075,15 @@ impl DiagTap {
                 shape = Some(an.shape);
                 args = an.args;
             }
+            if let Some(p) = r.params {
+                args.add_all_leaves(p);
+            }
             sig.tool = r.tool.map(str::to_string);
             rec.request = Some(RequestRec {
                 req: r.req,
                 era: r.era,
                 method: Name::new(r.method),
-                tool: r.tool.map(Name::new),
+                tool: r.tool.map(wire_name),
                 id_type: r.id_type,
                 progress: r.progress,
                 bytes: r.bytes,
@@ -1016,7 +1095,15 @@ impl DiagTap {
                 schema_diff: diff.clone(),
             });
         }
-        let sc = Scrubber::new(&self.scrub, salt, &args);
+        for other in self
+            .recent_args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            args.absorb(other);
+        }
+        let sc = Scrubber::new(&scrub, salt, &args);
 
         if let Some(e) = d.exit {
             rec.exit = Some(ExitRec {
@@ -1052,11 +1139,28 @@ impl DiagTap {
             });
         }
         if let Some(s) = d.stderr {
+            // Only lines this event can own: since the call started, or for
+            // lifecycle events since the last good response. Lines from
+            // other calls or sessions are not attached.
+            let cutoff = match d.request {
+                Some(r) => now_ms().saturating_sub(r.elapsed_ms),
+                None => self.last_good_ms.load(Ordering::Relaxed),
+            };
+            let own: Vec<&String> = if s.ts.len() == s.lines.len() {
+                s.lines
+                    .iter()
+                    .zip(s.ts)
+                    .filter(|(_, t)| **t >= cutoff)
+                    .map(|(l, _)| l)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let keep = diag.cfg.stderr_lines;
-            let skip = s.lines.len().saturating_sub(keep);
+            let skip = own.len().saturating_sub(keep);
             rec.stderr = Some(StderrRec {
                 total: s.total,
-                tail: s.lines[skip..].iter().map(|l| sc.stderr_line(l)).collect(),
+                tail: own[skip..].iter().map(|l| sc.stderr_line(l)).collect(),
             });
         }
         if d.frames {
@@ -1235,6 +1339,9 @@ impl DiagTap {
     pub fn on_frame(&self, dir: Dir, ftype: FrameType, method: &str, bid: u64, bytes: usize) {
         if !self.enabled() {
             return;
+        }
+        if dir == Dir::In && ftype == FrameType::Response {
+            self.last_good_ms.store(now_ms(), Ordering::Relaxed);
         }
         self.frames
             .push(dir, ftype, MethodTag::of(method), bid, bytes, None);

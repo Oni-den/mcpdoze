@@ -39,6 +39,10 @@ use crate::proctree::{resolve_command, ExitInfo, ProcessTree, TreeMemory};
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
 /// Lines of backend stderr kept for diagnostics.
 pub const STDERR_LINES: usize = 500;
+/// Newest stderr lines copied into one diagnostics event.
+pub const STDERR_SNAPSHOT_LINES: usize = 64;
+/// Longest stderr line copied into one diagnostics event.
+pub const STDERR_SNAPSHOT_BYTES: usize = 2048;
 /// Longest stderr line kept (longer lines are truncated).
 const MAX_STDERR_LINE: usize = 8 * 1024;
 /// Outgoing line queue depth per backend.
@@ -189,11 +193,24 @@ impl StderrRing {
         lock(&self.0).q.iter().cloned().collect()
     }
 
-    /// Lines written since the ring was created, and the buffered lines
-    /// (oldest first).
-    pub fn snapshot(&self) -> (u64, Vec<String>) {
+    /// Lines written since the ring was created, and the newest
+    /// [`STDERR_SNAPSHOT_LINES`] buffered lines (oldest first, each capped
+    /// at [`STDERR_SNAPSHOT_BYTES`]) with their arrival times. Bounded so a
+    /// flood of failures cannot make every event copy the whole ring.
+    pub fn snapshot(&self) -> (u64, Vec<String>, Vec<u64>) {
         let g = lock(&self.0);
-        (g.total, g.q.iter().map(|e| e.line.clone()).collect())
+        let skip = g.q.len().saturating_sub(STDERR_SNAPSHOT_LINES);
+        let mut lines = Vec::with_capacity(g.q.len() - skip);
+        let mut ts = Vec::with_capacity(g.q.len() - skip);
+        for e in g.q.iter().skip(skip) {
+            let mut end = e.line.len().min(STDERR_SNAPSHOT_BYTES);
+            while !e.line.is_char_boundary(end) {
+                end -= 1;
+            }
+            lines.push(e.line[..end].to_string());
+            ts.push(e.ts_ms);
+        }
+        (g.total, lines, ts)
     }
 }
 
@@ -335,10 +352,11 @@ impl ConnDiag {
     }
 
     fn with_stderr<R>(&self, f: impl FnOnce(&StderrView<'_>) -> R) -> R {
-        let (total, lines) = self.stderr.snapshot();
+        let (total, lines, ts) = self.stderr.snapshot();
         f(&StderrView {
             total,
             lines: &lines,
+            ts: &ts,
         })
     }
 

@@ -40,6 +40,9 @@ pub const MAX_DEPTH: usize = 6;
 pub const ARGSET_MAX_VALUES: usize = 32;
 /// Bytes kept in an [`ArgSet`].
 pub const ARGSET_MAX_BYTES: usize = 4096;
+/// Bytes of string leaves kept for substring (shingle) matching.
+pub const ARG_LEAF_BYTES: usize = 64 * 1024;
+const ARG_LEAF_CAP: usize = 16 * 1024;
 const ARG_VALUE_CAP: usize = 256;
 const ARG_MIN_LEN: usize = 4;
 const ARRAY_ITEMS: usize = 3;
@@ -117,6 +120,8 @@ pub enum ShapeRoot {
 pub struct ArgSet {
     items: Vec<(String, String)>,
     bytes: usize,
+    leaves: Vec<String>,
+    leaf_bytes: usize,
 }
 
 impl fmt::Debug for ArgSet {
@@ -136,6 +141,13 @@ fn cap_str(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// The JSON string form of `s` without the quotes, when it differs.
+fn json_escaped(s: &str) -> Option<String> {
+    let e = serde_json::to_string(s).ok()?;
+    let e = &e[1..e.len() - 1];
+    (e != s).then(|| e.to_string())
 }
 
 impl ArgSet {
@@ -166,8 +178,70 @@ impl ArgSet {
         self.items.push((v.to_string(), ptr.to_string()));
     }
 
+    /// Adds every string leaf (and object key, and number of 6+ digits) of
+    /// `v` to the substring-matching set, bounded by [`ARG_LEAF_BYTES`].
+    /// Iterative, so deep input cannot grow the stack. Call it for every
+    /// request that carries parameters.
+    pub fn add_all_leaves(&mut self, v: &Value) {
+        let mut stack: Vec<&Value> = vec![v];
+        while let Some(v) = stack.pop() {
+            if self.leaf_bytes >= ARG_LEAF_BYTES {
+                break;
+            }
+            match v {
+                Value::String(s) => self.add_leaf(s),
+                Value::Number(n) => self.add_leaf(&n.to_string()),
+                Value::Array(a) => stack.extend(a.iter()),
+                Value::Object(m) => {
+                    for (k, x) in m {
+                        self.add_leaf(k);
+                        stack.push(x);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn add_leaf(&mut self, s: &str) {
+        if s.len() < 6 {
+            return;
+        }
+        let s = cap_str(s, ARG_LEAF_CAP);
+        let mut variants = vec![s.to_string()];
+        if let Some(esc) = json_escaped(s) {
+            variants.push(esc);
+        }
+        for x in variants {
+            if self.leaf_bytes + x.len() > ARG_LEAF_BYTES + ARG_LEAF_CAP {
+                return;
+            }
+            self.leaf_bytes += x.len();
+            self.leaves.push(x);
+        }
+    }
+
+    /// Adds the leaves of `other` (the arguments of another recent call).
+    pub fn absorb(&mut self, other: &ArgSet) {
+        for l in &other.leaves {
+            if self.leaf_bytes + l.len() > ARG_LEAF_BYTES * 4 {
+                return;
+            }
+            self.leaf_bytes += l.len();
+            self.leaves.push(l.clone());
+        }
+    }
+
+    /// Leaves for substring matching (6+ bytes each).
+    pub fn leaves(&self) -> &[String] {
+        &self.leaves
+    }
+
     fn offer(&mut self, ptr: &str, value: &str) {
         self.push(ptr, value);
+        if let Some(esc) = json_escaped(value) {
+            self.push(ptr, &esc);
+        }
         if value.contains('\n') {
             for line in value.lines() {
                 let l = line.trim();
@@ -321,9 +395,15 @@ impl Walker<'_> {
                     n.digits = Some(digits(i.unsigned_abs()));
                     if enum_member(schema, v) {
                         n.en = Some(Name::new(&i.to_string()));
+                    } else if digits(i.unsigned_abs()) >= 6 {
+                        self.args.offer(ptr, &i.to_string());
                     }
                     n
                 } else {
+                    let t = num.to_string();
+                    if t.len() >= 6 {
+                        self.args.offer(ptr, &t);
+                    }
                     ShapeNode::of("float")
                 }
             }
@@ -402,6 +482,7 @@ pub fn analyse(value: &Value, schema: Option<&Value>, salt: &Salt) -> Analysis {
         }
         other => ShapeRoot::Node(w.walk(other, schema, "", 0)),
     };
+    w.args.add_all_leaves(value);
     let diff = schema.map(|s| schema_diff(value, s));
     let shape_hash = {
         use std::hash::{Hash, Hasher};

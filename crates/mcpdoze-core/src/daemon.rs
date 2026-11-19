@@ -342,6 +342,7 @@ impl Daemon {
             None => default_catalog(&cfg.broker),
         };
         let router = Router::with(catalog, opts.tuning);
+        router.add_diag_secret("BROKER_TOKEN", token.expose_secret());
         start_stats(&router, &cfg.stats);
         let security = Security::new(token, cfg.broker.allowed_hosts.clone());
         let control = Control::new(router, cfg, path.clone());

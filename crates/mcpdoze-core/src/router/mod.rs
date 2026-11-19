@@ -439,6 +439,9 @@ pub struct Router {
     stats: RwLock<Option<Arc<crate::stats::Stats>>>,
     /// Failure diagnostics recorder and level, when set.
     diag: RwLock<Option<DiagState>>,
+    /// Secrets every diagnostics scrubber must know (the resolved broker
+    /// token, wherever it came from).
+    diag_secrets: RwLock<Vec<(String, String)>>,
     /// Per-process request counter shared by the statistics log and the
     /// diagnostics records.
     next_req: AtomicU64,
@@ -492,16 +495,17 @@ impl Router {
             live: Mutex::new(HashMap::new()),
             stats: RwLock::new(None),
             diag: RwLock::new(None),
+            diag_secrets: RwLock::new(Vec::new()),
             next_req: AtomicU64::new(1),
             policies: RwLock::new(HashMap::new()),
             meta: RwLock::new({
                 let mut reg = optimize::meta::MetaRegistry::default();
                 reg.register(Arc::new(optimize::meta::ResultGet::new(me.clone())));
+                reg.register(Arc::new(optimize::meta::BatchTool::new(me.clone())));
                 reg
             }),
             results: Arc::default(),
             cache: Arc::default(),
-                reg.register(Arc::new(optimize::meta::BatchTool::new(me.clone())));
         })
     }
 
@@ -581,6 +585,16 @@ impl Router {
             settings: None,
         });
         self.reattach_diag();
+    }
+
+    /// Registers a secret (`name` appears in placeholders, `value` never
+    /// leaves memory) for the diagnostics scrubbers of every instance.
+    /// Call before [`Router::set_diag`].
+    pub fn add_diag_secret(&self, name: &str, value: &str) {
+        self.diag_secrets
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((name.to_owned(), value.to_owned()));
     }
 
     fn reattach_diag(&self) {
@@ -694,7 +708,19 @@ impl Router {
             .collect();
         if let Some(h) = &spec.http {
             secrets.extend(h.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+            secrets.extend(
+                crate::diag::url_secret_parts(&h.url)
+                    .into_iter()
+                    .map(|v| ("URL".to_owned(), v)),
+            );
         }
+        secrets.extend(
+            self.diag_secrets
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
         if let Ok(t) = std::env::var(crate::backend::TOKEN_ENV_VAR) {
             secrets.push((crate::backend::TOKEN_ENV_VAR.to_owned(), t));
         }

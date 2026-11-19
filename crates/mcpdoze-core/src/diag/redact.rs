@@ -44,6 +44,7 @@ use super::shape::ArgSet;
 /// Longest scrubbed text, in characters.
 pub const MAX_TEXT: usize = 300;
 const MIN_SECRET_LEN: usize = 4;
+const SHINGLE: usize = 12;
 const BLOCK: usize = 64;
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
@@ -197,6 +198,32 @@ pub fn reduce_url(salt: &Salt, url: &str) -> Option<UrlInfo> {
     })
 }
 
+/// The parts of a configured URL that may carry credentials: userinfo,
+/// path segments of 8+ characters (API keys in paths) and query values.
+pub fn url_secret_parts(url: &str) -> Vec<String> {
+    let Some((_, rest)) = url.split_once("://") else {
+        return Vec::new();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let mut out = Vec::new();
+    if let Some((info, _)) = rest[..end].rsplit_once('@') {
+        out.push(info.to_string());
+        out.extend(info.split(':').map(str::to_string));
+    }
+    let after = &rest[end..];
+    let (path, query) = match after.find(['?', '#']) {
+        Some(p) => (&after[..p], &after[p..]),
+        None => (after, ""),
+    };
+    out.extend(path.split('/').filter(|x| x.len() >= 8).map(str::to_string));
+    for pair in query.trim_start_matches(['?', '#']).split(['&', ';']) {
+        let v = pair.split_once('=').map_or(pair, |(_, v)| v);
+        out.push(v.to_string());
+    }
+    out.retain(|v| v.len() >= MIN_SECRET_LEN);
+    out
+}
+
 /// What the scrubber knows about this machine and this backend.
 #[derive(Debug, Clone, Default)]
 pub struct ScrubContext {
@@ -222,6 +249,18 @@ impl ScrubContext {
             secrets,
             ..Self::default()
         }
+    }
+
+    /// Adds more `(name, value)` secrets (same rules as [`ScrubContext::new`]).
+    pub fn with_secrets(mut self, more: impl IntoIterator<Item = (String, String)>) -> Self {
+        for (n, v) in more {
+            if v.len() >= MIN_SECRET_LEN && !self.secrets.iter().any(|(_, x)| *x == v) {
+                self.secrets.push((Name::new(&n).as_str().to_string(), v));
+            }
+        }
+        self.secrets
+            .sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+        self
     }
 
     /// Adds the home directory, user name and host name of this machine
@@ -383,6 +422,123 @@ fn redacted(n: usize) -> String {
 
 fn is_delim(c: char) -> bool {
     c.is_whitespace() || "\"'`()[]{},;|".contains(c)
+}
+
+#[derive(Default)]
+struct KwState {
+    redact_next: bool,
+    pending_key: bool,
+}
+
+/// An identifier-shaped name (header or field) holding a sensitive part:
+/// `api_key`, `X-Auth-Token`, `PRIVATE-TOKEN`, `client_secret`.
+fn sensitive_key(name: &str) -> bool {
+    if name.is_empty()
+        || name.len() > 40
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+    {
+        return false;
+    }
+    let l = name.to_ascii_lowercase();
+    SENSITIVE_KEY_PARTS.iter().any(|p| l.contains(p))
+}
+
+const FILE_EXTS: &[&str] = &[
+    "js", "ts", "rs", "py", "go", "rb", "md", "txt", "json", "toml", "yaml", "yml", "log", "cfg",
+    "conf", "ini", "xml", "html", "css", "exe", "dll", "so", "lock", "sh", "ps1", "cmd", "bat",
+    "mjs", "cjs", "tsx", "jsx", "java", "kt", "cs", "cpp", "hpp", "rlib", "sock", "pid", "tmp",
+    "bak", "map", "csv", "tsv", "zip", "gz", "tar", "pem", "key", "crt", "db", "sql",
+];
+const COMMON_TLDS: &[&str] = &[
+    "com", "net", "org", "io", "dev", "local", "internal", "corp", "lan", "cloud", "app", "co",
+    "edu", "gov", "example", "test", "home", "intranet",
+];
+
+fn is_hostname(h: &str) -> bool {
+    let labels: Vec<&str> = h.split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.is_empty() || l.len() > 63) {
+        return false;
+    }
+    if !labels.iter().all(|l| {
+        l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    }) {
+        return false;
+    }
+    let tld = labels[labels.len() - 1].to_ascii_lowercase();
+    if tld.len() < 2 || !tld.bytes().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    if COMMON_TLDS.contains(&tld.as_str()) {
+        return true;
+    }
+    labels.len() >= 3 && !FILE_EXTS.contains(&tld.as_str()) && tld.len() <= 24
+}
+
+/// Replaces bare dotted hostnames with `<host#hash>` (salted).
+fn redact_hosts(salt: &Salt, tok: &str) -> String {
+    let b = tok.as_bytes();
+    let mut out = String::with_capacity(tok.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphanumeric() {
+            let mut j = i;
+            // Our `<user>` / `<host>` markers may sit inside a name.
+            while j < b.len() {
+                if b[j].is_ascii_alphanumeric() || b[j] == b'-' || b[j] == b'.' {
+                    j += 1;
+                } else if let Some(m) = ["<user>", "<host>"]
+                    .iter()
+                    .find(|m| tok[j..].starts_with(**m))
+                {
+                    j += m.len();
+                } else {
+                    break;
+                }
+            }
+            let run = tok[i..j].trim_end_matches('.');
+            let probe = run.replace("<user>", "usr").replace("<host>", "hst");
+            if is_hostname(&probe) {
+                out.push_str(&format!(
+                    "<host#{}>",
+                    salt.hash8("host", &run.to_ascii_lowercase())
+                ));
+                i += run.len();
+                continue;
+            }
+            out.push_str(&tok[i..j]);
+            i = j;
+        } else {
+            let ch = tok[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Longest text the scrubber works on, in bytes (callers may pass a
+/// 16 MiB message).
+const MAX_INPUT: usize = 4096;
+
+/// Truncates to [`MAX_INPUT`] bytes at a char boundary and drops a trailing
+/// partial token, so a cut secret is not left half-visible.
+fn cap_input(text: &str) -> &str {
+    if text.len() <= MAX_INPUT {
+        return text;
+    }
+    let mut end = MAX_INPUT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &text[..end];
+    match cut.rfind(is_delim) {
+        Some(p) => &cut[..p],
+        None => "",
+    }
 }
 
 fn is_run_char(c: u8) -> bool {
@@ -666,7 +822,77 @@ impl<'a> Scrubber<'a> {
                 s = s.replace(value, &format!("<arg:{ptr}>"));
             }
         }
-        s
+        // Short leaves beyond the value cap: exact match.
+        let mut short: Vec<&str> = self
+            .args
+            .leaves()
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.len() < SHINGLE)
+            .collect();
+        short.sort_unstable();
+        short.dedup();
+        for v in short.into_iter().take(256) {
+            if s.contains(v) {
+                s = s.replace(v, "<arg:*>");
+            }
+        }
+        self.shingles(s)
+    }
+
+    /// Redacts any window of 12+ bytes that also occurs in an argument.
+    fn shingles(&self, s: String) -> String {
+        use std::collections::HashMap;
+        let leaves = self.args.leaves();
+        let tb = s.as_bytes();
+        if tb.len() < SHINGLE || !leaves.iter().any(|l| l.len() >= SHINGLE) {
+            return s;
+        }
+        let mut wins: HashMap<&[u8], Vec<usize>> = HashMap::new();
+        for i in 0..=tb.len() - SHINGLE {
+            let w = &tb[i..i + SHINGLE];
+            if w.iter().all(|b| b.is_ascii_whitespace() || *b == w[0]) {
+                continue;
+            }
+            wins.entry(w).or_default().push(i);
+        }
+        let mut mark = vec![false; tb.len()];
+        let mut any = false;
+        for l in leaves.iter().filter(|l| l.len() >= SHINGLE) {
+            let lb = l.as_bytes();
+            for j in 0..=lb.len() - SHINGLE {
+                if let Some(pos) = wins.get(&lb[j..j + SHINGLE]) {
+                    for &p in pos {
+                        mark[p..p + SHINGLE].iter_mut().for_each(|m| *m = true);
+                        any = true;
+                    }
+                }
+            }
+        }
+        if !any {
+            return s;
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < s.len() {
+            if mark[i] {
+                let mut j = i;
+                while j < s.len() && mark[j] {
+                    j += 1;
+                }
+                // Extend to char boundaries on both sides.
+                while j < s.len() && !s.is_char_boundary(j) {
+                    j += 1;
+                }
+                out.push_str("<arg:*>");
+                i = j;
+            } else {
+                let ch = s[i..].chars().next().unwrap_or(' ');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
     }
 
     fn system(&self, text: String) -> String {
@@ -710,33 +936,88 @@ impl<'a> Scrubber<'a> {
         ))
     }
 
+    /// True when the whole token is one of our placeholders.
+    fn is_placeholder(tok: &str) -> bool {
+        PLACEHOLDER_STARTS.iter().any(|p| {
+            tok.starts_with(p)
+                && tok.ends_with('>')
+                && tok.matches('<').count() == 1
+                && tok.matches('>').count() == 1
+        })
+    }
+
+    /// A token that starts with a placeholder but carries more text: keep
+    /// the placeholder, scrub the remainder (`<user>:pass`, `<host>.corp`).
+    fn placeholder_prefixed(&self, tok: &str) -> Option<String> {
+        if !PLACEHOLDER_STARTS.iter().any(|p| tok.starts_with(p)) {
+            return None;
+        }
+        let end = tok.find('>')? + 1;
+        let (ph, rest) = tok.split_at(end);
+        if rest.is_empty() {
+            return None;
+        }
+        // Our own `<path>/base[:line]` output, a port, or punctuation only.
+        if (ph == "<path>" && rest.starts_with(['/', '\\']))
+            || rest
+                .bytes()
+                .all(|c| !c.is_ascii_alphanumeric() || c == b':')
+            || rest
+                .strip_prefix(':')
+                .is_some_and(|r| r.bytes().all(|c| c.is_ascii_digit()))
+        {
+            return Some(format!("{ph}{}", self.token(rest)));
+        }
+        // A name placeholder glued to a word or a dotted name (`<user>s`,
+        // `<host>.corp.example`) is scrubbed as text; `<user>:pass` is not.
+        if (ph == "<user>" || ph == "<host>") && !rest.starts_with(':') {
+            return Some(format!("{ph}{}", self.token(rest)));
+        }
+        // Anything else glued to a placeholder was part of the secret.
+        Some(format!("{ph}{}", redacted(rest.len())))
+    }
+
     fn token(&self, tok: &str) -> String {
-        if PLACEHOLDER_STARTS.iter().any(|p| tok.starts_with(p)) {
+        // key=value: keep the key, scrub the value. Iterative: each step
+        // consumes one `=`, so hostile input cannot grow the stack.
+        let mut out = String::with_capacity(tok.len());
+        let mut rest = tok;
+        while let Some((k, v)) = rest.split_once('=') {
+            let ident = k.len() <= 32
+                && k.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c));
+            if !(ident && !v.is_empty()) {
+                break;
+            }
+            let kl = k.to_ascii_lowercase();
+            // A key with digits may itself be an address or an id.
+            if k.bytes().any(|c| c.is_ascii_digit()) {
+                out.push_str(&self.token_plain(k));
+            } else {
+                out.push_str(k);
+            }
+            out.push('=');
+            if SENSITIVE_KEY_PARTS.iter().any(|p| kl.contains(p)) {
+                out.push_str(&redacted(v.len()));
+                return out;
+            }
+            rest = v;
+        }
+        out.push_str(&self.token_plain(rest));
+        out
+    }
+
+    fn token_plain(&self, tok: &str) -> String {
+        if Self::is_placeholder(tok) {
             return tok.to_string();
+        }
+        if let Some(s) = self.placeholder_prefixed(tok) {
+            return s;
         }
         // A path under a scrubbed home or working directory: keep only the
         // file name.
         if (tok.starts_with("<home>") || tok.starts_with("<cwd>")) && tok.contains(['/', '\\']) {
             return reduce_path(tok);
-        }
-        // key=value: keep the key, scrub the value.
-        if let Some((k, v)) = tok.split_once('=') {
-            let ident = k.len() <= 32
-                && k.bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c));
-            if ident && !v.is_empty() {
-                let kl = k.to_ascii_lowercase();
-                // A key with digits may itself be an address or an id.
-                let key = if k.bytes().any(|c| c.is_ascii_digit()) {
-                    self.token(k)
-                } else {
-                    k.to_string()
-                };
-                if SENSITIVE_KEY_PARTS.iter().any(|p| kl.contains(p)) {
-                    return format!("{key}={}", redacted(v.len()));
-                }
-                return format!("{key}={}", self.token(v));
-            }
         }
         if let Some(u) = self.url_token(tok) {
             return u;
@@ -758,38 +1039,72 @@ impl<'a> Scrubber<'a> {
         }
         if let Some((head, query)) = tok.split_once('?') {
             if query.contains('=') {
-                return format!("{}?{}", self.token(head), redacted(query.len()));
+                return format!("{}?{}", self.token_plain(head), redacted(query.len()));
             }
         }
-        let t = redact_runs(tok);
-        if is_abs_or_deep_path(&t) && !t.contains("<redacted:") {
+        let t = redact_hosts(self.salt, tok);
+        let t = redact_runs(&t);
+        if is_abs_or_deep_path(&t) {
             return reduce_path(&t);
         }
         t
     }
 
+    fn flush(&self, out: &mut String, tok: &str, st: &mut KwState) {
+        let trimmed = tok.trim_matches(|c: char| c == ':' || c == '=');
+        if trimmed.is_empty() {
+            // A lone `:` or `=` between a key and its value (`"password":
+            // "x"`, `token : x`) must not consume the pending redaction.
+            out.push_str(tok);
+            if std::mem::take(&mut st.pending_key) {
+                st.redact_next = true;
+            }
+            return;
+        }
+        st.pending_key = false;
+        let lower = trimmed.to_ascii_lowercase();
+        if KEYWORDS.contains(&lower.as_str()) {
+            out.push_str(tok);
+            st.redact_next = true;
+            return;
+        }
+        if st.redact_next {
+            out.push_str(&redacted(tok.len()));
+            st.redact_next = false;
+            return;
+        }
+        if sensitive_key(trimmed) {
+            if tok.ends_with(':') || tok.ends_with('=') {
+                let core = tok.trim_end_matches([':', '=']);
+                out.push_str(&self.token(core));
+                out.push_str(&tok[core.len()..]);
+                st.redact_next = true;
+            } else {
+                out.push_str(&self.token(tok));
+                st.pending_key = true;
+            }
+            return;
+        }
+        // `name:value` with a sensitive name.
+        if let Some((k, v)) = tok.split_once(':') {
+            if !v.is_empty() && !v.starts_with("//") && sensitive_key(k) {
+                out.push_str(&self.token(k));
+                out.push(':');
+                out.push_str(&redacted(v.len()));
+                return;
+            }
+        }
+        out.push_str(&self.token(tok));
+    }
+
     fn token_pass(&self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut tok_start: Option<usize> = None;
-        let mut redact_next = false;
-        let flush = |out: &mut String, tok: &str, redact_next: &mut bool| {
-            let lower = tok
-                .trim_matches(|c: char| c == ':' || c == '=')
-                .to_ascii_lowercase();
-            if KEYWORDS.contains(&lower.as_str()) {
-                out.push_str(tok);
-                *redact_next = true;
-            } else if *redact_next {
-                out.push_str(&redacted(tok.len()));
-                *redact_next = false;
-            } else {
-                out.push_str(&self.token(tok));
-            }
-        };
+        let mut st = KwState::default();
         for (i, c) in text.char_indices() {
             if is_delim(c) {
                 if let Some(s) = tok_start.take() {
-                    flush(&mut out, &text[s..i], &mut redact_next);
+                    self.flush(&mut out, &text[s..i], &mut st);
                 }
                 out.push(c);
             } else if tok_start.is_none() {
@@ -797,13 +1112,14 @@ impl<'a> Scrubber<'a> {
             }
         }
         if let Some(s) = tok_start {
-            flush(&mut out, &text[s..], &mut redact_next);
+            self.flush(&mut out, &text[s..], &mut st);
         }
         out
     }
 
     /// Scrubs free text (an error message, a stderr line).
     pub fn scrub(&self, text: &str) -> Scrubbed {
+        let text = cap_input(text);
         let s = self.exact(text);
         let s = self.system(s);
         let s = self.token_pass(&s);
@@ -901,6 +1217,90 @@ mod tests {
         .with_user("example")
         .with_host("devbox01")
         .with_cwd("/work/project-x")
+    }
+
+    #[test]
+    fn leak_review_keyword_and_placeholder_regressions() {
+        let c = ctx();
+        let s = salt();
+        let args = ArgSet::new();
+        let sc = Scrubber::new(&c, &s, &args);
+        for (text, secret) in [
+            (r#"{"password":"hunter2x"}"#, "hunter2x"),
+            ("password = hunter2x", "hunter2x"),
+            ("token : abcdefgh", "abcdefgh"),
+            ("api_key: Zk9wQ8", "Zk9wQ8"),
+            ("client_secret=Zk9wQ8", "Zk9wQ8"),
+            ("X-Auth-Token: Zk9wQ8", "Zk9wQ8"),
+            ("PRIVATE-TOKEN: Zk9wQ8", "Zk9wQ8"),
+            (r#"{"access_token" : "Zk9wQ8"}"#, "Zk9wQ8"),
+            ("password:Zk9wQ8", "Zk9wQ8"),
+            ("<user>:S3cretPassw0rd", "S3cretPassw0rd"),
+            ("<env:A>:S3cretPassw0rd", "S3cretPassw0rd"),
+            ("<arg:/q>tailsecretvalue", "tailsecretvalue"),
+            ("<host>.corp.acme.example", "acme"),
+            ("srv01.corp.acme.example", "acme"),
+            ("connect db.internal.acme.example:5432", "acme"),
+        ] {
+            let out = sc.scrub(text).as_str().to_string();
+            assert!(!out.contains(secret), "{text:?} -> {out:?}");
+        }
+        // A bare placeholder passes through untouched.
+        assert_eq!(sc.scrub("<env:A> <path>/x").as_str(), "<env:A> <path>/x");
+        // Paths with a redacted run are still reduced.
+        let out = sc
+            .scrub("/opt/AbCdEfGhIjKlMnOpQrStUvWx1234/bin/tool")
+            .as_str()
+            .to_string();
+        assert!(!out.contains("/opt/"), "{out}");
+    }
+
+    #[test]
+    fn leak_review_scrubber_survives_huge_and_deep_input() {
+        let c = ctx();
+        let s = salt();
+        let args = ArgSet::new();
+        let sc = Scrubber::new(&c, &s, &args);
+        let eqs = "a=".repeat(2_000_000);
+        let out = sc.scrub(&eqs);
+        assert!(out.as_str().chars().count() <= MAX_TEXT + 1);
+        let big = format!("{} tailSecretPassw0rd1234", "x ".repeat(8_000));
+        assert!(!sc.scrub(&big).as_str().contains("tailSecret"));
+        // A cut inside a token drops the partial token.
+        let cut = format!("{}ghp_abcdefghijklmnop", "y ".repeat(2047));
+        assert!(!sc.scrub(&cut).as_str().contains("ghp_"));
+    }
+
+    #[test]
+    fn leak_review_argument_leaves_are_matched_beyond_the_value_caps() {
+        let c = ctx();
+        let s = salt();
+        // 40 array items (the walk keeps 3), a float, a negative integer, an
+        // escaped quote, and a long value the exact matcher caps at 256 bytes.
+        let long = format!("{}-LongTailSecretXyz987", "p".repeat(300));
+        let mut items: Vec<serde_json::Value> = (0..40)
+            .map(|i| serde_json::Value::from(format!("filler{i:02}")))
+            .collect();
+        items.push(serde_json::Value::from("late-array-secret-71"));
+        let v = serde_json::json!({
+            "list": items, "f": 1234.5678, "n": -9876543, "q": "say \"hi-there-friend\" ok", "long": long
+        });
+        let an = crate::diag::analyse(&v, None, &s);
+        let sc = Scrubber::new(&c, &s, &an.args);
+        for (text, secret) in [
+            ("failed late-array-secret-71 here", "late-array-secret-71"),
+            ("failed 1234.5678 here", "1234.5678"),
+            ("failed -9876543 here", "-9876543"),
+            (r#"echo "say \"hi-there-friend\" ok""#, "hi-there-friend"),
+            (
+                "failed with LongTailSecretXyz987 end",
+                "LongTailSecretXyz987",
+            ),
+            ("prefix-late-array-secret-71-suffix", "array-secret"),
+        ] {
+            let out = sc.scrub(text).as_str().to_string();
+            assert!(!out.contains(secret), "{text:?} -> {out:?}");
+        }
     }
 
     #[test]

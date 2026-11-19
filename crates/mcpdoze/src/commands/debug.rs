@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use mcpdoze_core::admin::api::{DebugSetRequest, FailuresQuery};
@@ -222,6 +222,18 @@ async fn show(a: DebugShowArgs, out: &mut dyn Write) -> Result<()> {
 
 // ---------------------------------------------------------------- export
 
+/// A path for terminal output: relative to the working directory when it
+/// lies below it, else just the file name (never the home directory).
+fn shown(p: &Path) -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(rel) = p.strip_prefix(&cwd) {
+            return rel.display().to_string();
+        }
+    }
+    p.file_name()
+        .map_or_else(|| "<file>".to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
 fn default_out(now: u64) -> PathBuf {
     PathBuf::from(format!("mcpdoze-debug-{}.md", now / 1000))
 }
@@ -253,7 +265,7 @@ async fn export_cmd(a: DebugExportArgs, out: &mut dyn Write) -> Result<u8> {
         bail!(
             "no failures recorded in the last {} (log: {}); turn recording on with `mcpdoze debug on`, reproduce the problem, then run this again",
             a.since,
-            file.display()
+            shown(&file)
         );
     }
 
@@ -288,7 +300,18 @@ async fn export_cmd(a: DebugExportArgs, out: &mut dyn Write) -> Result<u8> {
             }),
     };
 
-    let mut opts = ExportOptions::new(now);
+    let mut secrets: Vec<(String, String)> = cfg
+        .map(|c| {
+            c.servers
+                .values()
+                .flat_map(export::config_secrets)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(t) = std::env::var(mcpdoze_core::backend::TOKEN_ENV_VAR) {
+        secrets.push((mcpdoze_core::backend::TOKEN_ENV_VAR.to_owned(), t));
+    }
+    let mut opts = ExportOptions::new(now).with_secrets(secrets);
     opts.strict = a.strict;
     opts.identify = a.identify;
     opts.since_ms = since_ms;
@@ -335,10 +358,10 @@ async fn export_cmd(a: DebugExportArgs, out: &mut dyn Write) -> Result<u8> {
         }
         let mut f = o
             .open(&path)
-            .with_context(|| format!("cannot write {}", path.display()))?;
+            .with_context(|| format!("cannot write {}", shown(&path)))?;
         f.write_all(ex.text.as_bytes())
-            .with_context(|| format!("cannot write {}", path.display()))?;
-        writeln!(out, "wrote {} ({note})", path.display())?;
+            .with_context(|| format!("cannot write {}", shown(&path)))?;
+        writeln!(out, "wrote {} ({note})", shown(&path))?;
         writeln!(
             out,
             "it is built to be pasted into an issue; skim it first. `mcpdoze logs` output is not safe to paste."
