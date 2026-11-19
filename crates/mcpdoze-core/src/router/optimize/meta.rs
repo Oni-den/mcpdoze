@@ -82,3 +82,155 @@ pub fn bare(agent_name: &str) -> Option<&str> {
         .strip_prefix(crate::router::naming::SEP)
         .filter(|n| !n.is_empty())
 }
+
+/// `mcpdoze__result_get`: pages through a result the broker truncated.
+/// Listed while any server has `max_result_bytes` (or, later, the cache) on.
+pub struct ResultGet {
+    router: std::sync::Weak<crate::router::Router>,
+}
+
+/// Largest page one call returns.
+const MAX_PAGE: usize = 1 << 20;
+
+impl ResultGet {
+    /// A tool reading the store of `router`.
+    pub fn new(router: std::sync::Weak<crate::router::Router>) -> Self {
+        Self { router }
+    }
+}
+
+fn tool_error(msg: impl Into<String>) -> Value {
+    serde_json::json!({"content":[{"type":"text","text":msg.into()}],"isError":true})
+}
+
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// One page of `text`: `(start, end)` byte offsets, both on character
+/// boundaries, `end - start` about `limit` (at least one character).
+pub fn page_bounds(text: &str, offset: usize, limit: usize) -> (usize, usize) {
+    let start = floor_boundary(text, offset);
+    let mut end = floor_boundary(text, start.saturating_add(limit.max(1)));
+    if end <= start && start < text.len() {
+        end = start + 1;
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+    }
+    (start, end)
+}
+
+impl MetaTool for ResultGet {
+    fn name(&self) -> &str {
+        "result_get"
+    }
+
+    fn definition(&self) -> Value {
+        serde_json::json!({
+            "description": "Read a result the broker truncated (its text ends with a mcpdoze marker naming a ref). Returns a slice of the full text by byte offset and limit; pass the returned next_offset to continue. With pointer (JSON Pointer such as /structuredContent/items/3) only that part is paged.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string", "description": "The ref from the truncation marker."},
+                    "pointer": {"type": "string", "description": "Optional JSON Pointer into the stored result."},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Start byte (default 0)."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "Bytes to return (default: the server's max_result_bytes)."}
+                },
+                "required": ["ref"]
+            },
+            "annotations": {"readOnlyHint": true, "idempotentHint": true}
+        })
+    }
+
+    fn enabled(&self) -> bool {
+        self.router
+            .upgrade()
+            .is_some_and(|r| r.result_store_enabled())
+    }
+
+    fn call<'a>(&'a self, session: &'a Arc<Session>, arguments: Value) -> MetaFuture<'a> {
+        Box::pin(async move {
+            let Some(router) = self.router.upgrade() else {
+                return tool_error("broker is shutting down");
+            };
+            if session.is_ephemeral() {
+                return tool_error(
+                    "result refs are not available for stateless requests; call the original tool again",
+                );
+            }
+            let Some(id) = arguments["ref"].as_str() else {
+                return tool_error("result_get needs a string argument `ref`");
+            };
+            let num = |k: &str| match &arguments[k] {
+                Value::Null => Ok(None),
+                v => v
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .map(Some)
+                    .ok_or(format!("`{k}` must be a non-negative integer")),
+            };
+            let (offset, limit) = match (num("offset"), num("limit")) {
+                (Ok(o), Ok(l)) => (o.unwrap_or(0), l),
+                (Err(e), _) | (_, Err(e)) => return tool_error(e),
+            };
+            let Some(stored) = router.result_store().get(session.id(), id) else {
+                return tool_error(crate::router::optimize::store::LOST_REF);
+            };
+            let text = match arguments["pointer"].as_str() {
+                None => super::result::text_view(&stored.result),
+                Some(p) => match stored.result.pointer(p) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(v) => v.to_string(),
+                    None => return tool_error(format!("pointer {p} not found in the result")),
+                },
+            };
+            let limit = limit.unwrap_or(stored.page).clamp(1, MAX_PAGE);
+            let (start, end) = page_bounds(&text, offset, limit);
+            let total = text.len();
+            let more = end < total;
+            let note = if more {
+                format!("[mcpdoze: bytes {start}-{end} of {total}; next offset={end}]")
+            } else {
+                format!("[mcpdoze: bytes {start}-{end} of {total}; end]")
+            };
+            serde_json::json!({
+                "content": [
+                    {"type":"text","text": &text[start..end]},
+                    {"type":"text","text": note},
+                ],
+                "structuredContent": {
+                    "offset": start,
+                    "end": end,
+                    "total": total,
+                    "next_offset": if more { Value::from(end) } else { Value::Null },
+                },
+                "isError": false
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pages_cover_text_exactly() {
+        let t = "aé€😀b".repeat(50);
+        let mut out = String::new();
+        let mut at = 0;
+        while at < t.len() {
+            let (s, e) = page_bounds(&t, at, 7);
+            assert!(e > s);
+            out.push_str(&t[s..e]);
+            at = e;
+        }
+        assert_eq!(out, t);
+        assert_eq!(page_bounds(&t, t.len() + 5, 3), (t.len(), t.len()));
+    }
+}

@@ -228,3 +228,169 @@ async fn config_change_notifies_without_respawn() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------- phase A2
+
+async fn result_get(c: &Client, id: i64, args: Value) -> Value {
+    c.rpc(
+        id,
+        "tools/call",
+        json!({"name":"mcpdoze__result_get","arguments":args}),
+    )
+    .await
+}
+
+fn last_text(r: &Value) -> String {
+    let blocks = r["result"]["content"].as_array().unwrap();
+    blocks.last().unwrap()["text"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_result_pages_reassemble_and_refs_are_session_bound() {
+    with_timeout(LIMIT, async {
+        let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+        router
+            .register(
+                "m",
+                "m",
+                spec(MockServerSpec::new().tools(&["echo"]).big_items(300)),
+            )
+            .unwrap();
+        let b = Broker::start(router.clone()).await;
+        let c = Client::init(b.addr).await;
+        let raw = c.call(1, "big", json!({})).await;
+        let raw_text = raw["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(raw_text.len() > 5000);
+        // Not listed without the feature.
+        assert!(!tool_names(&c.rpc(2, "tools/list", json!({})).await)
+            .contains(&"mcpdoze__result_get".to_owned()));
+
+        router.set_policy(
+            "m",
+            Some(policy("[servers.m.optimize]\nmax_result_bytes = 1024\n")),
+        );
+        assert!(tool_names(&c.rpc(3, "tools/list", json!({})).await)
+            .contains(&"mcpdoze__result_get".to_owned()));
+        let t = c.call(4, "big", json!({})).await;
+        let blocks = t["result"]["content"].as_array().unwrap();
+        let shown = blocks[0]["text"].as_str().unwrap();
+        assert!(
+            shown.len() < 1400 && shown.len() < raw_text.len(),
+            "{}",
+            shown.len()
+        );
+        let marker = last_text(&t);
+        assert!(marker.starts_with("[mcpdoze: truncated,"), "{marker}");
+        let id = marker
+            .split("ref=")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']')
+            .to_owned();
+
+        // Page through with an awkward limit and reassemble.
+        let mut got = String::new();
+        let mut offset = 0u64;
+        for n in 0..200 {
+            let r = result_get(&c, 10 + n, json!({"ref":id,"offset":offset,"limit":777})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            got.push_str(r["result"]["content"][0]["text"].as_str().unwrap());
+            let sc = &r["result"]["structuredContent"];
+            assert_eq!(sc["total"].as_u64().unwrap() as usize, raw_text.len());
+            match sc["next_offset"].as_u64() {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert_eq!(got, raw_text, "pages must reassemble byte-identical");
+        // Default page size, and a JSON pointer into the stored result.
+        let r = result_get(&c, 300, json!({"ref":id})).await;
+        assert_eq!(
+            r["result"]["content"][0]["text"].as_str().unwrap().len(),
+            1024
+        );
+        let r = result_get(
+            &c,
+            301,
+            json!({"ref":id,"pointer":"/structuredContent/count"}),
+        )
+        .await;
+        assert_eq!(r["result"]["content"][0]["text"], "300", "{r}");
+
+        // Another session cannot use the ref; a bogus ref reads the same.
+        let other = Client::init(b.addr).await;
+        let r = result_get(&other, 1, json!({"ref":id})).await;
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        let foreign = r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            foreign.contains("call the original tool again"),
+            "{foreign}"
+        );
+        let r = result_get(&other, 2, json!({"ref":"0".repeat(32)})).await;
+        assert_eq!(r["result"]["content"][0]["text"], foreign.as_str());
+
+        // Purged when the session ends.
+        assert_eq!(router.result_store().usage().0, 1);
+        assert_eq!(c.delete().await, 200);
+        assert_eq!(router.result_store().usage().0, 0);
+        b.finish().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_results_pass_and_filter_drops_output_schema() {
+    with_timeout(LIMIT, async {
+        let router = Router::with(Arc::new(MemoryCatalog::default()), harness::tuning());
+        router
+            .register(
+                "m",
+                "m",
+                spec(
+                    MockServerSpec::new()
+                        .tools(&["echo"])
+                        .structured()
+                        .big_items(50),
+                ),
+            )
+            .unwrap();
+        let b = Broker::start(router.clone()).await;
+        let c = Client::init(b.addr).await;
+        let has_schema = |l: &Value, name: &str| {
+            l["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()
+                .get("outputSchema")
+                .is_some()
+        };
+        let l = c.rpc(1, "tools/list", json!({})).await;
+        assert!(has_schema(&l, "m__structured"));
+
+        router.set_policy(
+            "m",
+            Some(policy(
+                "[servers.m.optimize]\nmax_result_bytes = 4096\n[servers.m.tools.structured]\nkeep = [\"/tool\"]\n[servers.m.tools.big]\nkeep = [\"/count\"]\n",
+            )),
+        );
+        let l = c.rpc(2, "tools/list", json!({})).await;
+        assert!(!has_schema(&l, "m__structured"), "{l}");
+        let r = c.call(3, "big", json!({})).await;
+        assert_eq!(r["result"]["structuredContent"], json!({"count":50}));
+        assert_eq!(r["result"]["content"][0]["text"], "[]");
+        assert_eq!(last_text(&r), "[mcpdoze: fields filtered]");
+        // An unfiltered small result is untouched.
+        let e = c.call(4, "echo", json!({"a":1})).await;
+        assert_eq!(e["result"]["content"].as_array().unwrap().len(), 1, "{e}");
+        b.finish().await;
+    })
+    .await;
+}

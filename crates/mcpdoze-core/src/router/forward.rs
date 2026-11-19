@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use super::events::ProgressRoute;
-use super::optimize::{meta, TAG_ARGS};
+use super::optimize::{self, meta, TAG_ARGS};
 use super::session::RootsState;
 use super::usage::{CallExtras, CallRecord, CallStart, CallTrace};
 use super::{naming, uri, Router, Server, Session};
@@ -300,7 +300,13 @@ impl Router {
         let mut raw_bytes = None;
         if let Some(p) = policy.as_ref().filter(|p| p.transforms_results()) {
             let raw = crate::stats::json_len(&resp);
-            let applied = p.transform_result(&mut resp);
+            // Stateless (ephemeral) sessions have no stable identity to bind
+            // refs to: no store, so no truncation for them.
+            let ctx = (!session.is_ephemeral()).then(|| optimize::result::StoreCtx {
+                store: self.result_store(),
+                session,
+            });
+            let applied = p.transform_result(&tool, &mut resp, ctx.as_ref());
             if !applied.is_empty() {
                 raw_bytes = Some(raw);
                 tags.extend(applied);

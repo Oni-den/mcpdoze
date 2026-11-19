@@ -18,11 +18,16 @@ impl ServerPolicy {
             .collect()
     }
 
-    // The current result transforms never change `structuredContent`, so no
-    // `outputSchema` needs dropping here; a transform that does must remove
-    // it for its tools in this function.
+    // A transform that changes `structuredContent` (the field filter) must
+    // remove the tool's `outputSchema` here: the filtered result no longer
+    // validates against it. Truncation and minify leave it alone.
     fn view_tool(&self, tool: &Value) -> Value {
         let mut t = tool.clone();
+        if t["name"].as_str().is_some_and(|n| self.filters_tool(n)) {
+            if let Some(o) = t.as_object_mut() {
+                o.remove("outputSchema");
+            }
+        }
         if let Some(max) = self.description_max_chars {
             if let Some(d) = t["description"].as_str() {
                 let cut = trim_description(d, max);

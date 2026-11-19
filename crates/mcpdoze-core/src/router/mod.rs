@@ -445,6 +445,8 @@ pub struct Router {
     policies: RwLock<HashMap<String, Arc<optimize::ServerPolicy>>>,
     /// Broker-served meta-tools (`mcpdoze__*`).
     meta: RwLock<optimize::meta::MetaRegistry>,
+    /// Truncated results for `mcpdoze__result_get`.
+    results: Arc<optimize::store::ResultStore>,
 }
 
 impl std::fmt::Debug for Router {
@@ -489,7 +491,12 @@ impl Router {
             diag: RwLock::new(None),
             next_req: AtomicU64::new(1),
             policies: RwLock::new(HashMap::new()),
-            meta: RwLock::new(optimize::meta::MetaRegistry::default()),
+            meta: RwLock::new({
+                let mut reg = optimize::meta::MetaRegistry::default();
+                reg.register(Arc::new(optimize::meta::ResultGet::new(me.clone())));
+                reg
+            }),
+            results: Arc::default(),
         })
     }
 
@@ -511,6 +518,20 @@ impl Router {
             .unwrap_or_else(|e| e.into_inner())
             .get(server)
             .cloned()
+    }
+
+    /// The result store (`mcpdoze__result_get`).
+    pub fn result_store(&self) -> &Arc<optimize::store::ResultStore> {
+        &self.results
+    }
+
+    /// Whether any server keeps results for `mcpdoze__result_get`.
+    pub fn result_store_enabled(&self) -> bool {
+        self.policies
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|p| p.stores_results())
     }
 
     /// Registers a meta-tool (`mcpdoze__<name>`), listed while it is enabled.

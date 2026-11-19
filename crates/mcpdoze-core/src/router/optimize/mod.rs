@@ -15,6 +15,7 @@
 
 pub mod meta;
 pub mod result;
+pub mod store;
 pub mod view;
 
 use std::collections::{HashMap, HashSet};
@@ -34,6 +35,8 @@ pub struct ServerPolicy {
     description_max_chars: Option<usize>,
     strip_schema_descriptions: bool,
     minify_json: bool,
+    max_result_bytes: u64,
+    filters: HashMap<String, result::FieldFilter>,
     default_args: HashMap<String, Map<String, Value>>,
     /// `tool/key` pairs already warned about (one warning each).
     warned: Mutex<HashSet<String>>,
@@ -49,12 +52,19 @@ impl ServerPolicy {
             .filter(|(_, t)| !t.default_args.is_empty())
             .map(|(n, t)| (n.clone(), t.default_args.clone()))
             .collect();
+        let mut filters = HashMap::new();
+        for (n, t) in &server.tools {
+            if let Some(f) = result::FieldFilter::new(&t.keep, &t.drop)? {
+                filters.insert(n.clone(), f);
+            }
+        }
         let Some(o) = &server.optimize else {
-            if default_args.is_empty() {
+            if default_args.is_empty() && filters.is_empty() {
                 return Ok(None);
             }
             return Ok(Some(Self {
                 default_args,
+                filters,
                 ..Self::default()
             }));
         };
@@ -63,6 +73,8 @@ impl ServerPolicy {
             description_max_chars: o.description_max_chars.map(|n| n as usize),
             strip_schema_descriptions: o.strip_schema_descriptions,
             minify_json: o.minify_json,
+            max_result_bytes: o.max_result_bytes,
+            filters,
             default_args,
             warned: Mutex::default(),
         }))
@@ -75,7 +87,18 @@ impl ServerPolicy {
 
     /// Whether any result transform is on.
     pub fn transforms_results(&self) -> bool {
-        self.minify_json
+        self.minify_json || self.max_result_bytes > 0 || !self.filters.is_empty()
+    }
+
+    /// Whether results may be stored for `mcpdoze__result_get` (truncation;
+    /// the result cache will add itself here).
+    pub fn stores_results(&self) -> bool {
+        self.max_result_bytes > 0
+    }
+
+    /// Whether `tool` has a field filter.
+    pub fn filters_tool(&self, tool: &str) -> bool {
+        self.filters.contains_key(tool)
     }
 
     /// Merges the configured `default_args` of `tool` into `params`
