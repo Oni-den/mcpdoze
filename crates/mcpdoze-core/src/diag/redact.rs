@@ -924,8 +924,10 @@ mod tests {
                 "Authorization: Bearer abc.def.ghi",
                 "Authorization: Bearer <redacted:11>",
             ),
-            ("mail bob@corp.org now", "mail <redacted:12> now"),
-            ("peer 10.20.30.40:8080 down", "peer <redacted:11>:8080 down"),
+            // The ctx user "example" is scrubbed inside the domain first, so the
+            // span is "user@<user>.com" (15 chars).
+            ("mail user@example.com now", "mail <redacted:15> now"),
+            ("peer 192.0.2.40:8080 down", "peer <redacted:10>:8080 down"),
             (
                 "GET https://api.example.com/v1/items?token=abc",
                 "GET https://<host#",
