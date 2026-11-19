@@ -85,7 +85,9 @@ use serde_json::{json, Value};
 use crate::backend::jsonrpc;
 use crate::backend::stdio::lock;
 use crate::backend::{BackendSpec, ClientSide, Conn, Instance, StateKind, Tuning};
+use crate::config::DebugSettings;
 use crate::config::Scope;
+use crate::diag::{Diag, DiagConfig, Level, ScrubContext, TapIdent, Transport};
 pub use catalog::{
     fingerprint, Catalog, CatalogEntry, DiskCatalog, ListChanges, MemoryCatalog, CATALOG_VERSION,
 };
@@ -378,6 +380,37 @@ struct Registry {
     by_prefix: BTreeMap<String, Arc<Server>>,
 }
 
+/// The recorder and how deep each server records.
+#[derive(Clone)]
+struct DiagState {
+    diag: Arc<Diag>,
+    /// Level for servers without a resolved setting (set by
+    /// [`Router::set_diag`] / [`Router::set_diag_level`]).
+    level: Level,
+    /// Per-server levels from `[debug]` (see [`Router::apply_debug`]).
+    settings: Option<Arc<DebugSettings>>,
+}
+
+impl DiagState {
+    fn level_for(&self, server: &str) -> Level {
+        self.settings
+            .as_ref()
+            .map_or(self.level, |s| s.level_for(server))
+    }
+}
+
+fn same_diag_config(a: &DiagConfig, b: &DiagConfig) -> bool {
+    a.dir == b.dir
+        && a.max_file_bytes == b.max_file_bytes
+        && a.keep == b.keep
+        && a.frames == b.frames
+        && a.stderr_lines == b.stderr_lines
+        && a.slow_call == b.slow_call
+        && a.tool_errors == b.tool_errors
+        && a.per_minute == b.per_minute
+        && a.queue == b.queue
+}
+
 /// The broker core shared by every transport.
 pub struct Router {
     me: Weak<Router>,
@@ -402,6 +435,11 @@ pub struct Router {
     live: Mutex<HashMap<String, Weak<Session>>>,
     /// Statistics log, when enabled.
     stats: RwLock<Option<Arc<crate::stats::Stats>>>,
+    /// Failure diagnostics recorder and level, when set.
+    diag: RwLock<Option<DiagState>>,
+    /// Per-process request counter shared by the statistics log and the
+    /// diagnostics records.
+    next_req: AtomicU64,
 }
 
 impl std::fmt::Debug for Router {
@@ -443,7 +481,184 @@ impl Router {
             subs: subs::Subscriptions::default(),
             live: Mutex::new(HashMap::new()),
             stats: RwLock::new(None),
+            diag: RwLock::new(None),
+            next_req: AtomicU64::new(1),
         })
+    }
+
+    /// The next request number. One counter serves both the statistics log
+    /// (`req_id`) and the diagnostics records (`req`), so they correlate.
+    pub fn next_request_id(&self) -> u64 {
+        self.next_req.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Enables failure diagnostics: every instance (existing and future)
+    /// gets a tap on `diag` at `level`.
+    pub fn set_diag(&self, diag: Arc<Diag>, level: Level) {
+        *self.diag.write().unwrap_or_else(|e| e.into_inner()) = Some(DiagState {
+            diag,
+            level,
+            settings: None,
+        });
+        self.reattach_diag();
+    }
+
+    fn reattach_diag(&self) {
+        for server in self.servers() {
+            for inst in server.all_instances() {
+                self.attach_diag(&server.name, &inst);
+            }
+        }
+    }
+
+    /// Applies the effective `[debug]` settings: builds (or rebuilds, when
+    /// its configuration changed) the recorder and sets every instance's
+    /// level from [`DebugSettings::level_for`]. Never restarts a backend.
+    pub fn apply_debug(&self, settings: &Arc<DebugSettings>) {
+        let rebuilt = {
+            let mut g = self.diag.write().unwrap_or_else(|e| e.into_inner());
+            let keep = match (g.as_ref(), &settings.diag) {
+                (Some(st), Some(cfg)) => same_diag_config(st.diag.config(), cfg),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            match (&settings.diag, g.as_mut()) {
+                (Some(_), Some(st)) if keep => {
+                    st.settings = Some(settings.clone());
+                    false
+                }
+                (Some(cfg), _) => {
+                    *g = Some(DiagState {
+                        diag: Diag::new(cfg.clone()),
+                        level: Level::Off,
+                        settings: Some(settings.clone()),
+                    });
+                    true
+                }
+                (None, Some(st)) => {
+                    st.settings = Some(settings.clone());
+                    false
+                }
+                (None, None) => return,
+            }
+        };
+        if rebuilt {
+            self.reattach_diag();
+            return;
+        }
+        for server in self.servers() {
+            let level = settings.level_for(&server.name);
+            for inst in server.all_instances() {
+                inst.tap().set_level(level);
+            }
+        }
+    }
+
+    /// Follows the effective debug settings (see
+    /// `Control::debug_settings`): applies the current value now and every
+    /// later change from a background task. Needs a Tokio runtime.
+    pub fn follow_debug(&self, mut rx: tokio::sync::watch::Receiver<Arc<DebugSettings>>) {
+        let current = rx.borrow_and_update().clone();
+        self.apply_debug(&current);
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let next = rx.borrow_and_update().clone();
+                let Some(r) = me.upgrade() else { return };
+                r.apply_debug(&next);
+            }
+        });
+    }
+
+    /// The diagnostics recorder, when set.
+    pub fn diag(&self) -> Option<Arc<Diag>> {
+        self.diag
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|st| st.diag.clone())
+    }
+
+    /// Changes the diagnostics level of every instance without restarting
+    /// anything (no effect before [`set_diag`](Router::set_diag)).
+    pub fn set_diag_level(&self, level: Level) {
+        {
+            let mut g = self.diag.write().unwrap_or_else(|e| e.into_inner());
+            match g.as_mut() {
+                Some(d) => {
+                    d.level = level;
+                    d.settings = None;
+                }
+                None => return,
+            }
+        }
+        for server in self.servers() {
+            for inst in server.all_instances() {
+                inst.tap().set_level(level);
+            }
+        }
+    }
+
+    /// Gives `inst` a tap when diagnostics are set up.
+    pub(super) fn attach_diag(&self, server: &str, inst: &Arc<Instance>) {
+        let Some(st) = self.diag.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return;
+        };
+        let (diag, level) = (st.diag.clone(), st.level_for(server));
+        let spec = inst.spec();
+        let http = spec.http.is_some();
+        let mut secrets: Vec<(String, String)> = spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if let Some(h) = &spec.http {
+            secrets.extend(h.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        if let Ok(t) = std::env::var(crate::backend::TOKEN_ENV_VAR) {
+            secrets.push((crate::backend::TOKEN_ENV_VAR.to_owned(), t));
+        }
+        let mut scrub = ScrubContext::new(secrets).with_system();
+        if let Some(c) = spec.cwd.as_deref().and_then(Path::to_str) {
+            scrub = scrub.with_cwd(c);
+        }
+        let key = &spec.client.scope_key;
+        let scope = self.server(server).map_or(Scope::Shared, |s| s.scope.scope);
+        let ident = TapIdent {
+            server: server.to_owned(),
+            transport: if http {
+                Transport::Http
+            } else {
+                Transport::Stdio
+            },
+            launcher: (!http).then(|| spec.command.clone()),
+            scope: match scope {
+                Scope::Shared => crate::diag::Scope::Shared,
+                Scope::PerCwd => crate::diag::Scope::PerCwd,
+                Scope::PerSession => crate::diag::Scope::PerSession,
+            },
+            instance_key: (!key.is_empty()).then(|| key.clone()),
+        };
+        inst.set_tap(diag.tap(ident, level, Arc::new(scrub)));
+    }
+
+    /// The tap of server `server`'s instance with scope key `scope_key`
+    /// (a tap that is always off when there is none).
+    pub(super) fn tap_for(&self, server: &str, scope_key: &str) -> Arc<crate::diag::DiagTap> {
+        self.instance_for_scope(server, scope_key)
+            .map_or_else(crate::diag::DiagTap::disabled, |i| i.tap())
+    }
+
+    /// Server `server`'s instance with scope key `scope_key`.
+    pub(super) fn instance_for_scope(
+        &self,
+        server: &str,
+        scope_key: &str,
+    ) -> Option<Arc<Instance>> {
+        self.server(server)?
+            .all_instances()
+            .into_iter()
+            .find(|i| i.spec().client.scope_key == scope_key)
     }
 
     /// Registers a backend without probing. Nothing is spawned; the first
@@ -522,6 +737,7 @@ impl Router {
             server
         };
         self.hook_instance(name, &server.instance);
+        self.attach_diag(name, &server.instance);
         self.check_catalog(&server);
         Ok(())
     }
@@ -1079,6 +1295,7 @@ impl Router {
         spec.client.scope_key = key.clone();
         let inst = Instance::with_tuning(&server.name, spec, self.events.clone(), self.tuning);
         self.hook_instance(&server.name, &inst);
+        self.attach_diag(&server.name, &inst);
         tracing::info!(server = %server.name, scope = scope_name(server.scope.scope), "new scoped instance");
         map.insert(key, inst.clone());
         Ok(inst)

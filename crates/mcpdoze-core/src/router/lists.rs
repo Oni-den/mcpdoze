@@ -15,6 +15,7 @@ use super::{
 use crate::backend::stdio::lock;
 use crate::backend::{CallError, CallMeta, Conn, Instance, NoEvents};
 use crate::config::Scope;
+use crate::diag::{BackendView, DiagTap};
 
 /// Clears a server's deduplication flag when a background refresh ends.
 pub(super) struct BgFlag(Arc<Server>);
@@ -46,23 +47,68 @@ pub(super) async fn call_bounded(
     }
 }
 
-/// Every page of a list method (bounded in pages and items).
+/// Runs `f` with a view of the backend behind `conn` (diagnostics; call
+/// only when the tap is enabled).
+fn conn_view<R>(conn: &Conn, f: impl FnOnce(&BackendView<'_>) -> R) -> R {
+    let init = conn.init_result();
+    let caps: Vec<&str> = init["capabilities"]
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let mut v = BackendView::new("running", conn.generation());
+    v.uptime_ms = u64::try_from(conn.started().elapsed().as_millis()).unwrap_or(u64::MAX);
+    v.pending = conn.pending_len() as u64;
+    v.protocol = init["protocolVersion"].as_str();
+    v.server_info = init["serverInfo"]["name"]
+        .as_str()
+        .map(|n| (n, init["serverInfo"]["version"].as_str()));
+    v.caps = &caps;
+    f(&v)
+}
+
+fn note_list_failed(
+    tap: &DiagTap,
+    conn: &Conn,
+    cursor_loop: bool,
+    method: &str,
+    started: std::time::Instant,
+    pages: u32,
+) {
+    if tap.enabled() {
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        conn_view(conn, |b| {
+            tap.on_list_failed(cursor_loop, method, ms, pages, b)
+        });
+    }
+}
+
+/// Every page of a list method (bounded in pages and items). A failing
+/// page or a repeated cursor is recorded on `tap`.
 pub(super) async fn list_paged(
     conn: &Conn,
+    tap: &DiagTap,
     method: &str,
     key: &str,
 ) -> Result<Vec<Value>, ListError> {
     let mut out = Vec::new();
     let mut cursor: Option<Value> = None;
+    let started = std::time::Instant::now();
+    let mut pages = 0u32;
     for _ in 0..MAX_LIST_PAGES {
         let params = match &cursor {
             Some(c) => json!({"cursor": c}),
             None => json!({}),
         };
-        let resp = call_bounded(conn, method, params)
-            .await
-            .map_err(ListError::Call)?;
+        let resp = match call_bounded(conn, method, params).await {
+            Ok(r) => r,
+            Err(e) => {
+                note_list_failed(tap, conn, false, method, started, pages);
+                return Err(ListError::Call(e));
+            }
+        };
+        pages += 1;
         let Some(result) = resp.get("result") else {
+            note_list_failed(tap, conn, false, method, started, pages);
             return Err(ListError::Rpc(
                 resp.get("error").cloned().unwrap_or(Value::Null),
             ));
@@ -71,7 +117,14 @@ pub(super) async fn list_paged(
             let room = MAX_LIST_ITEMS.saturating_sub(out.len());
             out.extend(list.iter().take(room).cloned());
         }
-        cursor = result.get("nextCursor").filter(|c| !c.is_null()).cloned();
+        let next = result.get("nextCursor").filter(|c| !c.is_null()).cloned();
+        if next.is_some() && next == cursor {
+            // The backend keeps returning the same cursor; stop with what we
+            // have instead of reading the same page until the page limit.
+            note_list_failed(tap, conn, true, method, started, pages);
+            break;
+        }
+        cursor = next;
         if cursor.is_none() || out.len() >= MAX_LIST_ITEMS {
             break;
         }
@@ -82,10 +135,11 @@ pub(super) async fn list_paged(
 /// A list the backend may not implement: JSON-RPC errors mean empty.
 pub(super) async fn list_optional(
     conn: &Conn,
+    tap: &DiagTap,
     method: &str,
     key: &str,
 ) -> Result<Vec<Value>, CallError> {
-    match list_paged(conn, method, key).await {
+    match list_paged(conn, tap, method, key).await {
         Ok(v) => Ok(v),
         Err(ListError::Rpc(_)) => Ok(Vec::new()),
         Err(ListError::Call(e)) => Err(e),
@@ -93,14 +147,14 @@ pub(super) async fn list_optional(
 }
 
 /// Lists everything a backend offers, per its advertised capabilities.
-pub(super) async fn list_all(conn: &Conn) -> Result<CatalogEntry, CallError> {
+pub(super) async fn list_all(conn: &Conn, tap: &DiagTap) -> Result<CatalogEntry, CallError> {
     let init = conn.init_result();
     let caps = init
         .get("capabilities")
         .cloned()
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
-    let tools = match list_paged(conn, "tools/list", "tools").await {
+    let tools = match list_paged(conn, tap, "tools/list", "tools").await {
         Ok(v) => v,
         Err(ListError::Rpc(_)) if caps.get("tools").is_none() => Vec::new(),
         Err(ListError::Rpc(e)) => {
@@ -109,14 +163,14 @@ pub(super) async fn list_all(conn: &Conn) -> Result<CatalogEntry, CallError> {
         Err(ListError::Call(e)) => return Err(e),
     };
     let prompts = if caps.get("prompts").is_some() {
-        list_optional(conn, "prompts/list", "prompts").await?
+        list_optional(conn, tap, "prompts/list", "prompts").await?
     } else {
         Vec::new()
     };
     let (resources, resource_templates) = if caps.get("resources").is_some() {
         (
-            list_optional(conn, "resources/list", "resources").await?,
-            list_optional(conn, "resources/templates/list", "resourceTemplates").await?,
+            list_optional(conn, tap, "resources/list", "resources").await?,
+            list_optional(conn, tap, "resources/templates/list", "resourceTemplates").await?,
         )
     } else {
         (Vec::new(), Vec::new())
@@ -208,9 +262,10 @@ impl Router {
         let (ckey, listed) = match conn {
             Some((inst_key, c)) => {
                 lock(&server.listed).insert(inst_key.clone(), c.generation());
+                let tap = self.tap_for(&server.name, &inst_key);
                 (
                     server.catalog_key_of(&inst_key),
-                    list_all(&c).await.map_err(|e| e.to_string()),
+                    list_all(&c, &tap).await.map_err(|e| e.to_string()),
                 )
             }
             None if allow_probe => (None, self.probe_list(server).await),
@@ -240,13 +295,17 @@ impl Router {
             Arc::new(NoEvents),
             self.tuning,
         );
+        self.attach_diag(&server.name, &inst);
         let id = self.next_probe.fetch_add(1, Ordering::Relaxed);
         lock(&self.probes).insert(id, inst.clone());
         self.probe_count.fetch_add(1, Ordering::Relaxed);
         tracing::info!(server = %server.name, "probing backend for its catalog");
         let res = async {
             let guard = inst.acquire().await.map_err(|e| e.to_string())?;
-            let r = list_all(guard.conn()).await.map_err(|e| e.to_string());
+            let tap = inst.tap();
+            let r = list_all(guard.conn(), &tap)
+                .await
+                .map_err(|e| e.to_string());
             drop(guard);
             r
         }
@@ -437,7 +496,10 @@ impl Router {
         }
         let guard = server.instance.acquire().await.map_err(|e| e.to_string())?;
         lock(&server.listed).insert(String::new(), guard.conn().generation());
-        let entry = list_all(guard.conn()).await.map_err(|e| e.to_string())?;
+        let tap = guard.instance().tap();
+        let entry = list_all(guard.conn(), &tap)
+            .await
+            .map_err(|e| e.to_string())?;
         drop(guard);
         Ok(self.apply_entry(server, None, entry).1)
     }

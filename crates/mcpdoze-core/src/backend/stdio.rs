@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ use tokio::time::Instant;
 
 use super::jsonrpc::{self, Kind};
 use super::{handle_server_request, BackendEvents, BackendSpec, ClientSide, Reply};
+use crate::diag::{BackendView, DiagTap, Dir, ExitView, FrameType, IdType, Phase, StderrView};
 use crate::proctree::{resolve_command, ExitInfo, ProcessTree, TreeMemory};
 
 /// Largest stdout line accepted from a backend.
@@ -140,22 +141,250 @@ impl WireStats {
     }
 }
 
-/// Ring buffer of the most recent stderr lines of a backend.
+/// One stderr line with its sequence number and arrival time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StderrEntry {
+    /// 1-based number of the line since the ring was created.
+    pub seq: u64,
+    /// Arrival time (Unix milliseconds).
+    pub ts_ms: u64,
+    /// The line.
+    pub line: String,
+}
+
 #[derive(Debug, Default)]
-pub struct StderrRing(Mutex<VecDeque<String>>);
+struct StderrInner {
+    q: VecDeque<StderrEntry>,
+    total: u64,
+}
+
+/// Ring buffer of the most recent stderr lines of a backend. Entries carry
+/// a sequence number and a timestamp; the count of every line ever seen
+/// survives eviction.
+#[derive(Debug, Default)]
+pub struct StderrRing(Mutex<StderrInner>);
 
 impl StderrRing {
     fn push(&self, line: String) {
-        let mut q = lock(&self.0);
-        if q.len() == STDERR_LINES {
-            q.pop_front();
+        let mut g = lock(&self.0);
+        if g.q.len() == STDERR_LINES {
+            g.q.pop_front();
         }
-        q.push_back(line);
+        g.total += 1;
+        let seq = g.total;
+        g.q.push_back(StderrEntry {
+            seq,
+            ts_ms: crate::stats::now_ms(),
+            line,
+        });
     }
 
     /// Snapshot of the buffered lines, oldest first.
     pub fn lines(&self) -> Vec<String> {
-        lock(&self.0).iter().cloned().collect()
+        lock(&self.0).q.iter().map(|e| e.line.clone()).collect()
+    }
+
+    /// Snapshot of the buffered entries, oldest first.
+    pub fn entries(&self) -> Vec<StderrEntry> {
+        lock(&self.0).q.iter().cloned().collect()
+    }
+
+    /// Lines written since the ring was created, and the buffered lines
+    /// (oldest first).
+    pub fn snapshot(&self) -> (u64, Vec<String>) {
+        let g = lock(&self.0);
+        (g.total, g.q.iter().map(|e| e.line.clone()).collect())
+    }
+}
+
+/// Names of the lifecycle states, indexed like [`InstCounters::state`].
+pub(crate) const STATE_NAMES: [&str; 6] = [
+    "stopped", "starting", "running", "draining", "stopping", "failed",
+];
+
+/// Facts an instance shares with its connections so that diagnostics
+/// records built in the I/O tasks carry the instance's state. Plain
+/// atomics; reading them costs nothing when diagnostics are off.
+#[derive(Debug, Default)]
+pub struct InstCounters {
+    /// Index into [`STATE_NAMES`].
+    pub(crate) state: AtomicU8,
+    /// Consecutive failures counted for backoff.
+    pub(crate) failures: AtomicU64,
+    /// Processes spawned so far.
+    pub(crate) spawns: AtomicU64,
+    /// Calls handed out so far.
+    pub(crate) calls: AtomicU64,
+    /// How far the current start got (see [`Phase`]).
+    pub(crate) phase: AtomicU8,
+}
+
+impl InstCounters {
+    pub(crate) fn state_name(&self) -> &'static str {
+        STATE_NAMES[usize::from(self.state.load(Ordering::Relaxed)).min(STATE_NAMES.len() - 1)]
+    }
+
+    /// Moves the start phase forward (never back).
+    pub(crate) fn reach(&self, p: Phase) {
+        self.phase.fetch_max(phase_idx(p), Ordering::Relaxed);
+    }
+
+    /// Starts a new start attempt.
+    pub(crate) fn reset_phase(&self) {
+        self.phase.store(0, Ordering::Relaxed);
+    }
+
+    /// The phase reached so far.
+    pub(crate) fn phase(&self) -> Phase {
+        match self.phase.load(Ordering::Relaxed) {
+            0 => Phase::Spawned,
+            1 => Phase::InitSent,
+            2 => Phase::StdoutSeen,
+            _ => Phase::InitReplied,
+        }
+    }
+}
+
+fn phase_idx(p: Phase) -> u8 {
+    match p {
+        Phase::Spawned => 0,
+        Phase::InitSent => 1,
+        Phase::StdoutSeen => 2,
+        Phase::InitReplied => 3,
+    }
+}
+
+/// The JSON type of a JSON-RPC id.
+pub(crate) fn id_type_of(v: &Value) -> IdType {
+    match v {
+        Value::Number(_) => IdType::Number,
+        Value::String(_) => IdType::String,
+        Value::Null => IdType::Null,
+        _ => IdType::Other,
+    }
+}
+
+#[derive(Debug, Default)]
+struct Handshake {
+    protocol: Option<String>,
+    server_name: Option<String>,
+    server_version: Option<String>,
+    caps: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CrashInfo {
+    incident: String,
+    /// Backend ids that were pending when the connection died.
+    bids: Vec<u64>,
+    /// The last request sent among them.
+    suspect: u64,
+}
+
+/// What a call that died with its backend needs for its `crash_in_flight`
+/// record.
+#[derive(Debug, Clone)]
+pub struct CrashReport {
+    /// Incident id shared by every call lost in the same crash.
+    pub incident: String,
+    /// This was the last request sent before the crash.
+    pub suspect: bool,
+    /// How the process ended (as far as known).
+    pub exit: ExitView,
+}
+
+/// Diagnostics context of one connection, shared with its I/O tasks.
+pub(crate) struct ConnDiag {
+    pub(crate) tap: Arc<DiagTap>,
+    pub(crate) counters: Arc<InstCounters>,
+    stderr: Arc<StderrRing>,
+    generation: u64,
+    started: Instant,
+    pending: Arc<Mutex<PendingMap>>,
+    info: Mutex<Handshake>,
+    crash: Mutex<Option<CrashInfo>>,
+    /// Set when the broker itself stops the process (not a crash).
+    stopping: AtomicBool,
+}
+
+impl ConnDiag {
+    /// Runs `f` with a view of the backend. Call only after checking
+    /// [`DiagTap::enabled`]: it locks and allocates.
+    pub(crate) fn with_view<R>(&self, f: impl FnOnce(&BackendView<'_>) -> R) -> R {
+        let pending = lock(&self.pending).calls.len() as u64;
+        let h = lock(&self.info);
+        let caps: Vec<&str> = h.caps.iter().map(String::as_str).collect();
+        let mut v = BackendView::new(self.counters.state_name(), self.generation);
+        v.uptime_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        v.in_flight = pending;
+        v.pending = pending;
+        v.calls_served = self.counters.calls.load(Ordering::Relaxed);
+        v.restarts = self
+            .counters
+            .spawns
+            .load(Ordering::Relaxed)
+            .saturating_sub(1);
+        v.failures = self.counters.failures.load(Ordering::Relaxed);
+        v.protocol = h.protocol.as_deref();
+        v.server_info = h
+            .server_name
+            .as_deref()
+            .map(|n| (n, h.server_version.as_deref()));
+        v.caps = &caps;
+        f(&v)
+    }
+
+    fn with_stderr<R>(&self, f: impl FnOnce(&StderrView<'_>) -> R) -> R {
+        let (total, lines) = self.stderr.snapshot();
+        f(&StderrView {
+            total,
+            lines: &lines,
+        })
+    }
+
+    fn frame(&self, dir: Dir, ftype: FrameType, method: &str, bid: u64, bytes: usize) {
+        self.tap.on_frame(dir, ftype, method, bid, bytes);
+    }
+
+    fn noise(&self, line: &[u8]) {
+        if self.tap.enabled() {
+            self.with_view(|v| self.tap.on_stdout_noise(line, v));
+        }
+    }
+
+    fn oversize(&self, consumed: u64) {
+        if self.tap.enabled() {
+            self.with_view(|v| self.tap.on_frame_oversize(consumed, v));
+        }
+    }
+
+    fn invalid(&self, bytes: usize) {
+        if self.tap.enabled() {
+            self.with_view(|v| self.tap.on_frame_invalid(bytes, v));
+        }
+    }
+
+    fn id_mismatch(&self, ty: IdType) {
+        if self.tap.enabled() {
+            self.with_view(|v| self.tap.on_id_type_mismatch(ty, v));
+        }
+    }
+
+    fn late(&self, bid: u64) {
+        if self.tap.enabled() {
+            self.with_view(|v| self.tap.on_late_response(bid, v));
+        }
+    }
+
+    fn init_error(&self, returned: Option<&str>, rpc: Option<(i64, &str)>) {
+        if self.tap.enabled() {
+            self.with_view(|v| {
+                self.with_stderr(|s| {
+                    self.tap
+                        .on_init_error(BACKEND_PROTOCOL_VERSION, returned, rpc, v, Some(s));
+                });
+            });
+        }
     }
 }
 
@@ -174,6 +403,7 @@ pub struct StdioConn {
     wire: Arc<WireStats>,
     exit: watch::Receiver<Option<ExitInfo>>,
     protocol: Mutex<Option<String>>,
+    diag: Arc<ConnDiag>,
 }
 
 impl std::fmt::Debug for StdioConn {
@@ -193,6 +423,8 @@ impl StdioConn {
         spec: &BackendSpec,
         events: Arc<dyn BackendEvents>,
         stderr: Arc<StderrRing>,
+        tap: Arc<DiagTap>,
+        counters: Arc<InstCounters>,
     ) -> io::Result<Self> {
         let mut cmd = resolve_command(&spec.command, &spec.args)?;
         // Never hand the broker token to a backend through inheritance;
@@ -215,6 +447,17 @@ impl StdioConn {
         let pending = Arc::new(Mutex::new(PendingMap::default()));
         let wire = Arc::new(WireStats::default());
         let (exit_tx, exit) = watch::channel(None);
+        let diag = Arc::new(ConnDiag {
+            tap,
+            counters,
+            stderr: stderr.clone(),
+            generation,
+            started: Instant::now(),
+            pending: pending.clone(),
+            info: Mutex::new(Handshake::default()),
+            crash: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+        });
 
         tokio::spawn(write_loop(stdio.stdin, rx));
         tokio::spawn(read_loop(ReadCtx {
@@ -226,6 +469,7 @@ impl StdioConn {
             closed: closed_tx.clone(),
             client: spec.client.clone(),
             wire: wire.clone(),
+            diag: diag.clone(),
         }));
         let info = tree.exited_info();
         tokio::spawn(async move {
@@ -239,6 +483,7 @@ impl StdioConn {
             tree.exited(),
             pending.clone(),
             closed_tx,
+            diag.clone(),
         ));
         tokio::spawn(stderr_loop(BufReader::new(stdio.stderr), stderr));
         tracing::debug!(server, pid, "backend spawned");
@@ -256,6 +501,7 @@ impl StdioConn {
             wire,
             exit,
             protocol: Mutex::new(None),
+            diag,
         })
     }
 
@@ -269,11 +515,19 @@ impl StdioConn {
             "capabilities": self.client.capabilities(),
             "clientInfo": {"name": "mcpdoze", "version": env!("CARGO_PKG_VERSION")},
         });
+        self.diag.counters.reach(Phase::InitSent);
         let resp = self
             .call("initialize", params, CallMeta::default())
             .await
             .map_err(|e| e.to_string())?;
+        self.diag.counters.reach(Phase::InitReplied);
         let Some(result) = resp.get("result").cloned() else {
+            if self.diag.tap.enabled() {
+                let err = resp.get("error");
+                let code = err.and_then(|e| e["code"].as_i64()).unwrap_or(0);
+                let msg = err.and_then(|e| e["message"].as_str()).unwrap_or("");
+                self.diag.init_error(None, Some((code, msg)));
+            }
             return Err(format!(
                 "initialize failed: {}",
                 resp.get("error").cloned().unwrap_or(Value::Null)
@@ -288,6 +542,24 @@ impl StdioConn {
             .and_then(Value::as_str)
             .map(|v| v.chars().take(64).collect());
         *lock(&self.init) = result.clone();
+        {
+            let mut h = lock(&self.diag.info);
+            h.protocol = lock(&self.protocol).clone();
+            h.server_name = result["serverInfo"]["name"]
+                .as_str()
+                .map(|n| n.chars().take(64).collect());
+            h.server_version = result["serverInfo"]["version"]
+                .as_str()
+                .map(|n| n.chars().take(64).collect());
+            h.caps = result["capabilities"]
+                .as_object()
+                .map(|o| o.keys().take(32).cloned().collect())
+                .unwrap_or_default();
+        }
+        if self.protocol_mismatch() {
+            let returned = self.protocol_version();
+            self.diag.init_error(returned.as_deref(), None);
+        }
         Ok(result)
     }
 
@@ -365,6 +637,25 @@ impl StdioConn {
             .unwrap_or_default()
     }
 
+    /// For a call (backend id `bid`) that failed with [`CallError::Closed`]:
+    /// the crash it was lost in, when the connection died on its own while
+    /// it was pending. Waits briefly for the exit status.
+    pub(crate) async fn crash_for(&self, bid: u64) -> Option<CrashReport> {
+        let c = lock(&self.diag.crash).clone()?;
+        if !c.bids.contains(&bid) {
+            return None;
+        }
+        let exit = self.exit_info_wait(EXIT_DRAIN * 3).await;
+        Some(CrashReport {
+            incident: c.incident,
+            suspect: c.suspect == bid,
+            exit: ExitView {
+                code: exit.and_then(|e| e.code),
+                signal: exit.and_then(|e| e.signal),
+            },
+        })
+    }
+
     /// Number of calls awaiting a response.
     pub fn pending_len(&self) -> usize {
         lock(&self.pending).calls.len()
@@ -391,6 +682,8 @@ impl StdioConn {
         let sender = self.sender()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let line = jsonrpc::request(id, method, params).to_string();
+        self.diag
+            .frame(Dir::Out, FrameType::Request, method, id, line.len());
         let (tx, rx) = oneshot::channel();
         {
             let mut p = lock(&self.pending);
@@ -420,6 +713,8 @@ impl StdioConn {
     /// Sends a notification.
     pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<(), CallError> {
         let line = jsonrpc::notification(method, params).to_string();
+        self.diag
+            .frame(Dir::Out, FrameType::Notification, method, 0, line.len());
         self.sender()?
             .send(line)
             .await
@@ -438,6 +733,13 @@ impl StdioConn {
             json!({"requestId": id, "reason": reason}),
         )
         .to_string();
+        self.diag.frame(
+            Dir::Out,
+            FrameType::Notification,
+            "notifications/cancelled",
+            id,
+            line.len(),
+        );
         if let Err(mpsc::error::TrySendError::Full(line)) = sender.try_send(line) {
             if let Ok(h) = tokio::runtime::Handle::try_current() {
                 h.spawn(async move {
@@ -450,6 +752,7 @@ impl StdioConn {
     /// Stops the backend: closes stdin, waits up to `grace`, then kills the
     /// whole process tree. Idempotent.
     pub(crate) async fn shutdown(&self, grace: Duration) {
+        self.diag.stopping.store(true, Ordering::Relaxed);
         lock(&self.tx).take();
         let tree = lock(&self.tree).take();
         if let Some(mut tree) = tree {
@@ -457,7 +760,7 @@ impl StdioConn {
                 tracing::warn!(pid = self.pid, error = %e, "backend tree did not terminate");
             }
         }
-        fail_all(&self.pending);
+        fail_all(&self.pending, None);
     }
 }
 
@@ -493,13 +796,26 @@ fn deliver_response(pending: &Mutex<PendingMap>, mut msg: Value) -> bool {
     true
 }
 
-fn fail_all(pending: &Mutex<PendingMap>) {
-    let drained: Vec<Pending> = {
+/// Fails every pending call and closes the map. With `crash` (the
+/// connection died on its own) and diagnostics on, the lost calls are
+/// recorded first so each can report its `crash_in_flight`.
+fn fail_all(pending: &Mutex<PendingMap>, crash: Option<&ConnDiag>) {
+    let drained: Vec<(u64, Pending)> = {
         let mut p = lock(pending);
         p.closed = true;
-        p.calls.drain().map(|(_, v)| v).collect()
+        p.calls.drain().collect()
     };
-    for call in drained {
+    if let Some(d) = crash {
+        if !drained.is_empty() && d.tap.enabled() && !d.stopping.load(Ordering::Relaxed) {
+            let bids: Vec<u64> = drained.iter().map(|(b, _)| *b).collect();
+            *lock(&d.crash) = Some(CrashInfo {
+                incident: d.tap.new_incident(d.generation),
+                suspect: bids.iter().copied().max().unwrap_or(0),
+                bids,
+            });
+        }
+    }
+    for (_, call) in drained {
         let _ = call.tx.send(Err(CallError::Closed));
     }
 }
@@ -513,6 +829,7 @@ async fn exit_watch(
     exited: impl std::future::Future<Output = ()>,
     pending: Arc<Mutex<PendingMap>>,
     closed: Arc<watch::Sender<bool>>,
+    diag: Arc<ConnDiag>,
 ) {
     let mut rx = closed.subscribe();
     tokio::select! {
@@ -526,7 +843,7 @@ async fn exit_watch(
         return;
     }
     tracing::debug!(server, pid, "backend root process exited");
-    fail_all(&pending);
+    fail_all(&pending, Some(&diag));
     let _ = closed.send(true);
 }
 
@@ -550,8 +867,8 @@ async fn write_loop(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receive
 pub(crate) enum Frame {
     /// A complete line (without the newline) is in the buffer.
     Line,
-    /// The line exceeded the limit and was discarded.
-    TooLong,
+    /// The line exceeded the limit and was discarded (bytes consumed).
+    TooLong(u64),
     /// End of stream.
     Eof,
 }
@@ -566,12 +883,13 @@ pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(
     buf.clear();
     let mut overflow = false;
     let mut any = false;
+    let mut consumed: u64 = 0;
     loop {
         let avail = r.fill_buf().await?;
         if avail.is_empty() {
             return Ok(match (any, overflow) {
                 (false, _) => Frame::Eof,
-                (true, true) => Frame::TooLong,
+                (true, true) => Frame::TooLong(consumed),
                 (true, false) => Frame::Line,
             });
         }
@@ -588,13 +906,14 @@ pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(
                 buf.extend_from_slice(chunk);
             }
         }
+        consumed += used as u64;
         r.consume(used);
         if done {
             if buf.last() == Some(&b'\r') {
                 buf.pop();
             }
             return Ok(if overflow {
-                Frame::TooLong
+                Frame::TooLong(consumed)
             } else {
                 Frame::Line
             });
@@ -611,15 +930,18 @@ struct ReadCtx {
     closed: Arc<watch::Sender<bool>>,
     client: ClientSide,
     wire: Arc<WireStats>,
+    diag: Arc<ConnDiag>,
 }
 
 async fn read_loop(mut ctx: ReadCtx) {
     let mut buf = Vec::new();
     loop {
         match read_frame(&mut ctx.stdout, &mut buf, MAX_LINE).await {
-            Ok(Frame::Line) => {}
-            Ok(Frame::TooLong) => {
+            Ok(Frame::Line) => ctx.diag.counters.reach(Phase::StdoutSeen),
+            Ok(Frame::TooLong(consumed)) => {
+                ctx.diag.counters.reach(Phase::StdoutSeen);
                 ctx.wire.oversize.fetch_add(1, Ordering::Relaxed);
+                ctx.diag.oversize(consumed);
                 tracing::warn!(server = %ctx.server, "backend line over 16 MiB dropped");
                 // The dropped line may have been a response; which call it
                 // answered is unknowable, so fail the pending ones rather
@@ -638,33 +960,63 @@ async fn read_loop(mut ctx: ReadCtx) {
             continue;
         }
         match serde_json::from_slice::<Value>(&buf) {
-            Ok(msg) => dispatch(&ctx, msg),
+            Ok(msg) => dispatch(&ctx, msg, buf.len()),
             Err(_) => {
                 ctx.wire.non_json.fetch_add(1, Ordering::Relaxed);
+                ctx.diag.noise(&buf);
             }
         }
     }
-    fail_all(&ctx.pending);
+    fail_all(&ctx.pending, Some(&ctx.diag));
     let _ = ctx.closed.send(true);
     tracing::debug!(server = %ctx.server, "backend stdout closed");
 }
 
-fn dispatch(ctx: &ReadCtx, msg: Value) {
+fn dispatch(ctx: &ReadCtx, msg: Value, len: usize) {
     match jsonrpc::kind(&msg) {
         Kind::Response => {
-            if msg.get("id").and_then(response_id).is_none() {
+            let ftype = if msg.get("error").is_some() {
+                FrameType::Error
+            } else {
+                FrameType::Response
+            };
+            let bid = msg.get("id").and_then(response_id);
+            ctx.diag.frame(Dir::In, ftype, "", bid.unwrap_or(0), len);
+            let Some(bid) = bid else {
                 ctx.wire.foreign_ids.fetch_add(1, Ordering::Relaxed);
+                ctx.diag.id_mismatch(id_type_of(&msg["id"]));
                 tracing::debug!(server = %ctx.server, "response with foreign id dropped");
-            } else if !deliver_response(&ctx.pending, msg) {
+                return;
+            };
+            // The broker sends numeric ids; a string echo is a mismatch.
+            if msg["id"].is_string() {
+                ctx.diag.id_mismatch(IdType::String);
+            }
+            if !deliver_response(&ctx.pending, msg) {
+                ctx.diag.late(bid);
                 tracing::debug!(server = %ctx.server, "late or unknown response dropped");
             }
         }
         Kind::Notification => {
+            ctx.diag.frame(
+                Dir::In,
+                FrameType::Notification,
+                msg["method"].as_str().unwrap_or(""),
+                0,
+                len,
+            );
             let sessions = lock(&ctx.pending).sessions();
             ctx.events
                 .notification_from(&ctx.server, &ctx.client.scope_key, msg, sessions);
         }
         Kind::Request => {
+            ctx.diag.frame(
+                Dir::In,
+                FrameType::Request,
+                msg["method"].as_str().unwrap_or(""),
+                0,
+                len,
+            );
             let sessions = lock(&ctx.pending).sessions();
             let tx = ctx.tx.clone();
             let reply = Reply::new(msg["id"].clone(), move |resp: Value| {
@@ -689,6 +1041,7 @@ fn dispatch(ctx: &ReadCtx, msg: Value) {
         }
         Kind::Invalid => {
             ctx.wire.invalid.fetch_add(1, Ordering::Relaxed);
+            ctx.diag.invalid(len);
         }
     }
 }
@@ -698,7 +1051,7 @@ async fn stderr_loop(mut r: BufReader<tokio::process::ChildStderr>, ring: Arc<St
     loop {
         match read_frame(&mut r, &mut buf, MAX_STDERR_LINE).await {
             Ok(Frame::Line) => ring.push(String::from_utf8_lossy(&buf).into_owned()),
-            Ok(Frame::TooLong) => ring.push("<line too long>".into()),
+            Ok(Frame::TooLong(_)) => ring.push("<line too long>".into()),
             Ok(Frame::Eof) | Err(_) => break,
         }
     }
@@ -728,7 +1081,7 @@ mod tests {
             got,
             vec![
                 (Frame::Line, b"ab".to_vec()),
-                (Frame::TooLong, vec![]),
+                (Frame::TooLong(11), vec![]),
                 (Frame::Line, b"xyz".to_vec()),
             ]
         );

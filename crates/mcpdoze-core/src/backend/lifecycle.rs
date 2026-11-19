@@ -25,17 +25,18 @@
 //! durations instead (auto-advance would fire timeouts while waiting on
 //! process I/O).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 
 use super::http::HttpConn;
-use super::stdio::{lock, StderrRing, StdioConn, EXIT_DRAIN};
-use crate::proctree::ExitInfo;
+use super::stdio::{lock, InstCounters, StderrRing, StdioConn, EXIT_DRAIN, STATE_NAMES};
 use super::{BackendEvents, BackendSpec, CallError, Conn, SubscriptionPolicy};
+use crate::diag::{BackendView, DiagTap, ExitView, StderrView};
+use crate::proctree::ExitInfo;
 
 /// Timing knobs of the lifecycle; defaults follow the development plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +150,24 @@ enum State {
     Failed { until: Instant, error: String },
 }
 
+impl StateKind {
+    /// Lower-case state name (as written in diagnostics records).
+    pub fn name(self) -> &'static str {
+        STATE_NAMES[self.idx()]
+    }
+
+    fn idx(self) -> usize {
+        match self {
+            StateKind::Stopped => 0,
+            StateKind::Starting => 1,
+            StateKind::Running => 2,
+            StateKind::Draining => 3,
+            StateKind::Stopping => 4,
+            StateKind::Failed => 5,
+        }
+    }
+}
+
 impl State {
     fn kind(&self) -> StateKind {
         match self {
@@ -195,8 +214,10 @@ pub struct Instance {
     events: Arc<dyn BackendEvents>,
     stderr: Arc<StderrRing>,
     inner: Mutex<Inner>,
-    spawns: AtomicU64,
-    calls: AtomicU64,
+    /// Spawn and call counts, state and start phase, shared with the
+    /// connections for diagnostics views.
+    counters: Arc<InstCounters>,
+    tap: RwLock<Arc<DiagTap>>,
     spawn_hooks: Mutex<Vec<SpawnHook>>,
     lifecycle_hooks: Mutex<Vec<LifecycleHook>>,
 }
@@ -249,10 +270,93 @@ impl Instance {
                 pins: 0,
                 drain_reason: UnloadReason::Stop,
             }),
-            spawns: AtomicU64::new(0),
-            calls: AtomicU64::new(0),
+            counters: Arc::new(InstCounters::default()),
+            tap: RwLock::new(DiagTap::disabled()),
             spawn_hooks: Mutex::new(Vec::new()),
             lifecycle_hooks: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Sets the diagnostics tap of this instance (the router makes one per
+    /// instance; the default is a tap that is always off). Connections
+    /// started afterwards use it.
+    pub fn set_tap(&self, tap: Arc<DiagTap>) {
+        *self.tap.write().unwrap_or_else(|e| e.into_inner()) = tap;
+    }
+
+    /// The diagnostics tap.
+    pub fn tap(&self) -> Arc<DiagTap> {
+        self.tap.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn tap_ref(&self) -> std::sync::RwLockReadGuard<'_, Arc<DiagTap>> {
+        self.tap.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records a state change in the shared counters and the tap's
+    /// transition ring. Call right after assigning `g.state`.
+    fn trans(&self, g: &Inner, reason: &'static str) {
+        let kind = g.state.kind();
+        self.counters
+            .state
+            .store(u8::try_from(kind.idx()).unwrap_or(0), Ordering::Relaxed);
+        self.counters
+            .failures
+            .store(u64::from(g.failures), Ordering::Relaxed);
+        self.tap_ref()
+            .on_transition(kind.name(), reason, g.in_flight);
+    }
+
+    fn view_locked(&self, g: &Inner) -> BackendView<'static> {
+        let mut v = BackendView::new(g.state.kind().name(), g.generation);
+        v.in_flight = g.in_flight as u64;
+        v.calls_served = self.calls();
+        v.restarts = self.spawn_count().saturating_sub(1);
+        v.failures = u64::from(g.failures);
+        v
+    }
+
+    /// Runs `f` with a view of this instance's backend state, handshake
+    /// facts included when it is running. Allocates: call it only when the
+    /// tap is enabled.
+    pub fn with_view<R>(&self, f: impl FnOnce(&BackendView<'_>) -> R) -> R {
+        let conn = self.running_conn();
+        self.view_for(conn.as_deref(), None, f)
+    }
+
+    fn view_for<R>(
+        &self,
+        conn: Option<&Conn>,
+        state: Option<&'static str>,
+        f: impl FnOnce(&BackendView<'_>) -> R,
+    ) -> R {
+        let mut base = self.view_locked(&lock(&self.inner));
+        if let Some(s) = state {
+            base.state = s;
+        }
+        let Some(conn) = conn else { return f(&base) };
+        let init = conn.init_result();
+        let caps: Vec<&str> = init["capabilities"]
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut v = base;
+        v.uptime_ms = u64::try_from(conn.started().elapsed().as_millis()).unwrap_or(u64::MAX);
+        v.pending = conn.pending_len() as u64;
+        v.protocol = init["protocolVersion"].as_str();
+        v.server_info = init["serverInfo"]["name"]
+            .as_str()
+            .map(|n| (n, init["serverInfo"]["version"].as_str()));
+        v.caps = &caps;
+        f(&v)
+    }
+
+    /// Runs `f` with the stderr tail (call only when the tap is enabled).
+    pub fn with_stderr<R>(&self, f: impl FnOnce(&StderrView<'_>) -> R) -> R {
+        let (total, lines) = self.stderr.snapshot();
+        f(&StderrView {
+            total,
+            lines: &lines,
         })
     }
 
@@ -349,7 +453,7 @@ impl Instance {
 
     /// Number of processes spawned so far.
     pub fn spawn_count(&self) -> u64 {
-        self.spawns.load(Ordering::Relaxed)
+        self.counters.spawns.load(Ordering::Relaxed)
     }
 
     /// Last lines of backend stderr (across restarts).
@@ -359,7 +463,7 @@ impl Instance {
 
     /// Calls handed a [`CallGuard`] so far.
     pub fn calls(&self) -> u64 {
-        self.calls.load(Ordering::Relaxed)
+        self.counters.calls.load(Ordering::Relaxed)
     }
 
     /// The most recent start failure or crash, if any.
@@ -443,7 +547,7 @@ impl Instance {
                         let conn = conn.clone();
                         g.in_flight += 1;
                         g.idle_deadline = None;
-                        self.calls.fetch_add(1, Ordering::Relaxed);
+                        self.counters.calls.fetch_add(1, Ordering::Relaxed);
                         return Ok(CallGuard {
                             inst: self.clone(),
                             conn,
@@ -452,6 +556,10 @@ impl Instance {
                     State::Failed { until, error } => {
                         let now = Instant::now();
                         if now < *until {
+                            let tap = self.tap_ref();
+                            if tap.enabled() {
+                                tap.on_backoff_rejected(&self.view_locked(g));
+                            }
                             return Err(CallError::Unavailable(format!(
                                 "{error}; retry in {} ms",
                                 (*until - now).as_millis()
@@ -463,7 +571,15 @@ impl Instance {
                     s => Next::Wait(s.done().cloned().expect("transitional state")),
                 };
                 match next {
-                    Next::Wait(rx) => rx,
+                    Next::Wait(rx) => {
+                        if matches!(g.state, State::Draining { .. } | State::Stopping { .. }) {
+                            let tap = self.tap_ref();
+                            if tap.enabled() {
+                                tap.on_race_unload("acquire", &self.view_locked(g));
+                            }
+                        }
+                        rx
+                    }
                     // Same critical section as the decision: one start only.
                     Next::Start => self.begin_start(g),
                 }
@@ -506,6 +622,7 @@ impl Instance {
                 until: Instant::now(),
                 error: "lifecycle task ended unexpectedly".into(),
             };
+            self.trans(g, "abandoned");
         }
     }
 
@@ -514,43 +631,78 @@ impl Instance {
         let generation = g.generation;
         let (tx, rx) = watch::channel(false);
         g.state = State::Starting { done: rx.clone() };
-        self.spawns.fetch_add(1, Ordering::Relaxed);
+        self.trans(g, "call");
+        self.counters.spawns.fetch_add(1, Ordering::Relaxed);
+        self.counters.reset_phase();
         tokio::spawn(self.clone().run_start(generation, tx));
         rx
     }
 
     async fn run_start(self: Arc<Self>, generation: u64, done: watch::Sender<bool>) {
         let t0 = Instant::now();
+        let tap = self.tap();
         let start = async {
             let conn = if self.spec.http.is_some() {
-                Conn::Http(HttpConn::new(
+                let c = HttpConn::new(&self.name, generation, &self.spec, self.events.clone())?;
+                c.set_diag(tap.clone());
+                Conn::Http(c)
+            } else {
+                match StdioConn::spawn(
                     &self.name,
                     generation,
                     &self.spec,
                     self.events.clone(),
-                )?)
-            } else {
-                Conn::Stdio(Box::new(
-                    StdioConn::spawn(
-                        &self.name,
-                        generation,
-                        &self.spec,
-                        self.events.clone(),
-                        self.stderr.clone(),
-                    )
-                    .map_err(|e| format!("spawn failed: {e}"))?,
-                ))
+                    self.stderr.clone(),
+                    tap.clone(),
+                    self.counters.clone(),
+                ) {
+                    Ok(c) => Conn::Stdio(Box::new(c)),
+                    Err(e) => {
+                        if tap.enabled() {
+                            let cmd = self.spec.command.to_ascii_lowercase();
+                            let shim = cmd.ends_with(".cmd") || cmd.ends_with(".bat");
+                            self.view_for(None, Some("starting"), |v| {
+                                tap.on_spawn_failed(e.kind(), shim, v);
+                            });
+                        }
+                        return Err(format!("spawn failed: {e}"));
+                    }
+                }
             };
             let conn = Arc::new(conn);
-            conn.initialize().await?;
+            if let Err(e) = conn.initialize().await {
+                // The process went away before answering: an exit, not a
+                // timeout or a protocol error.
+                if let Conn::Stdio(c) = &*conn {
+                    if tap.enabled() && *c.closed().borrow() {
+                        let exit = c.exit_info_wait(EXIT_DRAIN * 3).await;
+                        let ev = ExitView {
+                            code: exit.and_then(|x| x.code),
+                            signal: exit.and_then(|x| x.signal),
+                        };
+                        self.view_for(Some(&conn), Some("starting"), |v| {
+                            self.with_stderr(|s| tap.on_exit(ev, v, Some(s)));
+                        });
+                    }
+                }
+                return Err(e);
+            }
             Ok::<_, String>(conn)
         };
         let res = match tokio::time::timeout(self.spec.start_timeout, start).await {
             Ok(r) => r,
-            Err(_) => Err(format!(
-                "start timed out after {} ms",
-                self.spec.start_timeout.as_millis()
-            )),
+            Err(_) => {
+                if tap.enabled() && self.spec.http.is_none() {
+                    let phase = self.counters.phase();
+                    self.view_for(None, Some("starting"), |v| {
+                        self.with_stderr(|s| tap.on_init_timeout(phase, v, Some(s)));
+                    });
+                }
+                Err(format!(
+                    "start timed out after {} ms",
+                    self.spec.start_timeout.as_millis()
+                ))
+            }
         };
         let mut spawned = None;
         let leftover = {
@@ -563,6 +715,7 @@ impl Instance {
                         conn: conn.clone(),
                         idle: idle.clone(),
                     };
+                    self.trans(g, "started");
                     let weak = Arc::downgrade(&self);
                     tokio::spawn(monitor(weak.clone(), generation, conn.closed()));
                     tokio::spawn(idle_task(weak, generation, idle.clone()));
@@ -585,6 +738,11 @@ impl Instance {
                             until: Instant::now() + wait,
                             error,
                         };
+                        self.trans(g, "start_failed");
+                    } else {
+                        self.counters
+                            .failures
+                            .store(u64::from(g.failures), Ordering::Relaxed);
                     }
                     None
                 }
@@ -614,6 +772,7 @@ impl Instance {
         idle.notify_one();
         let (tx, rx) = watch::channel(false);
         g.state = State::Draining { done: rx.clone() };
+        self.trans(g, reason.as_str());
         g.idle_deadline = None;
         g.drain = false;
         tokio::spawn(self.clone().run_stop(g.generation, conn, tx, reason));
@@ -633,6 +792,7 @@ impl Instance {
             if g.generation == generation {
                 if let State::Draining { done } = &g.state {
                     g.state = State::Stopping { done: done.clone() };
+                    self.trans(g, "stop");
                 }
             }
         }
@@ -645,6 +805,7 @@ impl Instance {
                 if conn.started().elapsed() >= self.tuning.healthy_reset {
                     g.failures = 0;
                 }
+                self.trans(g, "stopped");
             }
         }
         self.emit(LifecycleEvent::Unloaded {
@@ -721,10 +882,23 @@ impl Instance {
                 until: Instant::now() + wait,
                 error,
             };
+            self.trans(g, "crash");
             tracing::warn!(server = %self.name, pid = ?conn.pid(), backoff_ms = wait.as_millis() as u64, "backend crashed");
             eager = self.keeps_alive(g);
             conn
         };
+        {
+            let tap = self.tap();
+            if tap.enabled() {
+                let ev = ExitView {
+                    code: exit.and_then(|x| x.code),
+                    signal: exit.and_then(|x| x.signal),
+                };
+                self.view_for(Some(&conn), Some("running"), |v| {
+                    self.with_stderr(|s| tap.on_exit(ev, v, Some(s)));
+                });
+            }
+        }
         self.emit(LifecycleEvent::Unloaded {
             generation,
             reason: UnloadReason::Crash,
@@ -857,6 +1031,11 @@ impl CallGuard {
     /// The connection this call uses.
     pub fn conn(&self) -> &Arc<Conn> {
         &self.conn
+    }
+
+    /// The instance this call runs on.
+    pub fn instance(&self) -> &Arc<Instance> {
+        &self.inst
     }
 }
 

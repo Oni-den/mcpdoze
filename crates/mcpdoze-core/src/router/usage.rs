@@ -28,6 +28,8 @@ pub(super) struct CallTrace {
     pub(super) backend: Duration,
     /// Instance key ("" for the shared instance).
     pub(super) scope_key: Option<String>,
+    /// Request number shared by the statistics log and diagnostics.
+    pub(super) req: u64,
 }
 
 /// Facts about a call known before it is forwarded.
@@ -211,7 +213,7 @@ impl Router {
             .to_owned(),
             scope: scope_name(server.scope.scope).to_owned(),
             instance: trace.scope_key.as_deref().and_then(instance_tag),
-            req_id: debug.then(|| st.next_request_id()),
+            req_id: debug.then_some(trace.req),
             acquire_ms: debug.then(|| ms(trace.acquire)),
             backend_ms: debug.then(|| ms(trace.backend)),
             session: Some(if session.is_ephemeral() {

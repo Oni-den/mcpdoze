@@ -27,7 +27,7 @@ pub use crate::config::SubscriptionPolicy;
 pub use lifecycle::{
     CallGuard, Instance, LifecycleEvent, LifecycleHook, SpawnHook, StateKind, Tuning, UnloadReason,
 };
-pub use stdio::{CallError, CallMeta, StdioConn, WireCounts};
+pub use stdio::{CallError, CallMeta, CrashReport, StderrEntry, StdioConn, WireCounts};
 
 /// Default per-request timeout for HTTP backends.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -156,6 +156,9 @@ pub struct BackendSpec {
     pub strip_env: BTreeSet<String>,
     /// Idle behaviour while the instance holds resource subscriptions.
     pub subscriptions: SubscriptionPolicy,
+    /// A call with no answer after this long fails with -32000 and is
+    /// recorded as `stalled` (`None`: wait for as long as the agent does).
+    pub call_timeout: Option<Duration>,
 }
 
 /// Variable agents carry the broker token in; never inherited by backends.
@@ -181,6 +184,7 @@ impl BackendSpec {
             client: ClientSide::default(),
             strip_env: BTreeSet::from([TOKEN_ENV_VAR.to_string()]),
             subscriptions: SubscriptionPolicy::default(),
+            call_timeout: None,
         }
     }
 
@@ -247,6 +251,12 @@ impl BackendSpec {
     /// Sets the idle TTL.
     pub fn idle_ttl(mut self, ttl: Duration) -> Self {
         self.idle_ttl = ttl;
+        self
+    }
+
+    /// Sets the per-call timeout (`stalled`).
+    pub fn call_timeout(mut self, t: Duration) -> Self {
+        self.call_timeout = Some(t);
         self
     }
 
@@ -333,6 +343,16 @@ impl Conn {
         match self {
             Conn::Stdio(c) => c.pending_len(),
             Conn::Http(c) => c.pending_len(),
+        }
+    }
+
+    /// For a call (backend id `bid`) that failed with
+    /// [`CallError::Closed`]: the crash it was lost in. Stdio only; waits
+    /// briefly for the process exit status.
+    pub async fn crash_for(&self, bid: u64) -> Option<CrashReport> {
+        match self {
+            Conn::Stdio(c) => c.crash_for(bid).await,
+            Conn::Http(_) => None,
         }
     }
 
@@ -471,6 +491,8 @@ impl Reply {
 pub struct ServerRequest {
     /// Backend server name.
     pub server: String,
+    /// Scope key of the instance that sent it (see [`ClientSide::scope_key`]).
+    pub scope_key: String,
     /// The request as the backend sent it.
     pub msg: Value,
     /// Distinct agent sessions with a call in flight on this connection.
@@ -523,6 +545,7 @@ pub(crate) fn handle_server_request(
         "roots/list" => reply.result(client.roots_result()),
         _ => events.server_request(ServerRequest {
             server: server.to_owned(),
+            scope_key: client.scope_key.clone(),
             msg,
             sessions,
             owner: client.owner.clone(),

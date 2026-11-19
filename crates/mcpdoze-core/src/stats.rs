@@ -635,7 +635,6 @@ pub struct Stats {
     tx: Option<SyncSender<Msg>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     dropped: Arc<AtomicU64>,
-    next_req: AtomicU64,
     dir: PathBuf,
     debug: bool,
     interval: Duration,
@@ -682,7 +681,6 @@ impl Stats {
             tx: Some(tx),
             thread: Mutex::new(Some(thread)),
             dropped,
-            next_req: AtomicU64::new(1),
             dir,
             debug: cfg.debug,
             interval,
@@ -707,11 +705,6 @@ impl Stats {
     /// Events dropped because the queue was full.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
-    }
-
-    /// Next debug request id.
-    pub fn next_request_id(&self) -> u64 {
-        self.next_req.fetch_add(1, Ordering::Relaxed)
     }
 
     fn send(&self, msg: Msg) {

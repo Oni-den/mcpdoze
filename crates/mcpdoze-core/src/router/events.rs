@@ -13,6 +13,7 @@ use super::{Router, Session};
 use crate::backend::jsonrpc;
 use crate::backend::stdio::lock;
 use crate::backend::{BackendEvents, ServerRequest};
+use crate::diag::Unserved;
 
 /// Broker progress token -> (owning session, agent's token).
 #[derive(Default)]
@@ -92,6 +93,23 @@ impl Drop for ProgressRoute {
 }
 
 impl Router {
+    /// Records a backend-to-client request that could not be served.
+    pub(super) fn note_unserved(
+        &self,
+        server: &str,
+        scope_key: &str,
+        method: &str,
+        reason: Unserved,
+    ) {
+        let Some(inst) = self.instance_for_scope(server, scope_key) else {
+            return;
+        };
+        let tap = inst.tap();
+        if tap.enabled() {
+            inst.with_view(|b| tap.on_client_request_unserved(method, reason, b));
+        }
+    }
+
     pub(super) fn deliver_to(&self, sessions: &[String], msg: Value) {
         let targets: Vec<Arc<Session>> = {
             let map = lock(&self.sessions);
@@ -134,6 +152,7 @@ impl Router {
             // 2026-07-28 forbids server-to-client requests on any stream;
             // mapping them to MRTR input requests is not implemented.
             tracing::debug!(server = %req.server, %method, "server request during a 2026-07-28 call declined");
+            self.note_unserved(&req.server, &req.scope_key, &method, Unserved::Unsupported);
             return req.reply.error(
                 jsonrpc::METHOD_NOT_FOUND,
                 format!(
@@ -144,6 +163,7 @@ impl Router {
         }
         let Some(session) = target.as_deref().and_then(|id| self.session(id)) else {
             tracing::debug!(server = %req.server, %method, sessions = req.sessions.len(), "server request not routable");
+            self.note_unserved(&req.server, &req.scope_key, &method, Unserved::NotRouted);
             return req.reply.error(
                 jsonrpc::METHOD_NOT_FOUND,
                 format!(
@@ -153,6 +173,7 @@ impl Router {
             );
         };
         if !session.has_stream() {
+            self.note_unserved(&req.server, &req.scope_key, &method, Unserved::NotRouted);
             return req.reply.error(
                 jsonrpc::METHOD_NOT_FOUND,
                 format!(
@@ -170,10 +191,22 @@ impl Router {
                 .error(jsonrpc::INTERNAL_ERROR, "broker is shutting down");
         };
         let reply = req.reply;
+        let (server, scope_key) = (req.server, req.scope_key);
+        let me = self.me.clone();
         rt.spawn(async move {
             match session.client_request(id, &method, params, limit).await {
                 Ok(resp) => reply.forward(resp),
-                Err(e) => reply.error(jsonrpc::INTERNAL_ERROR, e),
+                Err(e) => {
+                    if let Some(r) = me.upgrade() {
+                        let why = if e.contains("timed out") {
+                            Unserved::TimedOut
+                        } else {
+                            Unserved::NotRouted
+                        };
+                        r.note_unserved(&server, &scope_key, &method, why);
+                    }
+                    reply.error(jsonrpc::INTERNAL_ERROR, e);
+                }
             }
         });
     }

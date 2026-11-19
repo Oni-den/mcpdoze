@@ -302,7 +302,6 @@ fn overflow_drops_and_counts() {
         tx: Some(tx),
         thread: Mutex::new(None),
         dropped: Arc::new(AtomicU64::new(0)),
-        next_req: AtomicU64::new(1),
         dir: PathBuf::new(),
         debug: false,
         interval: Duration::from_secs(60),

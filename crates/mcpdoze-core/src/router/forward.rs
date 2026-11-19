@@ -14,8 +14,11 @@ use super::session::RootsState;
 use super::usage::{CallStart, CallTrace};
 use super::{naming, uri, Router, Server, Session};
 use crate::backend::jsonrpc::{self, Kind};
+use crate::backend::stdio::id_type_of;
 use crate::backend::stdio::lock;
+use crate::backend::Instance;
 use crate::backend::{CallError, CallMeta, Conn, StateKind};
+use crate::diag::{DiagTap, Era as DEra, ExitView, RequestView};
 /// Removes a session's in-flight entry when the call ends.
 pub(super) struct InflightEntry<'a> {
     session: &'a Session,
@@ -45,7 +48,129 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Request facts kept while a call runs, for diagnostics records. Built
+/// only when the instance's tap is enabled. Dropped while still armed (the
+/// agent went away and the call future was dropped) it records
+/// `agent_disconnected`.
+struct CallDiag {
+    tap: Arc<DiagTap>,
+    inst: Arc<Instance>,
+    req: u64,
+    era: DEra,
+    method: String,
+    tool: Option<String>,
+    id_type: crate::diag::IdType,
+    progress: bool,
+    bytes: u64,
+    started: std::time::Instant,
+    acquire_ms: u64,
+    cold_start: bool,
+    arguments: Option<Value>,
+    disconnect: bool,
+}
+
+impl CallDiag {
+    fn view<'a>(&'a self, suspect: bool, schema: Option<&'a Value>) -> RequestView<'a> {
+        let mut v = RequestView::new(self.req, self.era, &self.method);
+        v.tool = self.tool.as_deref();
+        v.id_type = Some(self.id_type);
+        v.progress = self.progress;
+        v.bytes = self.bytes;
+        v.elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        v.acquire_ms = self.acquire_ms;
+        v.cold_start = self.cold_start;
+        v.suspect = suspect;
+        v.arguments = self.arguments.as_ref();
+        v.input_schema = schema;
+        v
+    }
+
+    fn slow(&self) {
+        self.inst
+            .with_view(|b| self.tap.on_slow_call(&self.view(false, None), b));
+    }
+
+    fn stalled(&self) {
+        self.inst.with_view(|b| {
+            self.inst
+                .with_stderr(|s| self.tap.on_stalled(&self.view(false, None), b, Some(s)));
+        });
+    }
+
+    fn cancelled(&self) {
+        self.inst
+            .with_view(|b| self.tap.on_agent_cancelled(&self.view(false, None), b));
+    }
+
+    fn crashed(&self, incident: &str, exit: ExitView, suspect: bool, schema: Option<&Value>) {
+        self.inst.with_view(|b| {
+            self.inst.with_stderr(|s| {
+                self.tap.on_crash_in_flight(
+                    incident,
+                    exit,
+                    &self.view(suspect, schema),
+                    b,
+                    Some(s),
+                );
+            });
+        });
+    }
+
+    /// Records a JSON-RPC error or (with `tool_errors`) an `isError` result.
+    fn answered(&self, resp: &Value, schema: Option<&Value>) {
+        if let Some(e) = resp.get("error").filter(|e| e.is_object()) {
+            let code = e["code"].as_i64().unwrap_or(0);
+            let msg = e["message"].as_str().unwrap_or("");
+            self.inst.with_view(|b| {
+                self.inst.with_stderr(|s| {
+                    self.tap.on_rpc_error(
+                        &self.view(false, schema),
+                        code,
+                        msg,
+                        e.get("data"),
+                        b,
+                        Some(s),
+                    );
+                });
+            });
+        } else if resp["result"]["isError"] == Value::Bool(true) && self.tap.tool_errors() {
+            let msg = resp["result"]["content"]
+                .as_array()
+                .and_then(|c| c.iter().find_map(|b| b["text"].as_str()));
+            self.inst.with_view(|b| {
+                self.inst.with_stderr(|s| {
+                    self.tap
+                        .on_tool_error(&self.view(false, schema), msg, b, Some(s));
+                });
+            });
+        }
+    }
+}
+
+impl Drop for CallDiag {
+    fn drop(&mut self) {
+        if self.disconnect && self.tap.enabled() {
+            self.inst
+                .with_view(|b| self.tap.on_agent_disconnected(&self.view(false, None), b));
+        }
+    }
+}
+
 impl Router {
+    /// The catalog `inputSchema` of `tool` on `server` as this session
+    /// sees it (diagnostics only: cloned on a failure path).
+    fn input_schema(&self, session: &Session, server: &Server, tool: &str) -> Option<Value> {
+        let ckey = self
+            .session_key_now(session)
+            .and_then(|k| server.catalog_key_of(&k));
+        let (entry, _) = self.entry_for(server, ckey.as_deref())?;
+        entry
+            .tools
+            .iter()
+            .find(|t| t["name"] == tool)
+            .and_then(|t| t.get("inputSchema").cloned())
+    }
+
     /// Handles one agent message. Returns the response for requests (and
     /// for invalid messages), `None` for notifications and responses.
     pub async fn handle(&self, session: &Arc<Session>, msg: Value) -> Option<Value> {
@@ -246,7 +371,10 @@ impl Router {
         params: Value,
         progress_token: Option<Value>,
     ) -> Value {
-        let mut trace = CallTrace::default();
+        let mut trace = CallTrace {
+            req: self.next_request_id(),
+            ..CallTrace::default()
+        };
         let logged = self
             .stats()
             .and_then(|st| CallStart::new(method, &params).map(|c| (st, c)));
@@ -303,10 +431,39 @@ impl Router {
             orig_id: id.clone(),
             progress_token,
         };
+        let tap = guard.instance().tap();
+        let mut cd = tap.enabled().then(|| CallDiag {
+            tap: tap.clone(),
+            inst: guard.instance().clone(),
+            req: trace.req,
+            era: match session.era() {
+                super::Era::Legacy => DEra::Legacy,
+                super::Era::Modern => DEra::Modern,
+            },
+            method: method.to_owned(),
+            tool: (method == "tools/call")
+                .then(|| params["name"].as_str().map(str::to_owned))
+                .flatten(),
+            id_type: id_type_of(&id),
+            progress: meta.progress_token.is_some(),
+            bytes: crate::stats::json_len(&params),
+            started: std::time::Instant::now(),
+            acquire_ms: u64::try_from(trace.acquire.as_millis()).unwrap_or(u64::MAX),
+            cold_start: trace.cold_start,
+            arguments: (method == "tools/call")
+                .then(|| params.get("arguments").cloned())
+                .flatten(),
+            disconnect: true,
+        });
         let sending = std::time::Instant::now();
-        let (back_id, rx) = match guard.conn().begin(method, params, meta).await {
+        let (back_id, mut rx) = match guard.conn().begin(method, params, meta).await {
             Ok(x) => x,
-            Err(e) => return jsonrpc::error(id, jsonrpc::BACKEND_UNAVAILABLE, e.to_string()),
+            Err(e) => {
+                if let Some(cd) = &mut cd {
+                    cd.disconnect = false;
+                }
+                return jsonrpc::error(id, jsonrpc::BACKEND_UNAVAILABLE, e.to_string());
+            }
         };
         // Declared after `guard`, so it runs first on drop: the backend hears
         // about the cancellation before the call stops counting as in flight.
@@ -315,21 +472,87 @@ impl Router {
             id: back_id,
             armed: true,
         };
-        let outcome = tokio::select! {
-            r = rx => r.unwrap_or(Err(CallError::Closed)),
-            Ok(()) = &mut cancel_rx => Err(CallError::Cancelled),
+        // The in-flight sweep for `slow_call` (trace level): one timer per
+        // traced call, firing once while the call is still running.
+        let slow = tokio::time::sleep(tap.slow_call_threshold());
+        tokio::pin!(slow);
+        let mut slow_armed = cd.is_some() && tap.level() == crate::diag::Level::Trace;
+        let mut cancel_live = true;
+        let call_timeout = guard.instance().spec().call_timeout;
+        let stall = tokio::time::sleep(call_timeout.unwrap_or(std::time::Duration::from_secs(1)));
+        tokio::pin!(stall);
+        let stall_armed = call_timeout.is_some();
+        let mut stalled = false;
+        let outcome = loop {
+            tokio::select! {
+                r = &mut rx => break r.unwrap_or(Err(CallError::Closed)),
+                c = &mut cancel_rx, if cancel_live => {
+                    cancel_live = false;
+                    if c.is_ok() {
+                        break Err(CallError::Cancelled);
+                    }
+                }
+                () = &mut stall, if stall_armed => {
+                    stalled = true;
+                    break Err(CallError::Unavailable("call timed out".into()));
+                }
+                () = &mut slow, if slow_armed => {
+                    slow_armed = false;
+                    if let Some(cd) = &cd {
+                        cd.slow();
+                    }
+                }
+            }
         };
         trace.backend = sending.elapsed();
+        if let Some(cd) = &mut cd {
+            cd.disconnect = false;
+        }
         match outcome {
             Ok(resp) => {
                 cancel.armed = false;
+                if let Some(cd) = &cd {
+                    let failed = resp.get("error").is_some()
+                        || (resp["result"]["isError"] == Value::Bool(true) && tap.tool_errors());
+                    if failed {
+                        let schema = cd
+                            .tool
+                            .as_deref()
+                            .and_then(|t| self.input_schema(session, server, t));
+                        cd.answered(&resp, schema.as_ref());
+                    }
+                }
                 resp
             }
             Err(CallError::Cancelled) => {
+                if let Some(cd) = &cd {
+                    cd.cancelled();
+                }
                 jsonrpc::error(id, jsonrpc::REQUEST_CANCELLED, "request cancelled")
+            }
+            Err(_) if stalled => {
+                // `cancel` stays armed: the backend is told to give up.
+                if let Some(cd) = &cd {
+                    cd.stalled();
+                }
+                let secs = call_timeout.map_or(0, |t| t.as_secs());
+                jsonrpc::error(
+                    id,
+                    jsonrpc::BACKEND_UNAVAILABLE,
+                    format!("backend did not answer within {secs} s (call_timeout)"),
+                )
             }
             Err(e) => {
                 cancel.armed = false;
+                if let (Some(cd), CallError::Closed) = (&cd, &e) {
+                    if let Some(c) = guard.conn().crash_for(back_id).await {
+                        let schema = cd
+                            .tool
+                            .as_deref()
+                            .and_then(|t| self.input_schema(session, server, t));
+                        cd.crashed(&c.incident, c.exit, c.suspect, schema.as_ref());
+                    }
+                }
                 jsonrpc::error(id, jsonrpc::BACKEND_UNAVAILABLE, e.to_string())
             }
         }
